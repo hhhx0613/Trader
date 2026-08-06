@@ -15,7 +15,7 @@ except ImportError:
 
 # ==================== 路径配置 ====================
 
-# 项目根目录（config.py 所在目录）
+# 项目根目录（config.py 位于项目根）
 PROJECT_ROOT = Path(__file__).parent
 
 # 本地数据缓存目录（存放下载的 K 线 CSV）
@@ -47,6 +47,13 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
 
 # 数据源优先级：本地缓存 → yfinance → Alpha Vantage → IBKR
 # 无需额外配置，data_collector 内部自动按此顺序兜底
+
+# 新闻多段请求（PPO 训练时需要更长的新闻历史，打开此开关）
+# AV News API 单次最多返回 1000 条（约覆盖 14-20 天），
+# 开启后会将日期范围切成多段分别请求再合并，消耗更多 API 配额。
+NEWS_MULTI_SEGMENT = False
+NEWS_SEGMENT_DAYS = 14  # 每段覆盖的天数（AV 1000 条 ≈ 14 天高产量股票）
+NEWS_DAILY_QUOTA = 20   # 单次运行最多消耗的新闻 API 次数（留 5 次给其他请求）
 
 
 # ==================== 技术指标参数 ====================
@@ -106,6 +113,21 @@ SLIPPAGE = 0.001
 RISK_FREE_RATE = 0.04
 
 
+# ==================== 选股与调仓配置 ====================
+
+# Top-K 选股：LLM 选出置信度最高的 K 只股票等权持有
+TOP_K = 3
+
+# 调仓周期：每 N 个交易日调仓一次（5 ≈ 每周）
+REBALANCE_DAYS = 5
+
+# 置信度阈值：低于此值的股票不入选，全部低于阈值则空仓
+CONFIDENCE_THRESHOLD = 0.5
+
+# 最大仓位暴露上限（公式版：平均 confidence × 此值）
+MAX_EXPOSURE_RATIO = 1.0
+
+
 # ==================== 风控参数 ====================
 
 # 最大仓位比例（占总资金的比例，1.0 = 满仓）
@@ -117,6 +139,13 @@ MAX_SINGLE_LOSS_RATIO = 0.02  # 2%
 # 单日最大回撤比例（超过则当日禁止新开仓）
 MAX_DAILY_DRAWDOWN = 0.05  # 5%
 
+# 连续亏损降仓：连亏 N 笔后降低仓位比例
+MAX_CONSECUTIVE_LOSSES = 3       # 连亏 3 笔触发降仓
+CONSECUTIVE_LOSS_PENALTY = 0.5   # 触发后仓位乘以 0.5
+
+# 换手惩罚：每次调仓产生交易时，扣除一定比例作为惩罚
+TURNOVER_PENALTY_RATIO = 0.001   # 每笔调仓交易扣除目标仓位的 0.1%
+
 
 # ==================== 策略信号定义 ====================
 
@@ -124,3 +153,12 @@ MAX_DAILY_DRAWDOWN = 0.05  # 5%
 SIGNAL_BUY = 1      # 买入信号
 SIGNAL_SELL = -1    # 卖出信号
 SIGNAL_HOLD = 0     # 持仓不动
+
+
+# ==================== LLM 配置 ====================
+
+# 默认 LLM 提供商（"glm" / "deepseek" / "openai"）
+DEFAULT_LLM_PROVIDER = "glm"
+
+# 默认 LLM 模型名称（为空时使用提供商的默认模型）
+DEFAULT_LLM_MODEL = "glm-4"

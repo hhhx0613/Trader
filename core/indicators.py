@@ -24,7 +24,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple
 
-import config
+from . import config
 
 
 # ==================== MA（简单移动平均线）====================

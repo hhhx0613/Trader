@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "trader"
+version = "0.1.0"
+description = "量化交易 LLM 多Agent 系统 — 毕设"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["core*", "agents*", "utils*"]

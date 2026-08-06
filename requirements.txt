@@ -6,3 +6,6 @@ requests>=2.31.0
 ib-insync>=0.9.86
 gymnasium>=1.0.0
 torch>=2.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+vaderSentiment>=3.3.2

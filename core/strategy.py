@@ -25,7 +25,7 @@
 import pandas as pd
 import numpy as np
 
-import config
+from . import config
 
 
 # ==================== 公开接口 ====================

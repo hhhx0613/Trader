@@ -9,6 +9,8 @@
   R1: 单笔止损 —— 持仓浮亏超过总资金 2% → 强制卖出
   R2: 单日最大回撤 —— 当日账户回撤超过 5% → 禁止新开仓
   R3: 最大仓位限制 —— 持仓不超过总资金的 100%
+  R4: 连亏降仓 —— 连续亏损 N 笔后降低仓位比例
+  R5: 换手惩罚 —— 每次调仓交易扣除一定比例作为惩罚
 
 为什么风控要独立于策略：
   - 策略的目标是追求收益，天然有"冒险倾向"
@@ -17,7 +19,7 @@
     阶段2的 PPO 和阶段4的多Agent都会沿用这个设计
 """
 
-import config
+from . import config
 
 
 class RiskManager:
@@ -45,6 +47,13 @@ class RiskManager:
 
         # 记录上一个交易日，用于在新一天重置日内限制
         self.last_date = None
+
+        # R4: 连亏降仓状态
+        self.consecutive_losses = 0       # 当前连续亏损笔数
+        self.position_multiplier = 1.0    # 仓位乘数（连亏触发后降低）
+
+        # R5: 换手惩罚累计（记录当期调仓交易笔数）
+        self.turnover_count = 0
 
     def check_risk(
         self,
@@ -120,13 +129,47 @@ class RiskManager:
             "allow_buy": allow_buy,
             "force_sell": force_sell,
             "halt_reason": halt_reason,
+            "position_multiplier": self.position_multiplier,  # R4: 仓位乘数
         }
+
+    def record_trade_result(self, is_profit: bool):
+        """
+        R4: 记录交易结果，更新连亏降仓状态。
+
+        参数：
+          is_profit: 本笔交易是否盈利
+        """
+        if is_profit:
+            self.consecutive_losses = 0
+            self.position_multiplier = 1.0  # 盈利后恢复
+        else:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+                self.position_multiplier = config.CONSECUTIVE_LOSS_PENALTY
+
+    def record_turnover(self):
+        """
+        R5: 记录一次调仓交易（用于换手惩罚计算）。
+        """
+        self.turnover_count += 1
+
+    def get_turnover_cost(self, target_value: float) -> float:
+        """
+        R5: 计算换手惩罚成本。
+
+        参数：
+          target_value: 本次调仓的目标交易金额
+
+        返回：
+          惩罚成本（美元）
+        """
+        return target_value * config.TURNOVER_PENALTY_RATIO
 
     def get_max_position_shares(
         self, current_equity: float, current_price: float
     ) -> int:
         """
-        计算当前允许的最大持仓股数。
+        计算当前允许的最大持仓股数（考虑连亏降仓乘数）。
 
         参数：
           current_equity: 当前账户总权益
@@ -138,7 +181,7 @@ class RiskManager:
         if current_price <= 0:
             return 0
 
-        max_value = current_equity * config.MAX_POSITION_RATIO
+        max_value = current_equity * config.MAX_POSITION_RATIO * self.position_multiplier
         return int(max_value / current_price)
 
     def reset(self):
@@ -146,3 +189,6 @@ class RiskManager:
         self.peak_equity = self.initial_capital
         self.daily_trading_halted = False
         self.last_date = None
+        self.consecutive_losses = 0
+        self.position_multiplier = 1.0
+        self.turnover_count = 0

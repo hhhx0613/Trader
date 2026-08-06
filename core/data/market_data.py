@@ -20,7 +20,7 @@ import requests
 from pathlib import Path
 from typing import Optional
 
-import config
+from .. import config
 
 # ==================== 公开接口 ====================
 
@@ -78,11 +78,11 @@ def fetch_ohlcv(
         _save_cache(df, cache_path)
         return df
     
-    # --- 开发兜底：生成模拟数据（仅用于无网络环境下的开发调试）---
-    print(f"[DataCollector] ⚠️  所有数据源均不可用，生成模拟数据用于开发测试")
-    print(f"[DataCollector]    正式上线前请确保至少一个网络数据源可用")
-    df = _generate_sample_data(symbol, start_date, end_date)
-    _save_cache(df, cache_path)
+    # --- 所有数据源均失败：返回空 DataFrame（禁止模拟数据兜底）---
+    print(f"[DataCollector] ⚠️  所有数据源均不可用，返回空 DataFrame：{symbol}")
+    print(f"[DataCollector]    请确保至少一个数据源可用（yfinance / Alpha Vantage / IBKR）")
+    df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df.index.name = "Date"
     return df
 
 
@@ -158,7 +158,7 @@ def _try_alpha_vantage(symbol: str, start_date: str, end_date: str) -> Optional[
     注意事项：
       - 免费版每日限 25 次请求，每分钟限 5 次
       - 需要设置 ALPHA_VANTAGE_API_KEY（在 config.py 或环境变量中）
-      - 免费版 outputsize=compact 只返回最近 100 条，超出范围的数据拿不到
+      - outputsize=full 返回完整历史数据（最多 20 年），full 模式每分钟限 2 次
     """
     api_key = config.ALPHA_VANTAGE_API_KEY
     if not api_key:
@@ -170,7 +170,7 @@ def _try_alpha_vantage(symbol: str, start_date: str, end_date: str) -> Optional[
             f"https://www.alphavantage.co/query"
             f"?function=TIME_SERIES_DAILY"
             f"&symbol={symbol}"
-            f"&outputsize=compact"
+            f"&outputsize=full"
             f"&apikey={api_key}"
         )
         response = requests.get(url, timeout=30, verify=False)
@@ -288,50 +288,6 @@ def _try_ibkr(symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFr
     except Exception as e:
         print(f"[DataCollector] IBKR 获取失败: {e}")
         return None
-
-
-def _generate_sample_data(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    生成模拟的股票日线数据，作为最终兜底方案。
-
-    使用几何布朗运动（GBM）模拟股价走势，生成的数据具有真实股票的统计特性：
-    - 年化收益率约 10%
-    - 年化波动率约 25%
-    - 日内波动（high-low）约为收盘价的 1-3%
-
-    ⚠️ 注意：模拟数据仅用于开发和调试，不代表真实市场表现。
-    """
-    np.random.seed(42)  # 固定随机种子，保证结果可复现
-
-    dates = pd.bdate_range(start=start_date, end=end_date)  # 交易日（排除周末）
-    n = len(dates)
-
-    # GBM 参数
-    mu = 0.10 / 252       # 日收益率（年化 10%）
-    sigma = 0.25 / np.sqrt(252)  # 日波动率（年化 25%）
-
-    # 生成对数收益率序列
-    log_returns = np.random.normal(mu, sigma, n)
-    # 累积得到价格序列（初始价格设为 150，接近 AAPL 的价格范围）
-    prices = 150 * np.exp(np.cumsum(log_returns))
-
-    # 生成 OHLCV 数据
-    daily_range = np.abs(np.random.normal(0.015, 0.005, n))  # 日内波动幅度
-    high = prices * (1 + daily_range / 2)
-    low = prices * (1 - daily_range / 2)
-    open_prices = low + np.random.uniform(0, 1, n) * (high - low)
-    volume = np.random.randint(1_000_000, 50_000_000, n).astype(float)
-
-    df = pd.DataFrame({
-        "open": open_prices,
-        "high": high,
-        "low": low,
-        "close": prices,
-        "volume": volume,
-    }, index=dates)
-    df.index.name = "Date"
-
-    return df
 
 
 # ==================== 缓存写入 ====================

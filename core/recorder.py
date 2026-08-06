@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import List
 from pathlib import Path
 
-import config
+from . import config
 
 
 # ==================== 数据结构 ====================
@@ -33,6 +33,7 @@ import config
 class Trade:
     """单笔交易记录。"""
     date: str           # 交易日期
+    symbol: str         # 股票代码（多股票回测时需要）
     direction: str      # "BUY" 或 "SELL"
     price: float        # 成交价格（已含滑点）
     shares: int         # 成交股数

@@ -19,8 +19,9 @@
   6. plot_results()                 → 绘制净值曲线 + 买卖点图
 """
 
-import argparse
 import sys
+import argparse
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -29,11 +30,12 @@ matplotlib.use("Agg")  # 非交互模式，避免在无 GUI 环境中阻塞
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-import config
-from data_collector import fetch_ohlcv
-from indicators import compute_all_indicators
-from strategy import generate_signals
-from backtest_engine import BacktestEngine
+# 从 core 模块导入
+from core import config
+from core.data.market_data import fetch_ohlcv
+from core.indicators import compute_all_indicators
+from core.strategy import generate_signals
+from core.backtest_engine import BacktestEngine
 
 
 # ==================== 主流程 ====================
@@ -59,6 +61,9 @@ def run_backtest(
 
     print("[Step 1/4] 获取行情数据...")
     df = fetch_ohlcv(symbol, start_date, end_date)
+    if df is None or len(df) == 0:
+        print(f"  ⚠️ 未获取到 {symbol} 的行情数据，请检查数据源或时间范围")
+        return None, None
     print(f"  → 获取到 {len(df)} 根日K线")
 
     # ---------- 第 2 步：计算技术指标 ----------
@@ -77,7 +82,7 @@ def run_backtest(
     # ---------- 第 4 步：运行回测 ----------
     print("\n[Step 4/4] 运行回测撮合引擎...")
     engine = BacktestEngine()
-    recorder = engine.run(df)
+    recorder = engine.run(df, symbol=symbol)
 
     # ---------- 输出报告 ----------
     recorder.print_report(df)
@@ -170,10 +175,10 @@ def plot_results(df: pd.DataFrame, recorder, symbol: str = config.DEFAULT_SYMBOL
 
 def parse_args():
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="量化交易 Agent 回测系统 — 阶段1")
-    parser.add_argument("--symbol", default=config.DEFAULT_SYMBOL, help="股票代码 (默认: AAPL)")
-    parser.add_argument("--start", default=config.DEFAULT_START_DATE, help="起始日期 (默认: 2021-01-01)")
-    parser.add_argument("--end", default=config.DEFAULT_END_DATE, help="结束日期 (默认: 2024-01-01)")
+    parser = argparse.ArgumentParser(description="量化交易 Agent 回测系统")
+    parser.add_argument("--symbol", default=config.DEFAULT_SYMBOL, help="股票代码 (默认：AAPL)")
+    parser.add_argument("--start", default=config.DEFAULT_START_DATE, help="起始日期 (默认：2021-01-01)")
+    parser.add_argument("--end", default=config.DEFAULT_END_DATE, help="结束日期 (默认：2024-01-01)")
     return parser.parse_args()
 
 
@@ -187,7 +192,8 @@ def main():
         end_date=args.end,
     )
 
-    plot_results(df, recorder, symbol=args.symbol)
+    if df is not None and recorder is not None:
+        plot_results(df, recorder, symbol=args.symbol)
 
 
 if __name__ == "__main__":
