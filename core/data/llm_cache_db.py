@@ -146,6 +146,42 @@ class LLMCacheDB:
             print(f"[LLM Cache DB] 保存失败：{e}")
             return False
     
+    def get_previous_analysis(self, symbol: str, before_date: str, model: str) -> Optional[Dict]:
+        """
+        获取某只股票在指定日期之前的最近一次分析结果（用于 L1 记忆）。
+        
+        Args:
+            symbol: 股票代码
+            before_date: 截止日期（不包含该日期，格式：YYYY-MM-DD）
+            model: LLM 模型名称
+        
+        Returns:
+            最近一次分析结果字典，不存在则返回 None
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT symbol, analysis_date, model, direction, confidence, 
+                       reasons, sources, prompt_version
+                FROM llm_analysis_cache
+                WHERE symbol=? AND analysis_date<? AND model=?
+                ORDER BY analysis_date DESC
+                LIMIT 1
+            """, (symbol, before_date, model))
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "symbol": row[0],
+                    "analysis_date": row[1],
+                    "model": row[2],
+                    "direction": row[3],
+                    "confidence": row[4],
+                    "reasons": json.loads(row[5]) if row[5] else [],
+                    "sources": json.loads(row[6]) if row[6] else [],
+                    "prompt_version": row[7],
+                }
+            return None
+    
     def query_by_symbol(self, symbol: str, limit: int = 100) -> List[Dict]:
         """
         按股票查询历史记录

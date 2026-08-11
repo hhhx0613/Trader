@@ -136,19 +136,27 @@ class LLMAnalystAgent:
       agent = LLMAnalystAgent()
       analysis = agent.analyze("AAPL", "2023-06-15", news_list)
       # 返回：{"direction": "bullish", "confidence": 0.8, ...}
+    
+    L1 记忆（分析上下文记忆）：
+      - 分析时从 SQLite 缓存检索该股票上次的判断结果
+      - 将上次分析（方向/置信度/理由）注入 prompt
+      - 让 LLM 判断有连贯性，避免反复横跳
+      - 与 LLM 缓存共用 SQLite，无需额外存储
     """
     
-    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None, enable_l1_memory: bool = True):
         """
         参数：
           provider: LLM 提供商 ("openai", "glm", "deepseek")
             如果为 None，则从环境变量 DEFAULT_LLM_PROVIDER 读取
           model: 模型名称
             如果为 None，则使用该提供商的默认模型
+          enable_l1_memory: 是否启用 L1 记忆（默认 True）
         """
         self.provider = provider
         self.model = model
         self.prompt_version = "v2.0"  # 结构化多维打分框架
+        self.enable_l1_memory = enable_l1_memory
         
         # 初始化 LLM 客户端
         try:
@@ -184,7 +192,10 @@ class LLMAnalystAgent:
         """
         # 调用 LLM API
         try:
-            return self._analyze_with_llm(symbol, date, news_list)
+            result = self._analyze_with_llm(symbol, date, news_list)
+            # L1 记忆：分析结果已自动保存到 SQLite 缓存（_save_cache）
+            # 下次分析时通过 _build_user_message 从缓存加载上次判断
+            return result
         except Exception as e:
             print(f"[LLMAnalystAgent] LLM 调用失败：{e}")
             raise
@@ -233,6 +244,7 @@ class LLMAnalystAgent:
     def _build_user_message(self, symbol: str, date: str, news_list: List[Dict]) -> str:
         """
         构建 user message（每次调用变化的新闻数据）。
+        如果启用 L1 记忆，会从 SQLite 缓存加载该股票上次的分析结果。
         """
         # 格式化新闻列表（处理可能的 NaN 值）
         news_lines = []
@@ -253,7 +265,24 @@ class LLMAnalystAgent:
 
         news_text = "\n\n".join(news_lines) if news_lines else "（无新闻）"
 
-        return f"请分析 {symbol} 在 {date} 的新闻：\n\n{news_text}"
+        # L1 记忆：从 SQLite 缓存加载上次分析结果
+        memory_text = ""
+        if self.enable_l1_memory:
+            cache_db = get_cache_db()
+            prev = cache_db.get_previous_analysis(symbol, date, self.model)
+            if prev:
+                reasons_str = "；".join(prev.get("reasons", [])[:2]) if prev.get("reasons") else "无"
+                memory_text = f"""
+
+## 你上次对 {symbol} 的分析（{prev['analysis_date']}）
+
+- 方向：{prev['direction']}
+- 置信度：{prev['confidence']:.2f}
+- 理由：{reasons_str}
+
+请结合最新新闻，给出新的判断。如果判断发生变化，请说明原因。"""
+
+        return f"请分析 {symbol} 在 {date} 的新闻：{memory_text}\n\n## 新闻内容\n\n{news_text}"
 
     # ==================== LLM 输出缓存（SQLite）====================
 

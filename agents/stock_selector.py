@@ -18,6 +18,7 @@ from typing import List, Dict, Optional, Set
 import pandas as pd
 
 from agents.llm_analyst import LLMAnalystAgent
+from agents.confidence_calibrator import get_calibrator
 from core.data.news_data import get_news_at_date
 from core import config
 
@@ -41,6 +42,7 @@ def analyze_candidate_pool(
     news_df: pd.DataFrame,
     provider: str = None,
     model: str = None,
+    enable_calibration: bool = True,
 ) -> List[Dict]:
     """
     对候选池中每只股票运行 LLM 分析。
@@ -51,6 +53,7 @@ def analyze_candidate_pool(
       news_df: 新闻 DataFrame（包含 symbol 列，用于按股票过滤）
       provider: LLM 提供商（默认 config.DEFAULT_LLM_PROVIDER）
       model: 模型名称（默认 config.DEFAULT_LLM_MODEL）
+      enable_calibration: 是否启用置信度校准（默认 True）
 
     返回：
       分析结果列表，每项包含：
@@ -63,6 +66,7 @@ def analyze_candidate_pool(
         model = config.DEFAULT_LLM_MODEL
 
     agent = LLMAnalystAgent(provider=provider, model=model)
+    calibrator = get_calibrator() if enable_calibration else None
     results = []
 
     print(f"\n[选股分析] {date}: 分析 {len(candidate_pool)} 只候选股...")
@@ -78,6 +82,7 @@ def analyze_candidate_pool(
                     "symbol": symbol,
                     "direction": "neutral",
                     "confidence": 0.0,
+                    "raw_confidence": 0.0,
                     "analysis": {"direction": "neutral", "confidence": 0.0},
                 })
                 continue
@@ -86,7 +91,15 @@ def analyze_candidate_pool(
             analysis = agent.analyze(symbol, date, news_list)
 
             direction = analysis.get("direction", "neutral")
-            confidence = float(analysis.get("confidence", 0.0))
+            raw_confidence = float(analysis.get("confidence", 0.0))
+            
+            # 置信度校准：将 LLM 自报 confidence 校准为实际胜率
+            if calibrator and direction != "neutral":
+                confidence = calibrator.calibrate(raw_confidence)
+                if abs(confidence - raw_confidence) > 0.01:
+                    print(f"  [校准] {symbol}: {raw_confidence:.2f} → {confidence:.2f}")
+            else:
+                confidence = raw_confidence
 
             print(f"  {symbol}: {direction} (confidence={confidence:.2f}, news={len(news_list)}条)")
 
@@ -94,6 +107,7 @@ def analyze_candidate_pool(
                 "symbol": symbol,
                 "direction": direction,
                 "confidence": confidence,
+                "raw_confidence": raw_confidence,  # 保留原始值用于后续校准训练
                 "analysis": analysis,
             })
 
