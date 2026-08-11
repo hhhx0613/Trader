@@ -226,50 +226,111 @@ def _try_finnhub(symbol: str, start_date: str, end_date: str) -> Optional[pd.Dat
         return None
 
 
-def _fetch_segment_with_fallback(
+def _fetch_complete_segment(
     symbol: str,
     seg_start_str: str,
     seg_end_str: str,
-    quota_remaining: List[int],  # 用列表以便在函数内修改
-    use_finnhub: bool = True,
+    quota_remaining: List[int],
 ) -> Optional[pd.DataFrame]:
     """
-    对单个段执行 3 层兜底：缓存 → AV → Finnhub。
+    获取已完成的段（从 complete 目录读取）。
     
-    参数：
-      quota_remaining: 剩余 API 配额（单元素列表，用于在调用间共享状态）
-      use_finnhub: 是否启用 Finnhub 兜底（分段模式下建议关闭）
-    
-    返回：DataFrame 或 None（该段无数据）
+    已完成的段：seg_end < today，数据不会再变化。
     """
-    seg_cache = config.NEWS_CACHE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
+    cache_file = config.NEWS_CACHE_COMPLETE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
     
-    # 第1层：缓存
-    cached = _try_load_cache(seg_cache)
+    # 检查缓存
+    cached = _try_load_cache(cache_file)
     if cached is not None:
         return cached
     
-    # 第2层：Alpha Vantage（有配额限制）
+    # 缓存未命中，从 API 拉取
     if quota_remaining[0] > 0:
         df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
         quota_remaining[0] -= 1
         
         if df is not None and len(df) > 0:
             df["symbol"] = symbol
-            _save_cache(df, seg_cache)
+            _save_cache(df, cache_file)
             return df
     else:
         print(f"    [NewsCollector] AV 配额已用完，跳过 {seg_start_str} ~ {seg_end_str}")
     
-    # 第3层：Finnhub（可选）
-    if use_finnhub:
-        df = _try_finnhub(symbol, seg_start_str, seg_end_str)
+    # Finnhub 兑底
+    df = _try_finnhub(symbol, seg_start_str, seg_end_str)
+    if df is not None and len(df) > 0:
+        df["symbol"] = symbol
+        _save_cache(df, cache_file)
+        return df
+    
+    return None
+
+
+def _fetch_incomplete_segment(
+    symbol: str,
+    seg_start_str: str,
+    seg_end_str: str,
+    quota_remaining: List[int],
+) -> Optional[pd.DataFrame]:
+    """
+    获取未完成的段（从 incomplete 目录读取，增量更新）。
+    
+    未完成的段：seg_end >= today，数据可能还在增长。
+    策略：
+      1. 检查 incomplete 缓存
+      2. 如果缓存存在且数据是最新的（最后数据日期 >= today - 1），直接返回
+      3. 否则从 API 拉取新数据，增量追加到缓存
+    """
+    cache_file = config.NEWS_CACHE_INCOMPLETE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
+    today = pd.Timestamp.now().normalize()
+    
+    # 检查缓存
+    cached = _try_load_cache(cache_file)
+    if cached is not None:
+        # 检查数据是否最新
+        last_date = cached["datetime"].max().normalize()
+        if (today - last_date).days < 1:
+            # 数据是最新的，直接返回
+            return cached
+        # 否则需要增量更新
+    
+    # 从 API 拉取新数据
+    if quota_remaining[0] > 0:
+        df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
+        quota_remaining[0] -= 1
+        
         if df is not None and len(df) > 0:
             df["symbol"] = symbol
-            _save_cache(df, seg_cache)
+            
+            # 增量追加：合并新旧数据
+            if cache_file.exists():
+                existing = _try_load_cache(cache_file)
+                if existing is not None:
+                    df = pd.concat([existing, df], ignore_index=True)
+                    df = df.drop_duplicates(subset=["title"], keep="last")
+                    df = df.sort_values("datetime").reset_index(drop=True)
+            
+            _save_cache(df, cache_file)
             return df
+    else:
+        print(f"    [NewsCollector] AV 配额已用完，跳过 {seg_start_str} ~ {seg_end_str}")
     
-    # 所有数据源均失败
+    # Finnhub 兑底
+    df = _try_finnhub(symbol, seg_start_str, seg_end_str)
+    if df is not None and len(df) > 0:
+        df["symbol"] = symbol
+        
+        # 增量追加
+        if cache_file.exists():
+            existing = _try_load_cache(cache_file)
+            if existing is not None:
+                df = pd.concat([existing, df], ignore_index=True)
+                df = df.drop_duplicates(subset=["title"], keep="last")
+                df = df.sort_values("datetime").reset_index(drop=True)
+        
+        _save_cache(df, cache_file)
+        return df
+    
     return None
 
 
@@ -281,7 +342,7 @@ def fetch_news(
     end_date: str = config.DEFAULT_END_DATE,
 ) -> pd.DataFrame:
     """
-    获取指定标的的历史新闻数据。
+    智能获取指定标的的新闻数据。
     
     参数：
       symbol: 股票代码（如 "AAPL"）
@@ -296,24 +357,36 @@ def fetch_news(
       - source: 新闻来源
       - sentiment_score: 情绪分数（-1.0 ~ 1.0，正=看涨，负=看跌）
     
-    数据源策略（按段独立兜底）：
-      1. 本地段级缓存（基于全局锚点网格）
-      2. Alpha Vantage（缓存未命中时从 API 拉取）
-      3. Finnhub（AV 失败时的兜底）
+    智能分段策略：
+      - 已完成的段（seg_end < today）：从 complete 目录读取，永久缓存
+      - 未完成的段（seg_end >= today）：从 incomplete 目录读取，增量更新
+      - 每段独立兜底：缓存 → Alpha Vantage → Finnhub
     """
-    # 按网格拆分，每段独立兜底
+    # 按网格拆分，每段智能处理
     segments = _split_into_segments(start_date, end_date)
     all_dfs = []
     quota_remaining = [config.NEWS_DAILY_QUOTA]  # 用列表以便在函数间共享
+    today = pd.Timestamp.now().normalize()
     
     for seg_idx, (seg_start_str, seg_end_str) in enumerate(segments, 1):
-        print(f"  [NewsCollector] 处理段 [{seg_idx}/{len(segments)}]：{seg_start_str} ~ {seg_end_str}")
+        seg_end_dt = pd.Timestamp(seg_end_str)
+        is_complete = seg_end_dt < today
         
-        df = _fetch_segment_with_fallback(
-            symbol, seg_start_str, seg_end_str,
-            quota_remaining=quota_remaining,
-            use_finnhub=False  # 分段模式下不用 Finnhub
-        )
+        status = "已完成" if is_complete else "未完成（增量）"
+        print(f"  [NewsCollector] 处理段 [{seg_idx}/{len(segments)}]：{seg_start_str} ~ {seg_end_str} [{status}]")
+        
+        if is_complete:
+            # 已完成的段：从 complete 目录读取
+            df = _fetch_complete_segment(
+                symbol, seg_start_str, seg_end_str,
+                quota_remaining=quota_remaining
+            )
+        else:
+            # 未完成的段：从 incomplete 目录读取，增量更新
+            df = _fetch_incomplete_segment(
+                symbol, seg_start_str, seg_end_str,
+                quota_remaining=quota_remaining
+            )
         
         if df is not None and len(df) > 0:
             all_dfs.append(df)

@@ -22,6 +22,8 @@ PROJECT_ROOT = Path(__file__).parent
 CACHE_DIR = PROJECT_ROOT / "data" / "cache"
 MARKET_CACHE_DIR = CACHE_DIR / "market"
 NEWS_CACHE_DIR = CACHE_DIR / "news"
+NEWS_CACHE_COMPLETE_DIR = NEWS_CACHE_DIR / "complete"      # 已完成的段（回测用）
+NEWS_CACHE_INCOMPLETE_DIR = NEWS_CACHE_DIR / "incomplete"  # 未完成的段（实盘增量用）
 
 # 回测输出目录（净值曲线、交易记录、评估报告）
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -29,6 +31,8 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 # 确保目录存在
 MARKET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+NEWS_CACHE_COMPLETE_DIR.mkdir(parents=True, exist_ok=True)
+NEWS_CACHE_INCOMPLETE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -52,12 +56,12 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
 # 无需额外配置，data_collector 内部自动按此顺序兜底
 
 # 新闻分段请求（永远启用）
-# AV News API 单次最多返回 1000 条（约覆盖 14 天），
-# 自动将日期范围切成 14 天一段分别请求再合并。
-NEWS_SEGMENT_DAYS = 14  # 每段覆盖的天数（AV 1000 条 ≈ 14 天高产量股票）
+# AV News API 单次最多返回 1000 条，
+# 自动将日期范围切成 28 天一段分别请求再合并。
+NEWS_SEGMENT_DAYS = 28  # 每段覆盖的天数（28天 ≈ 829条，接近1000限制）
 NEWS_DAILY_QUOTA = 25   # 单次运行最多消耗的新闻 API 次数（AV 免费版 25 次/天，按 IP 限额）
 
-# 分段缓存的全局锚点（一个周一）。段边界 = [anchor + 14k, anchor + 14k + 13]，
+# 分段缓存的全局锚点（一个周一）。段边界 = [anchor + 28k, anchor + 28k + 27]，
 # 与请求起点无关，保证不同区间/不同时间拉取都落在同一批段文件，天然去重、跨回测复用。
 # 见 Plan.md 假设 4。修改此值会使旧网格段失效，需重新归并。
 NEWS_SEGMENT_ANCHOR = "2020-01-06"

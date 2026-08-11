@@ -44,7 +44,7 @@ TARGET_START = "2025-08-11"
 TARGET_END = "2026-08-06"
 
 # 每段覆盖天数（与 config.NEWS_SEGMENT_DAYS 保持一致）
-SEGMENT_DAYS = 14
+SEGMENT_DAYS = 28
 
 # 进度文件路径
 PROGRESS_FILE = config.CACHE_DIR / "data_fetch_progress.json"
@@ -54,20 +54,16 @@ PROGRESS_FILE = config.CACHE_DIR / "data_fetch_progress.json"
 
 def compute_segments(start_date: str, end_date: str, segment_days: int) -> List[Tuple[str, str]]:
     """
-    计算覆盖 [start_date, end_date] 所需的全部段。
+    计算覆盖 [start_date, end_date] 所需的全部段（网格对齐）。
 
+    使用全局锚点 config.NEWS_SEGMENT_ANCHOR 对齐到 14 天网格。
     返回: [(seg_start, seg_end), ...]
     """
-    segments = []
-    current = __import__("pandas").Timestamp(start_date)
-    end = __import__("pandas").Timestamp(end_date)
+    import pandas as pd
+    from core.data.news_data import _split_into_segments
 
-    while current <= end:
-        seg_end = min(current + timedelta(days=segment_days - 1), end)
-        segments.append((current.strftime("%Y-%m-%d"), seg_end.strftime("%Y-%m-%d")))
-        current = seg_end + timedelta(days=1)
-
-    return segments
+    # 使用网格对齐的段拆分
+    return _split_into_segments(start_date, end_date)
 
 
 def get_existing_segments(symbol: str) -> Dict[Tuple[str, str], Path]:
@@ -80,10 +76,14 @@ def get_existing_segments(symbol: str) -> Dict[Tuple[str, str], Path]:
         rf"^{symbol}_news_seg_(\d{{4}}-\d{{2}}-\d{{2}})_(\d{{4}}-\d{{2}}-\d{{2}})\.csv$"
     )
     result = {}
-    for f in config.NEWS_CACHE_DIR.glob(f"{symbol}_news_seg_*.csv"):
-        m = pattern.match(f.name)
-        if m:
-            result[(m.group(1), m.group(2))] = f
+    
+    # 扫描 complete 和 incomplete 目录
+    for cache_dir in [config.NEWS_CACHE_COMPLETE_DIR, config.NEWS_CACHE_INCOMPLETE_DIR]:
+        for f in cache_dir.glob(f"{symbol}_news_seg_*.csv"):
+            m = pattern.match(f.name)
+            if m:
+                result[(m.group(1), m.group(2))] = f
+    
     return result
 
 
@@ -109,20 +109,28 @@ def is_segment_covered(
     return False
 
 
-def get_full_range_cache(symbol: str) -> Optional[Path]:
-    """检查是否存在覆盖全范围的主缓存文件。"""
-    path = config.NEWS_CACHE_DIR / f"{symbol}_news_{TARGET_START}_{TARGET_END}.csv"
-    return path if path.exists() else None
-
-
 # ==================== 进度分析 ====================
 
-def analyze_progress() -> Dict:
+def analyze_progress(force_refresh: bool = False) -> Dict:
     """
     分析所有股票的缓存覆盖情况。
 
+    优先从进度文件加载，避免每次扫描目录。
+    如果 force_refresh=True 或文件不存在，则重新扫描。
+
     返回结构化的进度信息。
     """
+    # 尝试加载已有进度
+    if not force_refresh:
+        cached_progress = load_progress()
+        if cached_progress is not None:
+            # 验证进度文件是否匹配当前配置
+            if (cached_progress.get("target_start") == TARGET_START and
+                cached_progress.get("target_end") == TARGET_END and
+                cached_progress.get("segment_days") == SEGMENT_DAYS):
+                return cached_progress
+
+    # 重新扫描目录
     all_segments = compute_segments(TARGET_START, TARGET_END, SEGMENT_DAYS)
     total_segments = len(all_segments)
 
@@ -132,7 +140,6 @@ def analyze_progress() -> Dict:
 
     for symbol in STOCKS:
         existing = get_existing_segments(symbol)
-        full_cache = get_full_range_cache(symbol)
 
         # 计算缺失段（支持重叠覆盖检测）
         missing = []
@@ -148,17 +155,6 @@ def analyze_progress() -> Dict:
         total_cached += cached_count
         total_needed += total_segments
 
-        # 计算覆盖的连续天数
-        covered_days = cached_count * SEGMENT_DAYS
-        # 最后一段可能不足 SEGMENT_DAYS 天
-        if cached_segs:
-            last_seg_end = __import__("pandas").Timestamp(cached_segs[-1][1])
-            first_seg_start = __import__("pandas").Timestamp(cached_segs[0][0])
-            # 实际覆盖天数（从第一段开始到最后一段结束）
-            span_days = (last_seg_end - first_seg_start).days + 1
-        else:
-            span_days = 0
-
         stock_status[symbol] = {
             "cached_segments": cached_segs,
             "missing_segments": missing,
@@ -166,7 +162,6 @@ def analyze_progress() -> Dict:
             "missing_count": missing_count,
             "total_segments": total_segments,
             "progress_pct": round(cached_count / total_segments * 100, 1) if total_segments > 0 else 0,
-            "full_range_cache": full_cache is not None,
             "has_gaps": len(cached_segs) > 0 and missing_count > 0,
         }
 
@@ -291,7 +286,7 @@ def fetch_missing_segments(progress: Dict, limit: int = 25) -> int:
 
             # 取第一个缺失段
             seg_start, seg_end = info["missing_segments"][0]
-            seg_cache = config.NEWS_CACHE_DIR / f"{symbol}_news_seg_{seg_start}_{seg_end}.csv"
+            seg_cache = config.NEWS_CACHE_COMPLETE_DIR / f"{symbol}_news_seg_{seg_start}_{seg_end}.csv"
 
             print(f"  [{symbol}] 拉取 {seg_start} ~ {seg_end} ...", end=" ", flush=True)
 
@@ -363,8 +358,8 @@ def load_progress() -> Optional[Dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="新闻数据拉取进度追踪器")
-    parser.add_argument("command", choices=["status", "fetch", "reset"],
-                        help="status=查看进度, fetch=拉取缺失段, reset=重置进度")
+    parser.add_argument("command", choices=["status", "fetch", "reset", "refresh"],
+                        help="status=查看进度, fetch=拉取缺失段, reset=重置进度, refresh=强制刷新进度")
     parser.add_argument("--limit", type=int, default=25,
                         help="fetch 模式下的 API 调用次数上限（默认 25）")
     parser.add_argument("--json", action="store_true",
@@ -373,7 +368,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "status":
-        progress = analyze_progress()
+        progress = analyze_progress(force_refresh=False)
         _update_summary(progress)
         save_progress(progress)
 
@@ -383,7 +378,7 @@ def main():
             print_progress_table(progress)
 
     elif args.command == "fetch":
-        progress = analyze_progress()
+        progress = analyze_progress(force_refresh=False)
         _update_summary(progress)
 
         print_progress_table(progress)
@@ -396,10 +391,18 @@ def main():
 
     elif args.command == "reset":
         # 只重置进度文件，不删除缓存
-        progress = analyze_progress()
+        progress = analyze_progress(force_refresh=True)
         _update_summary(progress)
         save_progress(progress)
         print("进度已重新扫描并保存。（缓存文件未删除）")
+
+    elif args.command == "refresh":
+        # 强制重新扫描目录
+        progress = analyze_progress(force_refresh=True)
+        _update_summary(progress)
+        save_progress(progress)
+        print("进度已强制刷新并保存。")
+        print_progress_table(progress)
 
 
 if __name__ == "__main__":
