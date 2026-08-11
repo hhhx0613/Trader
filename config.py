@@ -42,23 +42,8 @@ DEFAULT_START_DATE = "2026-07-06"
 DEFAULT_END_DATE = "2026-08-06"
 
 # Alpha Vantage API Key（免费申请：https://www.alphavantage.co/support/#api-key）
-# 支持多个 key 用逗号分隔，自动轮换以翻倍配额（如 "KEY1,KEY2"）
-_AV_KEYS_RAW = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-ALPHA_VANTAGE_API_KEYS = [k.strip() for k in _AV_KEYS_RAW.split(",") if k.strip()]
-# 兼容旧代码：第一个 key 作为默认
-ALPHA_VANTAGE_API_KEY = ALPHA_VANTAGE_API_KEYS[0] if ALPHA_VANTAGE_API_KEYS else ""
-
-# key 轮换计数器（每次调用 get_next_av_key 自动切换）
-_av_key_idx = 0
-
-def get_next_av_key() -> str:
-    """获取下一个 Alpha Vantage API key（round-robin 轮换）。"""
-    global _av_key_idx
-    if not ALPHA_VANTAGE_API_KEYS:
-        return ""
-    key = ALPHA_VANTAGE_API_KEYS[_av_key_idx % len(ALPHA_VANTAGE_API_KEYS)]
-    _av_key_idx += 1
-    return key
+# Alpha Vantage API Key（单个 key）
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 
 # IBKR TWS/IB Gateway API 端口（IB Gateway 模拟盘默认 4002）
 IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
@@ -66,12 +51,16 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
 # 数据源优先级：本地缓存 → yfinance → Alpha Vantage → IBKR
 # 无需额外配置，data_collector 内部自动按此顺序兜底
 
-# 新闻多段请求（PPO 训练时需要更长的新闻历史，打开此开关）
-# AV News API 单次最多返回 1000 条（约覆盖 14-20 天），
-# 开启后会将日期范围切成多段分别请求再合并，消耗更多 API 配额。
-NEWS_MULTI_SEGMENT = True
+# 新闻分段请求（永远启用）
+# AV News API 单次最多返回 1000 条（约覆盖 14 天），
+# 自动将日期范围切成 14 天一段分别请求再合并。
 NEWS_SEGMENT_DAYS = 14  # 每段覆盖的天数（AV 1000 条 ≈ 14 天高产量股票）
 NEWS_DAILY_QUOTA = 25   # 单次运行最多消耗的新闻 API 次数（AV 免费版 25 次/天，按 IP 限额）
+
+# 分段缓存的全局锚点（一个周一）。段边界 = [anchor + 14k, anchor + 14k + 13]，
+# 与请求起点无关，保证不同区间/不同时间拉取都落在同一批段文件，天然去重、跨回测复用。
+# 见 Plan.md 假设 4。修改此值会使旧网格段失效，需重新归并。
+NEWS_SEGMENT_ANCHOR = "2020-01-06"
 
 
 # ==================== 技术指标参数 ====================
@@ -132,6 +121,11 @@ TOP_K = 5  # 持有 5 只股票（分散化投资）
 
 # 调仓周期：每 N 个交易日调仓一次（5 ≈ 每周）
 REBALANCE_DAYS = 5
+
+# 调仓日锚定模式、
+#   True  = 每个自然周（ISO 周）的第一个可交易日调仓
+#   False = 旧行为：从 all_dates[0] 起每 REBALANCE_DAYS 个交易日计数调仓
+REBALANCE_WEEKLY = True
 
 # 置信度阈值：低于此值的股票不入选，全部低于阈值则空仓
 CONFIDENCE_THRESHOLD = 0.5

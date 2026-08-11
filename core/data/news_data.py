@@ -21,7 +21,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -29,186 +29,46 @@ import requests
 from .. import config
 
 
-def _find_covering_cache(symbol: str, start_date: str, end_date: str) -> Optional[Path]:
+# ==================== 辅助函数 ====================
+
+def _segment_bounds_for_grid(date: pd.Timestamp, anchor: pd.Timestamp, seg_days: int):
     """
-    查找覆盖请求日期范围的缓存文件。
-    
-    如果精确匹配不存在，查找更大的缓存文件（如 *_2025-08-11_2026-08-06.csv
-    可以覆盖 2026-07-06 ~ 2026-08-06 的请求）。
+    把任意日期映射到它所属的固定网格段 [seg_start, seg_end]。
+
+    段边界只依赖全局锚点 anchor 和段长 seg_days，与请求起点无关，
+    因此不同区间/不同时间拉取都落在同一批段文件，天然去重、可跨回测复用。
+    见 Plan.md 假设 4。
+
+    例：anchor=2020-01-06(周一), seg_days=14 →
+        2026-07-06 属于段 [2026-07-06, 2026-07-19]。
     """
-    import re
-    
-    # 精确匹配
-    exact = config.NEWS_CACHE_DIR / f"{symbol}_news_{start_date}_{end_date}.csv"
-    if exact.exists():
-        return exact
-    
-    # 查找覆盖范围更大的缓存
-    pattern = re.compile(rf"^{symbol}_news_(\d{{4}}-\d{{2}}-\d{{2}})_(\d{{4}}-\d{{2}}-\d{{2}})\.csv$")
-    req_start = pd.Timestamp(start_date)
-    req_end = pd.Timestamp(end_date)
-    
-    best_match = None
-    best_span = 0
-    
-    for f in config.NEWS_CACHE_DIR.glob(f"{symbol}_news_*.csv"):
-        if "_seg_" in f.name:
-            continue  # 跳过分段缓存
-        m = pattern.match(f.name)
-        if m:
-            cache_start = pd.Timestamp(m.group(1))
-            cache_end = pd.Timestamp(m.group(2))
-            # 检查是否覆盖请求范围
-            if cache_start <= req_start and cache_end >= req_end:
-                span = (cache_end - cache_start).days
-                if span > best_span:
-                    best_span = span
-                    best_match = f
-    
-    return best_match
+    # 用 floor 除法，保证 date 早于 anchor 时也能正确落到对应网格
+    delta_days = (date.normalize() - anchor.normalize()).days
+    k = delta_days // seg_days
+    seg_start = anchor.normalize() + pd.Timedelta(days=k * seg_days)
+    seg_end = seg_start + pd.Timedelta(days=seg_days - 1)
+    return seg_start, seg_end
 
 
-# ==================== 公开接口 ====================
-
-def fetch_news(
-    symbol: str = config.DEFAULT_SYMBOL,
-    start_date: str = config.DEFAULT_START_DATE,
-    end_date: str = config.DEFAULT_END_DATE,
-    use_cache: bool = True,
-) -> pd.DataFrame:
+def _split_into_segments(start_date: str, end_date: str) -> List[Tuple[str, str]]:
     """
-    获取指定标的的历史新闻数据。
+    将日期范围按全局锚点网格拆分为多个段。
     
-    参数：
-      symbol: 股票代码（如 "AAPL"）
-      start_date: 起始日期（格式 "YYYY-MM-DD"）
-      end_date: 结束日期（格式 "YYYY-MM-DD"）
-      use_cache: 是否使用本地缓存（默认 True）
-    
-    返回：
-      pd.DataFrame，列 = [datetime, title, summary, source, sentiment_score]
-      - datetime: 新闻发布时间（pd.Timestamp）
-      - title: 新闻标题
-      - summary: 新闻摘要
-      - source: 新闻来源
-      - sentiment_score: 情绪分数（-1.0 ~ 1.0，正=看涨，负=看跌）
-    
-    数据源策略（优先 + 兜底）：
-      1. 本地 CSV 缓存（有缓存就直接用）
-      2. Alpha Vantage（历史覆盖广，自带情绪分，优先）
-      3. Finnhub（AV 失败时的兜底）
+    返回：[(seg_start_str, seg_end_str), ...]
     """
-    # --- 第 1 层：检查本地缓存（精确匹配或覆盖范围更大的缓存）---
-    if use_cache:
-        cache_path = _find_covering_cache(symbol, start_date, end_date)
-        if cache_path is not None:
-            df = _try_load_cache(cache_path)
-            if df is not None:
-                # 过滤到请求的日期范围
-                req_start = pd.Timestamp(start_date)
-                req_end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
-                df = df[(df["datetime"] >= req_start) & (df["datetime"] < req_end)]
-                print(f"[NewsCollector] 命中本地缓存：{cache_path.name}，过滤后 {len(df)} 条")
-                return df
+    segment_days = config.NEWS_SEGMENT_DAYS
+    anchor = pd.Timestamp(config.NEWS_SEGMENT_ANCHOR)
+    seg_end_full = pd.Timestamp(end_date)
+    seg_start, _ = _segment_bounds_for_grid(pd.Timestamp(start_date), anchor, segment_days)
     
-    # 精确缓存文件名（用于保存）
-    cache_filename = f"{symbol}_news_{start_date}_{end_date}.csv"
-    cache_path = config.NEWS_CACHE_DIR / cache_filename
+    segments = []
+    while seg_start <= seg_end_full:
+        chunk_end = seg_start + pd.Timedelta(days=segment_days - 1)
+        segments.append((seg_start.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
+        seg_start = chunk_end + pd.Timedelta(days=1)
     
-    # --- 第 2 层：Alpha Vantage 优先（历史覆盖广 + 自带情绪分）---
-    if config.NEWS_MULTI_SEGMENT:
-        # 多段模式：切分日期范围，逐段请求后合并（PPO 训练用）
-        df = _fetch_news_segmented_av(symbol, start_date, end_date)
-    else:
-        # 单段模式：一次请求（阶段 1-3 足够）
-        df = _try_alpha_vantage_news(symbol, start_date, end_date)
+    return segments
 
-    if df is not None and len(df) > 0:
-        print(f"[NewsCollector] Alpha Vantage 获取成功：{symbol}, {len(df)} 条新闻")
-        df["symbol"] = symbol
-        _save_cache(df, cache_path)
-        return df
-    
-    # --- 第 3 层：Finnhub 兜底 ---
-    df = _try_finnhub(symbol, start_date, end_date)
-    if df is not None and len(df) > 0:
-        print(f"[NewsCollector] Finnhub 获取成功：{symbol}, {len(df)} 条新闻")
-        df["symbol"] = symbol
-        _save_cache(df, cache_path)
-        return df
-    
-    # --- 所有数据源均失败：返回空 DataFrame（不缓存，下次重试）---
-    print(f"[NewsCollector] 所有新闻源均不可用，返回空 DataFrame：{symbol}")
-    df = pd.DataFrame(columns=["datetime", "title", "summary", "source", "sentiment_score", "symbol"])
-    return df
-
-
-def get_news_at_date(
-    news_df: pd.DataFrame,
-    symbol: str,
-    target_date: str,
-) -> List[Dict]:
-    """
-    获取指定股票在指定日期的新闻列表（严格时点对齐）。
-    
-    参数：
-      news_df: 新闻 DataFrame（由 fetch_news 返回）
-      symbol: 股票代码（用于过滤）
-      target_date: 目标日期（格式 "YYYY-MM-DD"）
-    
-    返回：
-      List[Dict]，每个 dict 包含：
-        {
-          "datetime": pd.Timestamp,
-          "title": str,
-          "summary": str,
-          "source": str,
-          "sentiment_score": float
-        }
-    
-    时点对齐规则：
-      - 只返回 datetime <= target_date 23:59:59 的新闻
-      - 不能用 target_date 之后的新闻（即使有）
-    """
-    # 去除时区信息，只保留日期部分
-    target_date_str = str(target_date).split(' ')[0]  # 取 "YYYY-MM-DD" 部分
-    target_dt = pd.Timestamp(target_date_str) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    
-    # 处理时区问题：确保 target_dt 和 news_df["datetime"] 时区一致
-    news_dt_dtype = news_df["datetime"].dtype
-    if hasattr(news_dt_dtype, 'tz'):
-        # pandas datetime with timezone
-        if news_dt_dtype.tz is not None:
-            # news_df 有时区，给 target_dt 也加上
-            target_dt = target_dt.tz_localize(news_dt_dtype.tz)
-    # 否则 news_df 是 tz-naive，target_dt 也保持 tz-naive
-    
-    # 1. 先按 symbol 过滤（如果有 symbol 列）
-    if "symbol" in news_df.columns:
-        filtered = news_df[news_df["symbol"] == symbol]
-    else:
-        # 兼容旧数据：没有 symbol 列就用所有新闻
-        filtered = news_df
-    
-    # 2. 再过滤出目标日期及之前的新闻
-    mask = (filtered["datetime"] <= target_dt)
-    filtered = filtered[mask]
-    
-    # 转换为列表格式
-    news_list = []
-    for _, row in filtered.iterrows():
-        news_list.append({
-            "datetime": row["datetime"],
-            "title": row["title"],
-            "summary": row["summary"],
-            "source": row["source"],
-            "sentiment_score": row["sentiment_score"],
-        })
-    
-    return news_list
-
-
-# ==================== 各数据源实现 ====================
 
 def _try_load_cache(cache_path: Path) -> Optional[pd.DataFrame]:
     """尝试从本地 CSV 读取缓存数据。"""
@@ -224,6 +84,76 @@ def _try_load_cache(cache_path: Path) -> Optional[pd.DataFrame]:
         return df
     except Exception as e:
         print(f"[NewsCollector] 读取缓存失败：{e}")
+        return None
+
+
+def _save_cache(df: pd.DataFrame, cache_path: Path) -> None:
+    """将 DataFrame 保存为 CSV 缓存。"""
+    try:
+        df.to_csv(cache_path, index=False)
+        print(f"[NewsCollector] 已缓存到：{cache_path.name}")
+    except Exception as e:
+        print(f"[NewsCollector] 缓存写入失败（不影响本次使用）: {e}")
+
+
+def _try_alpha_vantage_news(symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+    """
+    通过 Alpha Vantage News & Sentiment API 获取新闻数据。
+    
+    免费版限制：25 次/天/key
+    API 文档：https://www.alphavantage.co/documentation/#news-sentiment
+    """
+    api_key = config.ALPHA_VANTAGE_API_KEY
+    if not api_key:
+        print("[NewsCollector] Alpha Vantage API Key 未配置，跳过")
+        return None
+    
+    try:
+        url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=NEWS_SENTIMENT"
+            f"&tickers={symbol}"
+            f"&time_from={pd.Timestamp(start_date).strftime('%Y%m%dT0000')}"
+            f"&time_to={pd.Timestamp(end_date).strftime('%Y%m%dT2359')}"
+            f"&limit=1000"
+            f"&apikey={api_key}"
+        )
+        
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if "feed" not in data:
+            print(f"[NewsCollector] Alpha Vantage 返回格式异常：{list(data.keys())}")
+            return None
+        
+        feed = data["feed"]
+        if not feed:
+            return None
+        
+        # 解析新闻
+        all_news = []
+        for item in feed:
+            # Alpha Vantage 提供情绪分数
+            sentiment_score = 0.0
+            if "overall_sentiment_score" in item:
+                sentiment_score = float(item["overall_sentiment_score"])
+            
+            all_news.append({
+                "datetime": pd.to_datetime(item["time_published"], format="%Y%m%dT%H%M%S"),
+                "title": item.get("title", ""),
+                "summary": item.get("summary", ""),
+                "source": item.get("source", "Alpha Vantage"),
+                "sentiment_score": sentiment_score,
+            })
+        
+        df = pd.DataFrame(all_news)
+        df = df.sort_values("datetime").reset_index(drop=True)
+        
+        return df
+    
+    except Exception as e:
+        print(f"[NewsCollector] Alpha Vantage 获取失败：{e}")
         return None
 
 
@@ -296,160 +226,185 @@ def _try_finnhub(symbol: str, start_date: str, end_date: str) -> Optional[pd.Dat
         return None
 
 
-def _fetch_news_segmented_av(
+def _fetch_segment_with_fallback(
     symbol: str,
-    start_date: str,
-    end_date: str,
+    seg_start_str: str,
+    seg_end_str: str,
+    quota_remaining: List[int],  # 用列表以便在函数内修改
+    use_finnhub: bool = True,
 ) -> Optional[pd.DataFrame]:
     """
-    多段请求 Alpha Vantage News，拼接更长的历史覆盖。
-
-    将 [start_date, end_date] 按 NEWS_SEGMENT_DAYS 天切分为多段，
-    每段独立调用 AV API（单次最多 1000 条），最后合并去重。
-
-    每段独立缓存：已拉取的段不会重复请求，可以分多天完成。
-    免费版 25 次/天，3 年数据（~78 段 × 2 股）需要 ~6 天分批拉取。
+    对单个段执行 3 层兜底：缓存 → AV → Finnhub。
+    
+    参数：
+      quota_remaining: 剩余 API 配额（单元素列表，用于在调用间共享状态）
+      use_finnhub: 是否启用 Finnhub 兜底（分段模式下建议关闭）
+    
+    返回：DataFrame 或 None（该段无数据）
     """
-    segment_days = config.NEWS_SEGMENT_DAYS
-    seg_start = pd.Timestamp(start_date)
-    seg_end_full = pd.Timestamp(end_date)
+    seg_cache = config.NEWS_CACHE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
+    
+    # 第1层：缓存
+    cached = _try_load_cache(seg_cache)
+    if cached is not None:
+        return cached
+    
+    # 第2层：Alpha Vantage（有配额限制）
+    if quota_remaining[0] > 0:
+        df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
+        quota_remaining[0] -= 1
+        
+        if df is not None and len(df) > 0:
+            df["symbol"] = symbol
+            _save_cache(df, seg_cache)
+            return df
+    else:
+        print(f"    [NewsCollector] AV 配额已用完，跳过 {seg_start_str} ~ {seg_end_str}")
+    
+    # 第3层：Finnhub（可选）
+    if use_finnhub:
+        df = _try_finnhub(symbol, seg_start_str, seg_end_str)
+        if df is not None and len(df) > 0:
+            df["symbol"] = symbol
+            _save_cache(df, seg_cache)
+            return df
+    
+    # 所有数据源均失败
+    return None
 
+
+# ==================== 公开接口 ====================
+
+def fetch_news(
+    symbol: str = config.DEFAULT_SYMBOL,
+    start_date: str = config.DEFAULT_START_DATE,
+    end_date: str = config.DEFAULT_END_DATE,
+) -> pd.DataFrame:
+    """
+    获取指定标的的历史新闻数据。
+    
+    参数：
+      symbol: 股票代码（如 "AAPL"）
+      start_date: 起始日期（格式 "YYYY-MM-DD"）
+      end_date: 结束日期（格式 "YYYY-MM-DD"）
+    
+    返回：
+      pd.DataFrame，列 = [datetime, title, summary, source, sentiment_score]
+      - datetime: 新闻发布时间（pd.Timestamp）
+      - title: 新闻标题
+      - summary: 新闻摘要
+      - source: 新闻来源
+      - sentiment_score: 情绪分数（-1.0 ~ 1.0，正=看涨，负=看跌）
+    
+    数据源策略（按段独立兜底）：
+      1. 本地段级缓存（基于全局锚点网格）
+      2. Alpha Vantage（缓存未命中时从 API 拉取）
+      3. Finnhub（AV 失败时的兜底）
+    """
+    # 按网格拆分，每段独立兜底
+    segments = _split_into_segments(start_date, end_date)
     all_dfs = []
-    seg_idx = 0
-    skipped_cache = 0
-    fetched_new = 0
-    quota_remaining = config.NEWS_DAILY_QUOTA  # 本次运行的 API 配额
-    quota_exhausted = False
-
-    while seg_start < seg_end_full:
-        chunk_end = min(seg_start + pd.Timedelta(days=segment_days - 1), seg_end_full)
-        seg_idx += 1
-
-        seg_start_str = seg_start.strftime('%Y-%m-%d')
-        seg_end_str = chunk_end.strftime('%Y-%m-%d')
-
-        # 每段独立缓存
-        seg_cache = config.NEWS_CACHE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
-        cached = _try_load_cache(seg_cache)
-
-        if cached is not None:
-            all_dfs.append(cached)
-            skipped_cache += 1
-        elif quota_remaining > 0:
-            print(f"  [NewsCollector] 分段请求 [{seg_idx}]：{seg_start_str} ~ {seg_end_str}")
-            chunk_df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
-            quota_remaining -= 1
-
-            # 限流重试：如果返回空（被限速），等 30 秒后重试一次
-            if chunk_df is None and quota_remaining > 0:
-                print(f"    [NewsCollector] 可能触发限流，等待 30 秒重试...")
-                time.sleep(30)
-                chunk_df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
-                quota_remaining -= 1
-
-            if chunk_df is not None and len(chunk_df) > 0:
-                chunk_df["symbol"] = symbol
-                _save_cache(chunk_df, seg_cache)
-                all_dfs.append(chunk_df)
-                fetched_new += 1
-
-            # 限流保护：免费版 5 次/分钟（12 秒/次），用 15 秒留余量
-            if seg_start + pd.Timedelta(days=segment_days) < seg_end_full and quota_remaining > 0:
-                time.sleep(15)
-        else:
-            if not quota_exhausted:
-                print(f"  [NewsCollector] 本次配额已用完 "
-                      f"({config.NEWS_DAILY_QUOTA} 次)，剩余段下次再拉")
-                quota_exhausted = True
-
-        seg_start = chunk_end + pd.Timedelta(days=1)
-
+    quota_remaining = [config.NEWS_DAILY_QUOTA]  # 用列表以便在函数间共享
+    
+    for seg_idx, (seg_start_str, seg_end_str) in enumerate(segments, 1):
+        print(f"  [NewsCollector] 处理段 [{seg_idx}/{len(segments)}]：{seg_start_str} ~ {seg_end_str}")
+        
+        df = _fetch_segment_with_fallback(
+            symbol, seg_start_str, seg_end_str,
+            quota_remaining=quota_remaining,
+            use_finnhub=False  # 分段模式下不用 Finnhub
+        )
+        
+        if df is not None and len(df) > 0:
+            all_dfs.append(df)
+        
+        # 限流保护：AV 免费版 5次/分钟（12秒/次），用 15 秒留余量
+        if seg_idx < len(segments) and quota_remaining[0] > 0:
+            time.sleep(15)
+    
     if not all_dfs:
-        return None
-
+        print(f"[NewsCollector] 所有段均无数据：{symbol}")
+        return pd.DataFrame(columns=["datetime", "title", "summary", "source", "sentiment_score", "symbol"])
+    
+    # 合并去重
     df = pd.concat(all_dfs, ignore_index=True)
     before = len(df)
     df = df.drop_duplicates(subset=["title"], keep="first")
     df = df.sort_values("datetime").reset_index(drop=True)
     after = len(df)
-
-    print(f"  [NewsCollector] 分段合并：{seg_idx} 段 "
-          f"(缓存命中 {skipped_cache}, 新拉取 {fetched_new}), "
-          f"{before} → {after} 条")
-
+    
+    print(f"[NewsCollector] 分段完成：{len(segments)} 段, "
+          f"{before} → {after} 条，剩余配额 {quota_remaining[0]}")
     return df
 
 
-def _try_alpha_vantage_news(symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+def get_news_at_date(
+    news_df: pd.DataFrame,
+    symbol: str,
+    target_date: str,
+    lookback_days: int = 7,
+) -> List[Dict]:
     """
-    通过 Alpha Vantage News & Sentiment API 获取新闻数据。
+    获取指定股票在指定日期的新闻列表（严格时点对齐）。
     
-    免费版限制：25 次/天/key，多 key 自动轮换
-    API 文档：https://www.alphavantage.co/documentation/#news-sentiment
+    参数：
+      news_df: 新闻 DataFrame（由 fetch_news 返回）
+      symbol: 股票代码（用于过滤）
+      target_date: 目标日期（格式 "YYYY-MM-DD"）
+      lookback_days: 回溯天数（默认 7 天，只看最近一周的新闻）
+    
+    返回：
+      List[Dict]，每个 dict 包含：
+        {
+          "datetime": pd.Timestamp,
+          "title": str,
+          "summary": str,
+          "source": str,
+          "sentiment_score": float
+        }
+    
+    时点对齐规则：
+      - 只返回 target_date - lookback_days <= datetime <= target_date 的新闻
+      - 不能用 target_date 之后的新闻（即使有）
+      - 不看太久远的新闻（避免 token 爆炸）
     """
-    api_key = config.get_next_av_key()
-    if not api_key:
-        print("[NewsCollector] Alpha Vantage API Key 未配置，跳过")
-        return None
+    # 去除时区信息，只保留日期部分
+    target_date_str = str(target_date).split(' ')[0]  # 取 "YYYY-MM-DD" 部分
+    target_dt = pd.Timestamp(target_date_str) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    start_dt = target_dt - pd.Timedelta(days=lookback_days)
     
-    try:
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=NEWS_SENTIMENT"
-            f"&tickers={symbol}"
-            f"&time_from={pd.Timestamp(start_date).strftime('%Y%m%dT0000')}"
-            f"&time_to={pd.Timestamp(end_date).strftime('%Y%m%dT2359')}"
-            f"&limit=1000"
-            f"&apikey={api_key}"
-        )
-        
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "feed" not in data:
-            print(f"[NewsCollector] Alpha Vantage 返回格式异常：{list(data.keys())}")
-            return None
-        
-        feed = data["feed"]
-        if not feed:
-            return None
-        
-        # 解析新闻
-        all_news = []
-        for item in feed:
-            # Alpha Vantage 提供情绪分数
-            sentiment_score = 0.0
-            if "overall_sentiment_score" in item:
-                sentiment_score = float(item["overall_sentiment_score"])
-            
-            all_news.append({
-                "datetime": pd.to_datetime(item["time_published"], format="%Y%m%dT%H%M%S"),
-                "title": item.get("title", ""),
-                "summary": item.get("summary", ""),
-                "source": item.get("source", "Alpha Vantage"),
-                "sentiment_score": sentiment_score,
-            })
-        
-        df = pd.DataFrame(all_news)
-        df = df.sort_values("datetime").reset_index(drop=True)
-        
-        return df
+    # 处理时区问题：确保 target_dt 和 news_df["datetime"] 时区一致
+    news_dt_dtype = news_df["datetime"].dtype
+    if hasattr(news_dt_dtype, 'tz'):
+        # pandas datetime with timezone
+        if news_dt_dtype.tz is not None:
+            # news_df 有时区，给 target_dt 也加上
+            target_dt = target_dt.tz_localize(news_dt_dtype.tz)
+    # 否则 news_df 是 tz-naive，target_dt 也保持 tz-naive
     
-    except Exception as e:
-        print(f"[NewsCollector] Alpha Vantage 获取失败：{e}")
-        return None
-
-
-# ==================== 缓存写入 ====================
-
-def _save_cache(df: pd.DataFrame, cache_path: Path) -> None:
-    """将 DataFrame 保存为 CSV 缓存。"""
-    try:
-        df.to_csv(cache_path, index=False)
-        print(f"[NewsCollector] 已缓存到：{cache_path.name}")
-    except Exception as e:
-        print(f"[NewsCollector] 缓存写入失败（不影响本次使用）: {e}")
+    # 1. 先按 symbol 过滤（如果有 symbol 列）
+    if "symbol" in news_df.columns:
+        filtered = news_df[news_df["symbol"] == symbol]
+    else:
+        # 兼容旧数据：没有 symbol 列就用所有新闻
+        filtered = news_df
+    
+    # 2. 过滤出目标日期范围内的新闻（最近 lookback_days 天）
+    mask = (filtered["datetime"] >= start_dt) & (filtered["datetime"] <= target_dt)
+    filtered = filtered[mask]
+    
+    # 转换为列表格式
+    news_list = []
+    for _, row in filtered.iterrows():
+        news_list.append({
+            "datetime": row["datetime"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "source": row["source"],
+            "sentiment_score": row["sentiment_score"],
+        })
+    
+    return news_list
 
 
 # ==================== 测试入口 ====================
