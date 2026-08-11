@@ -19,6 +19,7 @@ from .risk_manager import RiskManager
 from .recorder import Recorder, Trade
 
 
+
 class BaseBacktestEngine:
     """
     回测引擎基类，提供资金管理和交易撮合的公共实现。
@@ -85,12 +86,17 @@ class BaseBacktestEngine:
             reason=reason,
         ))
 
+        # R5: 调仓交易记录换手并扣除惩罚
+        if "调仓" in reason:
+            self.risk_manager.record_turnover()
+            turnover_cost = self.risk_manager.get_turnover_cost(shares * exec_price)
+            self.cash -= turnover_cost
+
         print(f"  [BUY] {symbol} x{shares} @ ${exec_price:.2f} = ${shares * exec_price:,.2f} ({reason})")
 
     def sell(self, symbol: str, shares: int, price: float, date, reason: str = ""):
         """
         卖出股票（含滑点和手续费），并反馈风控。
-
         如果 shares 超过实际持仓，自动截断为持仓量。
         """
         if symbol not in self.holdings or shares <= 0:
@@ -126,6 +132,12 @@ class BaseBacktestEngine:
 
         # R4: 反馈交易结果给风控（更新连亏降仓状态）
         self.risk_manager.record_trade_result(pnl > 0)
+
+        # R5: 调仓交易记录换手并扣除惩罚
+        if "调仓" in reason:
+            self.risk_manager.record_turnover()
+            turnover_cost = self.risk_manager.get_turnover_cost(shares * exec_price)
+            self.cash -= turnover_cost
 
     # ==================== 持仓查询 ====================
 
