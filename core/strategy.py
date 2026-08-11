@@ -6,9 +6,9 @@
   阶段1 使用纯规则策略，不需要任何机器学习训练。
 
 策略逻辑（自适应多条件融合投票）：
-  综合 MA金叉死叉、EMA趋势、RSI超买超卖、MACD方向 四个维度的信号，
+  综合 EMA趋势、RSI超买超卖、MACD方向 三个维度的信号，
   根据 ADX 识别市场状态，动态调整各指标权重：
-  - 趋势行情（ADX > 25）：趋势指标（MA/EMA/MACD）权重高，RSI 权重低
+  - 趋势行情（ADX > 25）：趋势指标（EMA/MACD）权重高，RSI 权重低
   - 震荡行情（ADX ≤ 25）：RSI 权重高，趋势指标权重低
   同时用 VWAP 作为买入过滤条件（价格在 VWAP 上方才允许买入）。
 
@@ -47,7 +47,6 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
       ┌──────────┬─────────────────────┬──────────────────────┬────────────┐
       │ 指标     │ 看涨条件 (+1)       │ 看跌条件 (-1)        │ 趋势权重   │
       ├──────────┼─────────────────────┼──────────────────────┼────────────┤
-      │ MA       │ 短期MA > 长期MA     │ 短期MA < 长期MA      │ 趋势:1.5 震荡:0.5 │
       │ EMA      │ 短期EMA > 长期EMA   │ 短期EMA < 长期EMA    │ 趋势:1.5 震荡:0.5 │
       │ RSI      │ RSI < 超卖阈值      │ RSI > 超买阈值       │ 趋势:0.5 震荡:1.5 │
       │ MACD     │ MACD柱 > 0          │ MACD柱 < 0           │ 趋势:1.5 震荡:0.5 │
@@ -61,13 +60,7 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     # ---------- 第 1 步：逐指标打分 ----------
 
-    # MA 趋势得分：短期均线在长期均线之上 = +1，之下 = -1
-    ma_score = np.where(
-        result["ma_short"] > result["ma_long"], 1,
-        np.where(result["ma_short"] < result["ma_long"], -1, 0)
-    )
-
-    # EMA 趋势得分：比 MA 更灵敏，对近期价格变化反应更快
+    # EMA 趋势得分：短期均线在长期均线之上 = +1，之下 = -1
     ema_score = np.where(
         result["ema_short"] > result["ema_long"], 1,
         np.where(result["ema_short"] < result["ema_long"], -1, 0)
@@ -95,9 +88,8 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     trend_w = np.where(is_trending, 1.5, 0.5)
     rsi_w = np.where(is_trending, 0.5, 1.5)
 
-    # 加权总分（范围约：-6 ~ +6）
+    # 加权总分（范围约：-4.5 ~ +4.5）
     total_score = (
-        ma_score * trend_w +
         ema_score * trend_w +
         rsi_score * rsi_w +
         macd_score * trend_w

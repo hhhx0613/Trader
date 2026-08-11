@@ -4,7 +4,7 @@
 支持通过 OpenAI 兼容接口灵活切换：
 - OpenAI (GPT-4, GPT-3.5-turbo)
 - GLM (智谱 AI: GLM-4, GLM-3-turbo)
-- DeepSeek (DeepSeek-Chat, DeepSeek-Code)
+- DeepSeek (DeepSeek-V4-Pro, DeepSeek-V4-Flash)
 
 使用方法：
   client = LLMClient(provider="glm")  # 或 "openai", "deepseek"
@@ -17,8 +17,14 @@
 """
 
 import os
+import sys
 from typing import Dict, List, Optional
 from pathlib import Path
+
+# 添加项目根目录到 Python 路径
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from core import config
 
@@ -50,8 +56,8 @@ class LLMClient:
         "deepseek": {
             "base_url": "https://api.deepseek.com/v1",
             "api_key_env": "DEEPSEEK_API_KEY",
-            "default_model": "deepseek-chat",
-            "models": ["deepseek-chat", "deepseek-code"],
+            "default_model": "deepseek-v4-pro",
+            "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
         },
     }
     

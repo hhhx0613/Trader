@@ -9,7 +9,7 @@
   5. 返回：选中的 K 只股票 + 各自置信度
 
 Plan.md 阶段 3 对应：
-  - 选股(每周)：LLM 分析候选池 → 按置信度排序返回 Top-K(默认 K=3)
+  - 选股(每周)：LLM 分析候选池 → 按置信度排序返回 Top-K(默认 K=5)
   - 不足 K 只达标(confidence >= 阈值)则减少持仓数，全不达标则空仓
   - 持有优先：仍在 Top-K 的持仓不动，只替换掉出榜的
 """
@@ -22,8 +22,17 @@ from core.data.news_data import get_news_at_date
 from core import config
 
 
-# 默认候选池
-DEFAULT_CANDIDATE_POOL = ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN"]
+# 默认候选池（10 只股票，跨行业分散化）
+DEFAULT_CANDIDATE_POOL = [
+    # 科技（5 只）
+    "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN",
+    # 金融（2 只）
+    "JPM", "V",
+    # 医疗（2 只）
+    "JNJ", "UNH",
+    # 消费（1 只）
+    "WMT"
+]
 
 
 def analyze_candidate_pool(
@@ -62,6 +71,16 @@ def analyze_candidate_pool(
         try:
             # 获取该股票的新闻（按 symbol 过滤）
             news_list = _get_news_for_symbol(news_df, symbol, date)
+
+            # 无新闻时直接跳过 LLM 调用，避免浪费 API 配额
+            if not news_list:
+                results.append({
+                    "symbol": symbol,
+                    "direction": "neutral",
+                    "confidence": 0.0,
+                    "analysis": {"direction": "neutral", "confidence": 0.0},
+                })
+                continue
 
             # LLM 分析
             analysis = agent.analyze(symbol, date, news_list)
@@ -238,13 +257,7 @@ def _get_news_for_symbol(
     if news_df is None or len(news_df) == 0:
         return []
 
-    # 按 symbol 过滤（如果有 symbol 列）
-    if "symbol" in news_df.columns:
-        filtered_df = news_df[news_df["symbol"] == symbol]
-    else:
-        filtered_df = news_df
-
-    return get_news_at_date(filtered_df, symbol, date)
+    return get_news_at_date(news_df, symbol, date)
 
 
 # ==================== 测试入口 ====================

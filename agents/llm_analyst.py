@@ -18,17 +18,114 @@ LLM Analyst Agent（新闻分析师）
 """
 
 import json
+import sys
 import hashlib
 import pandas as pd
 from typing import Dict, List, Optional
 from pathlib import Path
 
+# 支持直接运行本文件（python agents/llm_analyst.py）
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from core.data.news_data import get_news_at_date
+from core.data.llm_cache_db import get_cache_db
 from utils.llm_client import LLMClient
 
 # LLM 输出缓存目录
 _LLM_CACHE_DIR = Path(__file__).parent.parent / "core" / "data" / "cache" / "llm"
 _LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==================== System Prompt（v2.0 结构化多维打分框架）====================
+# 设计原则：
+#   - 约束模型的思考维度（事件影响性、预期差、时效性、传导确定性）
+#   - 不设定关键词到分数的硬映射（避免退化为 VADER 式词典匹配）
+#   - 让 LLM 发挥语义理解优势，同时输出可解释、可追溯的结构化评分
+
+_SYSTEM_PROMPT = """\
+你是专业股票分析师。请对给定的股票新闻进行结构化多维分析，判断市场情绪和股价方向。
+
+## 分析框架
+
+对每条新闻，从以下 4 个维度独立打分：
+
+### 1. 事件影响性（impact：-2 ~ +2）
+对公司基本面（营收、利润、市场份额、技术壁垒）的实质影响程度。
+- +2：重大利好（超预期财报、重大合同、突破性产品）
+- +1：温和利好（小幅超预期、正面合作、分析师上调评级）
+-  0：中性（例行公告、人事变动、行业一般动态）
+- -1：温和利空（小幅不及预期、监管关注、竞争加剧）
+- -2：重大利空（财报暴雷、核心产品失败、高管丑闻、重大诉讼）
+
+### 2. 预期差（expectation_gap：-2 ~ +2）
+与市场已有共识的偏离程度。
+- +2：远超市场共识的意外利好
+- +1：略超市场预期
+-  0：符合预期，或新闻本身未涉及预期对比
+- -1：略低于市场预期
+- -2：远低于预期的意外利空
+
+### 3. 时效性系数（timeliness：0.5 / 1.0 / 1.5）
+影响持续时间的估计。
+- 0.5：短期噪音（1-3 天内消化，如日内波动、未经证实的传闻、技术面反弹）
+- 1.0：中期影响（1-4 周内逐步反映，如季度财报、产品发布）
+- 1.5：长期结构性变化（1-3 个月以上持续影响，如战略转型、行业格局变化）
+
+### 4. 传导确定性（certainty：0.5 / 1.0 / 1.5）
+从事件到股价变动的逻辑链可靠性。
+- 0.5：逻辑链弱或存在多重不确定性（传闻、间接影响、需多步传导）
+- 1.0：逻辑链较清晰（直接影响、有历史参照）
+- 1.5：因果关系明确且可验证（已公告的重大事件、历史同类事件均有明确反应）
+
+### 单条新闻得分计算
+score = (impact + expectation_gap) × timeliness × certainty
+理论范围 [-6, +6]
+
+### 综合得分（composite_score）
+所有新闻 score 的加权平均（时效性高的权重更大），归一化到 [-1, 1]。
+归一化方法：composite_score = tanh(加权平均 score / 3.0)
+
+## 输出格式
+
+严格按以下 JSON 结构输出，不要添加任何其他文字：
+
+{
+  "per_news": [
+    {
+      "index": 1,
+      "impact": 1,
+      "expectation_gap": 0,
+      "timeliness": 1.0,
+      "certainty": 1.0,
+      "score": 1.0,
+      "reasoning": "简要说明打分理由（50字以内）"
+    }
+  ],
+  "composite_score": 0.75,
+  "direction": "bullish",
+  "confidence": 0.8,
+  "key_factors": ["因素1", "因素2"],
+  "reasons": ["综合原因1", "综合原因2"]
+}
+
+## 字段说明
+- per_news：每条新闻的维度打分（与新闻列表序号对应）
+- composite_score：综合得分，[-1, 1]，正=看涨，负=看跌
+- direction：bullish（composite_score > 0.1）/ neutral（-0.1 ~ 0.1）/ bearish（< -0.1）
+- confidence：置信度，硬性规则如下：
+  - 5+ 条有实质内容的新闻：0.8-1.0
+  - 2-4 条新闻：0.5-0.7
+  - 0-1 条新闻：0.0-0.4
+- key_factors：影响判断的核心因素（不超过 3 个）
+- reasons：综合判断理由（不超过 3 条）
+
+## 约束
+1. 只输出 JSON，不要任何额外文字或 markdown 标记
+2. 每条 news 的 reasoning 不超过 50 字
+3. composite_score 必须在 [-1, 1] 范围内
+4. 如果无新闻，per_news 为空数组，direction 为 neutral，confidence 为 0.0
+"""
 
 
 class LLMAnalystAgent:
@@ -51,7 +148,7 @@ class LLMAnalystAgent:
         """
         self.provider = provider
         self.model = model
-        self.prompt_version = "v1.0"  # 记录 prompt 版本（可复现性）
+        self.prompt_version = "v2.0"  # 结构化多维打分框架
         
         # 初始化 LLM 客户端
         try:
@@ -96,11 +193,12 @@ class LLMAnalystAgent:
         """
         使用 LLM 客户端分析新闻（带缓存）。
         """
-        # 构建 prompt
-        prompt = self._build_prompt(symbol, date, news_list)
+        # 构建 prompt（system = 固定框架，user = 每次变化的新闻数据）
+        system_prompt = self._build_system_prompt()
+        user_message = self._build_user_message(symbol, date, news_list)
         
         # 检查缓存（可复现性：相同输入直接返回缓存结果）
-        cache_key = self._compute_cache_key(symbol, date, prompt)
+        cache_key = self._compute_cache_key(symbol, date, system_prompt, user_message)
         cached = self._load_cache(cache_key)
         if cached is not None:
             print(f"  [LLM Cache] 命中缓存: {symbol} @ {date}")
@@ -108,10 +206,10 @@ class LLMAnalystAgent:
         
         # 调用 LLM 客户端
         response = self.llm_client.chat_json(
-            message=prompt,
-            system_prompt="你是一个专业的股票分析师。",
+            message=user_message,
+            system_prompt=system_prompt,
             temperature=0.1,  # 低温保证可复现性
-            max_tokens=1000,
+            max_tokens=2000,
         )
         
         # 检查是否有错误
@@ -128,79 +226,60 @@ class LLMAnalystAgent:
         
         return response
     
-    def _build_prompt(self, symbol: str, date: str, news_list: List[Dict]) -> str:
+    def _build_system_prompt(self) -> str:
+        """返回固定的分析框架 prompt（见模块级常量 _SYSTEM_PROMPT）。"""
+        return _SYSTEM_PROMPT
+
+    def _build_user_message(self, symbol: str, date: str, news_list: List[Dict]) -> str:
         """
-        构建 LLM prompt。
+        构建 user message（每次调用变化的新闻数据）。
         """
         # 格式化新闻列表（处理可能的 NaN 值）
         news_lines = []
-        for news in news_list[:5]:  # 最多取 5 条新闻
+        for i, news in enumerate(news_list[-10:], 1):  # 最多取最近 10 条新闻
             dt = news.get('datetime', 'Unknown')
             title = news.get('title', 'No title')
             summary = news.get('summary', '')
+            source = news.get('source', 'Unknown')
             # 处理 summary 可能是 NaN 的情况
             if pd.isna(summary) or not isinstance(summary, str):
                 summary = ''
-            summary_text = summary[:100] if summary else 'No summary'
-            news_lines.append(f"- {dt}: {title}\n  摘要：{summary_text}")
-        
-        news_text = "\n".join(news_lines)
-        
-        prompt = f"""
-分析 {symbol} 在 {date} 的新闻，判断市场情绪和股价方向。
+            summary_text = summary[:200] if summary else 'No summary'
+            news_lines.append(
+                f"[{i}] [{source}] {dt}\n"
+                f"    标题：{title}\n"
+                f"    摘要：{summary_text}"
+            )
 
-新闻列表：
-{news_text}
+        news_text = "\n\n".join(news_lines) if news_lines else "（无新闻）"
 
-请以 JSON 格式输出：
-{{
-  "symbol": "{symbol}",
-  "direction": "bullish（看涨）| neutral（中性）| bearish（看跌）",
-  "confidence": 0.0-1.0（置信度，基于新闻质量和数量）,
-  "reasons": ["原因 1", "原因 2", ...],
-  "sources": ["新闻标题 1", "新闻标题 2", ...]
-}}
+        return f"请分析 {symbol} 在 {date} 的新闻：\n\n{news_text}"
 
-注意：
-1. 只输出 JSON，不要其他文字
-2. confidence 根据新闻数量和质量调整：
-   - 5+ 条新闻：0.8-1.0
-   - 2-4 条新闻：0.5-0.7
-   - 0-1 条新闻：0.0-0.4
-3. direction 必须准确，不要模棱两可
-"""
-        
-        return prompt.strip()
+    # ==================== LLM 输出缓存（SQLite）====================
 
-    # ==================== LLM 输出缓存 ====================
-
-    def _compute_cache_key(self, symbol: str, date: str, prompt: str) -> str:
+    def _compute_cache_key(self, symbol: str, date: str, system_prompt: str, user_message: str) -> tuple:
         """
-        计算缓存 key（基于 symbol + date + prompt 的 hash）。
-        保证相同输入总是返回相同缓存。
+        计算缓存 key（用于 SQLite 查询）。
+        返回 (symbol, date, model) 三元组。
         """
-        content = f"{symbol}|{date}|{self.model}|{prompt}"
-        return hashlib.md5(content.encode("utf-8")).hexdigest()
+        return (symbol, date, self.model)
 
-    def _load_cache(self, cache_key: str) -> Optional[Dict]:
-        """从本地文件加载 LLM 缓存。"""
-        cache_file = _LLM_CACHE_DIR / f"{cache_key}.json"
-        if cache_file.exists():
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return None
-        return None
+    def _load_cache(self, cache_key: tuple) -> Optional[Dict]:
+        """从 SQLite 数据库加载 LLM 缓存。"""
+        symbol, date, model = cache_key
+        cache_db = get_cache_db()
+        return cache_db.get_cache(symbol, date, model)
 
-    def _save_cache(self, cache_key: str, data: Dict):
-        """将 LLM 输出保存到本地缓存文件。"""
-        cache_file = _LLM_CACHE_DIR / f"{cache_key}.json"
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[LLM Cache] 缓存写入失败（不影响使用）：{e}")
+    def _save_cache(self, cache_key: tuple, data: Dict):
+        """将 LLM 输出保存到 SQLite 数据库。"""
+        symbol, date, model = cache_key
+        cache_db = get_cache_db()
+        
+        # 添加 model 字段到 data
+        data_to_save = data.copy()
+        data_to_save["model"] = model
+        
+        cache_db.save_cache(data_to_save)
 
 
 # ==================== 便捷函数 ====================
@@ -218,14 +297,14 @@ def analyze_stock_news(
     参数：
       symbol: 股票代码
       date: 分析日期
-      news_df: 新闻 DataFrame（由 fetch_news 返回）
+      news_df: 新闻 DataFrame（由 fetch_news 返回，包含所有股票）
       provider: LLM 提供商 ("openai", "glm", "deepseek")
       model: 模型名称
     
     返回：
       LLM 分析结果字典
     """
-    # 获取时点对齐的新闻
+    # 获取该股票在时点对齐的新闻
     news_list = get_news_at_date(news_df, symbol, date)
     
     # 创建 agent 并分析
@@ -246,7 +325,7 @@ if __name__ == "__main__":
     # 模拟新闻数据
     news_list = [
         {
-            "datetime": "2023-06-15 09:00:00",
+            "datetime": "2023-06-17 09:00:00",
             "title": "Apple reports strong earnings",
             "summary": "Apple beat expectations with Q2 revenue of $90B",
             "source": "Finnhub",
@@ -254,5 +333,5 @@ if __name__ == "__main__":
         }
     ]
     
-    result = agent.analyze("AAPL", "2023-06-15", news_list)
+    result = agent.analyze("AAPL", "2023-06-17", news_list)
     print(f"分析结果：{json.dumps(result, indent=2, ensure_ascii=False)}")

@@ -29,6 +29,45 @@ import requests
 from .. import config
 
 
+def _find_covering_cache(symbol: str, start_date: str, end_date: str) -> Optional[Path]:
+    """
+    查找覆盖请求日期范围的缓存文件。
+    
+    如果精确匹配不存在，查找更大的缓存文件（如 *_2025-08-11_2026-08-06.csv
+    可以覆盖 2026-07-06 ~ 2026-08-06 的请求）。
+    """
+    import re
+    
+    # 精确匹配
+    exact = config.NEWS_CACHE_DIR / f"{symbol}_news_{start_date}_{end_date}.csv"
+    if exact.exists():
+        return exact
+    
+    # 查找覆盖范围更大的缓存
+    pattern = re.compile(rf"^{symbol}_news_(\d{{4}}-\d{{2}}-\d{{2}})_(\d{{4}}-\d{{2}}-\d{{2}})\.csv$")
+    req_start = pd.Timestamp(start_date)
+    req_end = pd.Timestamp(end_date)
+    
+    best_match = None
+    best_span = 0
+    
+    for f in config.NEWS_CACHE_DIR.glob(f"{symbol}_news_*.csv"):
+        if "_seg_" in f.name:
+            continue  # 跳过分段缓存
+        m = pattern.match(f.name)
+        if m:
+            cache_start = pd.Timestamp(m.group(1))
+            cache_end = pd.Timestamp(m.group(2))
+            # 检查是否覆盖请求范围
+            if cache_start <= req_start and cache_end >= req_end:
+                span = (cache_end - cache_start).days
+                if span > best_span:
+                    best_span = span
+                    best_match = f
+    
+    return best_match
+
+
 # ==================== 公开接口 ====================
 
 def fetch_news(
@@ -59,16 +98,22 @@ def fetch_news(
       2. Alpha Vantage（历史覆盖广，自带情绪分，优先）
       3. Finnhub（AV 失败时的兜底）
     """
-    # 生成缓存文件名
-    cache_filename = f"{symbol}_news_{start_date}_{end_date}.csv"
-    cache_path = config.CACHE_DIR / cache_filename
-    
-    # --- 第 1 层：检查本地缓存 ---
+    # --- 第 1 层：检查本地缓存（精确匹配或覆盖范围更大的缓存）---
     if use_cache:
-        df = _try_load_cache(cache_path)
-        if df is not None:
-            print(f"[NewsCollector] 命中本地缓存：{cache_filename}")
-            return df
+        cache_path = _find_covering_cache(symbol, start_date, end_date)
+        if cache_path is not None:
+            df = _try_load_cache(cache_path)
+            if df is not None:
+                # 过滤到请求的日期范围
+                req_start = pd.Timestamp(start_date)
+                req_end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+                df = df[(df["datetime"] >= req_start) & (df["datetime"] < req_end)]
+                print(f"[NewsCollector] 命中本地缓存：{cache_path.name}，过滤后 {len(df)} 条")
+                return df
+    
+    # 精确缓存文件名（用于保存）
+    cache_filename = f"{symbol}_news_{start_date}_{end_date}.csv"
+    cache_path = config.NEWS_CACHE_DIR / cache_filename
     
     # --- 第 2 层：Alpha Vantage 优先（历史覆盖广 + 自带情绪分）---
     if config.NEWS_MULTI_SEGMENT:
@@ -104,11 +149,11 @@ def get_news_at_date(
     target_date: str,
 ) -> List[Dict]:
     """
-    获取指定日期的新闻列表（严格时点对齐）。
+    获取指定股票在指定日期的新闻列表（严格时点对齐）。
     
     参数：
       news_df: 新闻 DataFrame（由 fetch_news 返回）
-      symbol: 股票代码
+      symbol: 股票代码（用于过滤）
       target_date: 目标日期（格式 "YYYY-MM-DD"）
     
     返回：
@@ -138,9 +183,16 @@ def get_news_at_date(
             target_dt = target_dt.tz_localize(news_dt_dtype.tz)
     # 否则 news_df 是 tz-naive，target_dt 也保持 tz-naive
     
-    # 过滤出目标日期及之前的新闻
-    mask = (news_df["datetime"] <= target_dt)
-    filtered = news_df[mask]
+    # 1. 先按 symbol 过滤（如果有 symbol 列）
+    if "symbol" in news_df.columns:
+        filtered = news_df[news_df["symbol"] == symbol]
+    else:
+        # 兼容旧数据：没有 symbol 列就用所有新闻
+        filtered = news_df
+    
+    # 2. 再过滤出目标日期及之前的新闻
+    mask = (filtered["datetime"] <= target_dt)
+    filtered = filtered[mask]
     
     # 转换为列表格式
     news_list = []
@@ -277,7 +329,7 @@ def _fetch_news_segmented_av(
         seg_end_str = chunk_end.strftime('%Y-%m-%d')
 
         # 每段独立缓存
-        seg_cache = config.CACHE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
+        seg_cache = config.NEWS_CACHE_DIR / f"{symbol}_news_seg_{seg_start_str}_{seg_end_str}.csv"
         cached = _try_load_cache(seg_cache)
 
         if cached is not None:
@@ -288,15 +340,22 @@ def _fetch_news_segmented_av(
             chunk_df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
             quota_remaining -= 1
 
+            # 限流重试：如果返回空（被限速），等 30 秒后重试一次
+            if chunk_df is None and quota_remaining > 0:
+                print(f"    [NewsCollector] 可能触发限流，等待 30 秒重试...")
+                time.sleep(30)
+                chunk_df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
+                quota_remaining -= 1
+
             if chunk_df is not None and len(chunk_df) > 0:
                 chunk_df["symbol"] = symbol
                 _save_cache(chunk_df, seg_cache)
                 all_dfs.append(chunk_df)
                 fetched_new += 1
 
-            # 限流保护：免费版 5 次/分钟，留余量
+            # 限流保护：免费版 5 次/分钟（12 秒/次），用 15 秒留余量
             if seg_start + pd.Timedelta(days=segment_days) < seg_end_full and quota_remaining > 0:
-                time.sleep(13)
+                time.sleep(15)
         else:
             if not quota_exhausted:
                 print(f"  [NewsCollector] 本次配额已用完 "
@@ -325,10 +384,10 @@ def _try_alpha_vantage_news(symbol: str, start_date: str, end_date: str) -> Opti
     """
     通过 Alpha Vantage News & Sentiment API 获取新闻数据。
     
-    免费版限制：25 次/天
+    免费版限制：25 次/天/key，多 key 自动轮换
     API 文档：https://www.alphavantage.co/documentation/#news-sentiment
     """
-    api_key = config.ALPHA_VANTAGE_API_KEY
+    api_key = config.get_next_av_key()
     if not api_key:
         print("[NewsCollector] Alpha Vantage API Key 未配置，跳过")
         return None

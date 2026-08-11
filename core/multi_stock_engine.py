@@ -72,15 +72,22 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         if candidate_pool is None:
             candidate_pool = list(market_data.keys())
 
-        # ========== 预处理：计算所有股票的技术指标 ==========
+        # ========== 预处理：检查/计算技术指标 ==========
         print(f"\n[MultiStockEngine] 预处理技术指标...")
         enriched_data = {}
         for symbol, df in market_data.items():
-            enriched_df = compute_all_indicators(df.copy())
-            enriched_data[symbol] = enriched_df
-            print(f"  {symbol}: {len(enriched_df)} bars, "
-                  f"RSI={enriched_df['rsi'].iloc[-1]:.1f}, "
-                  f"MACD_hist={enriched_df['macd_hist'].iloc[-1]:.3f}")
+            if "rsi" in df.columns and "adx" in df.columns and "ema_short" in df.columns:
+                # 数据已含指标（由调用方预计算含预热期），直接使用
+                enriched_data[symbol] = df
+                print(f"  {symbol}: {len(df)} bars (预计算), "
+                      f"RSI={df['rsi'].iloc[-1]:.1f}, "
+                      f"MACD_hist={df['macd_hist'].iloc[-1]:.3f}")
+            else:
+                enriched_df = compute_all_indicators(df.copy())
+                enriched_data[symbol] = enriched_df
+                print(f"  {symbol}: {len(enriched_df)} bars, "
+                      f"RSI={enriched_df['rsi'].iloc[-1]:.1f}, "
+                      f"MACD_hist={enriched_df['macd_hist'].iloc[-1]:.3f}")
 
         # ========== 构建统一交易日历 ==========
         all_dates = set()
@@ -203,8 +210,8 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                 "macd_hist": float(bar.get("macd_hist", 0.0)),
                 "adx": float(bar.get("adx", 25.0)),
                 "atr": float(bar.get("atr", 0.0)),
-                "ma_short": float(bar.get("ma_short", bar["close"])),
-                "ma_long": float(bar.get("ma_long", bar["close"])),
+                "ema_short": float(bar.get("ema_short", bar["close"])),
+                "ema_long": float(bar.get("ema_long", bar["close"])),
                 "rolling_20d": rolling_20d,
             }
 

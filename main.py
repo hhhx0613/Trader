@@ -12,7 +12,7 @@
 
 阶段1 完整流程：
   1. data_collector.fetch_ohlcv()   → 获取 K 线数据（三层兜底）
-  2. indicators.compute_all_indicators() → 计算 MA/RSI/MACD
+  2. indicators.compute_all_indicators() → 计算 EMA/RSI/MACD
   3. strategy.generate_signals()    → 生成买卖信号
   4. BacktestEngine.run()           → 逐 Bar 回测撮合
   5. Recorder.print_report()        → 输出绩效报告
@@ -67,9 +67,9 @@ def run_backtest(
     print(f"  → 获取到 {len(df)} 根日K线")
 
     # ---------- 第 2 步：计算技术指标 ----------
-    print("\n[Step 2/4] 计算技术指标 (MA/RSI/MACD)...")
+    print("\n[Step 2/4] 计算技术指标 (EMA/RSI/MACD)...")
     df = compute_all_indicators(df)
-    print(f"  → 已计算 MA({config.MA_SHORT}/{config.MA_LONG}), "
+    print(f"  → 已计算 EMA({config.EMA_SHORT}/{config.EMA_LONG}), "
           f"RSI({config.RSI_PERIOD}), MACD({config.MACD_FAST}/{config.MACD_SLOW}/{config.MACD_SIGNAL})")
 
     # ---------- 第 3 步：生成交易信号 ----------
@@ -111,8 +111,8 @@ def plot_results(df: pd.DataFrame, recorder, symbol: str = config.DEFAULT_SYMBOL
     # ---------- 图1：股价 + 均线 + 买卖点 ----------
     ax1 = axes[0]
     ax1.plot(dates, df["close"], label="Close", color="gray", alpha=0.7, linewidth=1)
-    ax1.plot(dates, df["ma_short"], label=f"MA{config.MA_SHORT}", color="blue", linewidth=1)
-    ax1.plot(dates, df["ma_long"], label=f"MA{config.MA_LONG}", color="orange", linewidth=1)
+    ax1.plot(dates, df["ema_short"], label=f"EMA{config.EMA_SHORT}", color="blue", linewidth=1)
+    ax1.plot(dates, df["ema_long"], label=f"EMA{config.EMA_LONG}", color="orange", linewidth=1)
 
     # 标记买卖点
     buy_signals = df[df["signal"] == config.SIGNAL_BUY]

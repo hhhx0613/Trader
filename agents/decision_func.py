@@ -2,23 +2,85 @@
 决策函数：把 LLM 分析结果转换为交易决策
 
 Plan.md 阶段 3 决策逻辑：
-  1. 选股(每周)：LLM 分析候选池 → Top-K 等权
-  2. 仓位：总仓位暴露 = 平均 confidence × 风控允许上限（纯公式）
+  1. 选股(每周)：LLM 按 confidence 排序选出 Top-K（confidence 仅用于筛选）
+  2. 仓位：波动率目标定总暴露 + 逆波动率定个股权重（业界标准，无需建模）
+     - 总暴露 = TARGET_VOLATILITY / σ_portfolio，截断到 MAX_POSITION_RATIO
+     - 个股权重 w_i = (1/σ_i) / Σ(1/σ_j)，σ_i 由 ATR/price 近似
   3. 风控：risk_manager 硬规则（止损、回撤、连亏降仓）
   4. 执行：回测引擎按调仓周期执行
 
 返回格式：
   {
-    "holdings": [{"symbol": "AAPL", "weight": 0.5}, ...],  # 持仓列表 + 等权权重
+    "holdings": [{"symbol": "AAPL", "weight": 0.5}, ...],  # 持仓列表 + 逆波动率权重
     "exposure": 0.6,  # 总仓位暴露（0~1）
   }
 """
 
+# 直接运行本文件时，把项目根目录加入 sys.path，使 `agents` / `core` 等包可被导入
+import os
+import sys
+if __name__ == "__main__":
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+import math
 import pandas as pd
 from typing import Dict, List, Set
 from agents.stock_selector import select_top_k, DEFAULT_CANDIDATE_POOL
 from core import config
 from core.data.sentiment import SentimentAnalyzer
+
+
+def _stock_daily_vol(stock_state: Dict) -> float:
+    """
+    用 ATR/price 近似该股的日波动率。
+    ATR 缺失或为 0 时回退到 FALLBACK_VOLATILITY（约年化 25%）。
+    """
+    price = stock_state.get("current_price", 0.0)
+    atr = stock_state.get("atr", 0.0)
+    if price > 0 and atr > 0:
+        return atr / price
+    return config.FALLBACK_VOLATILITY
+
+
+def _position_sizing(holdings_result, market_state):
+    """
+    波动率目标 + 逆波动率加权，业界标准仓位分配。
+
+    返回：
+      holdings: [{"symbol": str, "weight": float}, ...]  # 权重 = 逆波动率归一
+      exposure: float  # 总暴露，= TARGET_VOL / σ_portfolio，截断到上限
+    """
+    # 1) 每只股票的日波动率（ATR/price 近似）
+    vols = []
+    for h in holdings_result:
+        vol = _stock_daily_vol(market_state.get(h["symbol"], {}))
+        vols.append(vol)
+
+    # 2) 逆波动率加权：让每只股票对组合的风险贡献接近相等
+    inv_vols = [1.0 / v for v in vols]
+    sum_inv = sum(inv_vols)
+    weights = [iv / sum_inv for iv in inv_vols]
+
+    holdings = [
+        {"symbol": h["symbol"], "weight": w}
+        for h, w in zip(holdings_result, weights)
+    ]
+
+    # 3) 组合波动率（等权组合的波动率近似 = Σ w_i × σ_i）
+    port_vol = sum(w * v for w, v in zip(weights, vols))
+
+    # 4) 波动率目标定总暴露：σ_target / σ_portfolio
+    if port_vol > 0:
+        exposure = config.TARGET_VOLATILITY / (port_vol * math.sqrt(252))
+    else:
+        exposure = 0.0
+
+    # 风控截断：不超过 MAX_POSITION_RATIO
+    exposure = min(exposure, config.MAX_POSITION_RATIO)
+
+    return holdings, exposure, weights, vols
 
 
 def decide_formula_llm(
@@ -29,7 +91,11 @@ def decide_formula_llm(
     current_holdings: Set[str] = None,
 ) -> Dict:
     """
-    公式版决策函数：LLM Top-K 选股 + 技术指标确认 + 公式仓位
+    公式版决策函数：LLM Top-K 选股 + 波动率目标/逆波动率加权仓位
+
+    流程（纯客观，无主观调整）：
+      1. LLM 按 confidence 排序选出 Top-K（confidence 仅用于筛选，不决定仓位）
+      2. 仓位由波动率目标 + 逆波动率加权决定（业界标准，无需建模）
 
     参数：
       date: 当前日期
@@ -40,11 +106,8 @@ def decide_formula_llm(
 
     返回：
       {
-        "holdings": [
-          {"symbol": "AAPL", "weight": 0.5},
-          {"symbol": "NVDA", "weight": 0.5},
-        ],
-        "exposure": 0.6,  # 总仓位暴露
+        "holdings": [{"symbol": "AAPL", "weight": 0.65}, ...],
+        "exposure": 0.54,  # 总仓位暴露（0~1）
       }
       空仓时返回 {"holdings": [], "exposure": 0.0}
     """
@@ -75,55 +138,15 @@ def decide_formula_llm(
     if not holdings_result:
         return {"holdings": [], "exposure": 0.0}
 
-    # ========== 2. 技术指标确认（对每只选中的股票）==========
-    adjusted_confidences = []
-    for h in holdings_result:
-        symbol = h["symbol"]
-        confidence = h["confidence"]
-
-        # 从 market_state 获取该股票的技术指标
-        stock_state = market_state.get(symbol, {})
-        rsi = stock_state.get("rsi", 50.0)
-        macd_hist = stock_state.get("macd_hist", 0.0)
-
-        # RSI 调整
-        if rsi > 70:  # 超买
-            confidence *= 0.7
-            print(f"  [调整] {symbol} RSI={rsi:.1f} 超买，置信度降至 {confidence:.2f}")
-        elif rsi < 30:  # 超卖
-            confidence *= 1.2
-            confidence = min(confidence, 1.0)
-            print(f"  [调整] {symbol} RSI={rsi:.1f} 超卖，置信度提升至 {confidence:.2f}")
-
-        # MACD 确认
-        if macd_hist > 0:
-            confidence *= 1.1
-            confidence = min(confidence, 1.0)
-        elif macd_hist < 0:
-            confidence *= 0.9
-
-        adjusted_confidences.append(confidence)
-
-    # ========== 3. 计算仓位 ==========
-    # 等权：每只股票权重 = 1/K
-    k = len(holdings_result)
-    weight_per_stock = 1.0 / k
-
-    holdings = [
-        {"symbol": h["symbol"], "weight": weight_per_stock}
-        for h in holdings_result
-    ]
-
-    # 总仓位暴露 = 平均 confidence × 风控允许上限
-    avg_confidence = sum(adjusted_confidences) / len(adjusted_confidences)
-    exposure = avg_confidence * config.MAX_EXPOSURE_RATIO
-
-    # 风控截断：不超过 MAX_POSITION_RATIO
-    exposure = min(exposure, config.MAX_POSITION_RATIO)
+    # ========== 2. 仓位：波动率目标 + 逆波动率加权 ==========
+    holdings, exposure, weights, vols = _position_sizing(
+        holdings_result, market_state
+    )
 
     print(f"  [决策] {date}: "
           f"持仓={[h['symbol'] for h in holdings]}, "
-          f"等权={weight_per_stock:.0%}, "
+          f"权重={[f'{w:.0%}' for w in weights]}, "
+          f"日波动率={[f'{v:.2%}' for v in vols]}, "
           f"暴露={exposure:.0%}")
 
     return {
@@ -214,20 +237,16 @@ def decide_formula_vader(
     qualified.sort(key=lambda x: x["confidence"], reverse=True)
     top_k_stocks = qualified[:config.TOP_K]
 
-    k = len(top_k_stocks)
-    weight_per_stock = 1.0 / k
+    # 仓位：波动率目标 + 逆波动率加权
+    holdings, exposure, weights, vols = _position_sizing(
+        top_k_stocks, market_state
+    )
 
-    holdings = [
-        {"symbol": s["symbol"], "weight": weight_per_stock}
-        for s in top_k_stocks
-    ]
-
-    avg_confidence = sum(s["confidence"] for s in top_k_stocks) / k
-    exposure = avg_confidence * config.MAX_EXPOSURE_RATIO
-    exposure = min(exposure, config.MAX_POSITION_RATIO)
-
-    print(f"  [VADER决策] {date}: 持仓={[h['symbol'] for h in holdings]}, "
-          f"等权={weight_per_stock:.0%}, 暴露={exposure:.0%}")
+    print(f"  [VADER决策] {date}: "
+          f"持仓={[h['symbol'] for h in holdings]}, "
+          f"权重={[f'{w:.0%}' for w in weights]}, "
+          f"日波动率={[f'{v:.2%}' for v in vols]}, "
+          f"暴露={exposure:.0%}")
 
     return {
         "holdings": holdings,
@@ -242,8 +261,8 @@ if __name__ == "__main__":
 
     # 模拟市场状态
     market_state = {
-        "AAPL": {"current_price": 150.0, "rsi": 45.0, "macd_hist": 0.5},
-        "NVDA": {"current_price": 800.0, "rsi": 55.0, "macd_hist": -0.3},
+        "AAPL": {"current_price": 150.0, "rsi": 45.0, "macd_hist": 0.5, "atr": 2.0},
+        "NVDA": {"current_price": 800.0, "rsi": 55.0, "macd_hist": -0.3, "atr": 20.0},
     }
 
     # 测试（无新闻数据 → 空仓）

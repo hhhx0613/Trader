@@ -6,8 +6,7 @@
   所有函数都接收 DataFrame，返回新增列的 DataFrame（不修改原始数据）。
 
 阶段1 实现的指标：
-  - MA（简单移动平均线）：趋势方向判断的基础
-  - EMA（指数移动平均线）：对近期价格更敏感，减少滞后
+  - EMA（指数移动平均线）：趋势方向判断，对近期价格更敏感，减少滞后
   - RSI（相对强弱指数）：超买/超卖判断
   - MACD（指数平滑异同移动平均线）：趋势强度与方向
   - ATR（平均真实波幅）：衡量价格波动性，用于止损/仓位管理
@@ -25,36 +24,6 @@ import numpy as np
 from typing import Tuple
 
 from . import config
-
-
-# ==================== MA（简单移动平均线）====================
-
-def compute_ma(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算短期和长期简单移动平均线（SMA）。
-
-    金叉/死叉策略的核心依据：
-      - 短期均线上穿长期均线 → 金叉（看涨信号）
-      - 短期均线下穿长期均线 → 死叉（看跌信号）
-
-    参数读取 config.MA_SHORT / config.MA_LONG，默认 5 / 20。
-
-    返回：
-      在原 DataFrame 基础上新增 ma_short, ma_long 两列的副本。
-    """
-    result = df.copy()
-
-    # rolling(window).mean() 是 pandas 计算移动平均的标准方法
-    # min_periods=1 保证前几行（数据不足一个窗口时）也能计算出值，而非 NaN
-    result["ma_short"] = result["close"].rolling(
-        window=config.MA_SHORT, min_periods=1
-    ).mean()
-
-    result["ma_long"] = result["close"].rolling(
-        window=config.MA_LONG, min_periods=1
-    ).mean()
-
-    return result
 
 
 # ==================== EMA（指数移动平均线）====================
@@ -310,9 +279,8 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     使用方式：
         df = data_collector.fetch_ohlcv("AAPL")
         df = compute_all_indicators(df)
-        # 现在 df 包含：OHLCV + ma/ema/rsi/macd/atr/vwap 等指标列
+        # 现在 df 包含：OHLCV + ema/rsi/macd/atr/vwap/adx 等指标列
     """
-    df = compute_ma(df)
     df = compute_ema(df)
     df = compute_rsi(df)
     df = compute_macd(df)

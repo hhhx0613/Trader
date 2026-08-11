@@ -1,0 +1,263 @@
+"""
+LLM 缓存数据库管理器（SQLite）
+
+设计说明：
+  - 替代原有的 JSON 文件缓存方案
+  - 提供 SQL 查询能力，支持复杂筛选和统计
+  - 事务保证数据一致性
+  - 单文件部署，无需额外数据库服务器
+
+表结构：
+  - llm_analysis_cache: 存储 LLM 分析结果
+  - 索引：symbol, analysis_date, model（加速查询）
+"""
+
+import sqlite3
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime
+
+
+class LLMCacheDB:
+    """LLM 分析结果缓存数据库"""
+    
+    def __init__(self, db_path: str = None):
+        """
+        初始化数据库连接
+        
+        Args:
+            db_path: 数据库文件路径，默认为 core/data/cache/llm_cache.db
+        """
+        if db_path is None:
+            # 默认路径：data/cache/llm/llm_cache.db
+            self.db_path = Path(__file__).parent.parent.parent / "data" / "cache" / "llm" / "llm_cache.db"
+        else:
+            self.db_path = Path(db_path)
+        
+        # 确保目录存在
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化数据库表
+        self._init_db()
+    
+    def _init_db(self):
+        """初始化数据库表和索引"""
+        with sqlite3.connect(self.db_path) as conn:
+            # 创建缓存表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS llm_analysis_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    analysis_date TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    direction TEXT,
+                    confidence REAL,
+                    reasons TEXT,
+                    sources TEXT,
+                    prompt_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(symbol, analysis_date, model)
+                )
+            """)
+            
+            # 创建索引（加速查询）
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_symbol 
+                ON llm_analysis_cache(symbol)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_date 
+                ON llm_analysis_cache(analysis_date)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_model 
+                ON llm_analysis_cache(model)
+            """)
+            
+            conn.commit()
+    
+    def get_cache(self, symbol: str, date: str, model: str) -> Optional[Dict]:
+        """
+        查询缓存
+        
+        Args:
+            symbol: 股票代码
+            date: 分析日期（格式：YYYY-MM-DD）
+            model: LLM 模型名称
+        
+        Returns:
+            缓存的分析结果字典，不存在则返回 None
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT symbol, analysis_date, model, direction, confidence, 
+                       reasons, sources, prompt_version, created_at
+                FROM llm_analysis_cache
+                WHERE symbol=? AND analysis_date=? AND model=?
+            """, (symbol, date, model))
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "symbol": row[0],
+                    "analysis_date": row[1],
+                    "model": row[2],
+                    "direction": row[3],
+                    "confidence": row[4],
+                    "reasons": json.loads(row[5]) if row[5] else [],
+                    "sources": json.loads(row[6]) if row[6] else [],
+                    "prompt_version": row[7],
+                    "created_at": row[8]
+                }
+            return None
+    
+    def save_cache(self, data: Dict) -> bool:
+        """
+        保存缓存（INSERT OR REPLACE）
+        
+        Args:
+            data: 分析结果字典，包含 symbol, analysis_date, model, direction, 
+                  confidence, reasons, sources, prompt_version
+        
+        Returns:
+            是否成功保存
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO llm_analysis_cache
+                    (symbol, analysis_date, model, direction, confidence, 
+                     reasons, sources, prompt_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data["symbol"],
+                    data["analysis_date"],
+                    data.get("model", "glm-4"),
+                    data.get("direction"),
+                    data.get("confidence"),
+                    json.dumps(data.get("reasons", []), ensure_ascii=False),
+                    json.dumps(data.get("sources", []), ensure_ascii=False),
+                    data.get("prompt_version", "v1.0")
+                ))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[LLM Cache DB] 保存失败：{e}")
+            return False
+    
+    def query_by_symbol(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """
+        按股票查询历史记录
+        
+        Args:
+            symbol: 股票代码
+            limit: 返回条数限制
+        
+        Returns:
+            分析结果列表
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT symbol, analysis_date, model, direction, confidence
+                FROM llm_analysis_cache
+                WHERE symbol=?
+                ORDER BY analysis_date DESC
+                LIMIT ?
+            """, (symbol, limit))
+            
+            return [
+                {
+                    "symbol": row[0],
+                    "analysis_date": row[1],
+                    "model": row[2],
+                    "direction": row[3],
+                    "confidence": row[4]
+                }
+                for row in cursor.fetchall()
+            ]
+    
+    def query_by_date_range(self, start_date: str, end_date: str) -> List[Dict]:
+        """
+        按日期范围查询
+        
+        Args:
+            start_date: 起始日期（YYYY-MM-DD）
+            end_date: 结束日期（YYYY-MM-DD）
+        
+        Returns:
+            分析结果列表
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT symbol, analysis_date, model, direction, confidence
+                FROM llm_analysis_cache
+                WHERE analysis_date BETWEEN ? AND ?
+                ORDER BY analysis_date DESC
+            """, (start_date, end_date))
+            
+            return [
+                {
+                    "symbol": row[0],
+                    "analysis_date": row[1],
+                    "model": row[2],
+                    "direction": row[3],
+                    "confidence": row[4]
+                }
+                for row in cursor.fetchall()
+            ]
+    
+    def statistics(self) -> List[Dict]:
+        """
+        统计信息（按股票分组）
+        
+        Returns:
+            统计结果列表
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT 
+                    symbol,
+                    COUNT(*) as total,
+                    AVG(confidence) as avg_confidence,
+                    MIN(analysis_date) as first_date,
+                    MAX(analysis_date) as last_date
+                FROM llm_analysis_cache
+                GROUP BY symbol
+                ORDER BY total DESC
+            """)
+            
+            return [
+                {
+                    "symbol": row[0],
+                    "total": row[1],
+                    "avg_confidence": row[2],
+                    "first_date": row[3],
+                    "last_date": row[4]
+                }
+                for row in cursor.fetchall()
+            ]
+    
+    def count(self) -> int:
+        """获取总缓存条数"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM llm_analysis_cache")
+            return cursor.fetchone()[0]
+    
+    def clear_all(self):
+        """清空所有缓存（谨慎使用）"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM llm_analysis_cache")
+            conn.commit()
+            print("[LLM Cache DB] 已清空所有缓存")
+
+
+# 全局实例（单例模式）
+_cache_db_instance = None
+
+def get_cache_db() -> LLMCacheDB:
+    """获取全局缓存数据库实例"""
+    global _cache_db_instance
+    if _cache_db_instance is None:
+        _cache_db_instance = LLMCacheDB()
+    return _cache_db_instance

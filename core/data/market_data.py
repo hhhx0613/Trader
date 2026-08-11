@@ -22,6 +22,44 @@ from typing import Optional
 
 from .. import config
 
+
+def _find_covering_cache(symbol: str, start_date: str, end_date: str) -> Optional[Path]:
+    """
+    查找覆盖请求日期范围的缓存文件。
+    
+    如果精确匹配不存在，查找更大的缓存文件（如 *_2025-06-12_2026-08-06.csv
+    可以覆盖 2026-07-06 ~ 2026-08-06 的请求）。
+    """
+    import re
+    
+    # 精确匹配
+    exact = config.MARKET_CACHE_DIR / f"{symbol}_{start_date}_{end_date}.csv"
+    if exact.exists():
+        return exact
+    
+    # 查找覆盖范围更大的缓存
+    pattern = re.compile(rf"^{symbol}_(\d{{4}}-\d{{2}}-\d{{2}})_(\d{{4}}-\d{{2}}-\d{{2}})\.csv$")
+    req_start = pd.Timestamp(start_date)
+    req_end = pd.Timestamp(end_date)
+    
+    best_match = None
+    best_span = 0
+    
+    for f in config.MARKET_CACHE_DIR.glob(f"{symbol}_*.csv"):
+        m = pattern.match(f.name)
+        if m:
+            cache_start = pd.Timestamp(m.group(1))
+            cache_end = pd.Timestamp(m.group(2))
+            # 检查是否覆盖请求范围
+            if cache_start <= req_start and cache_end >= req_end:
+                span = (cache_end - cache_start).days
+                if span > best_span:
+                    best_span = span
+                    best_match = f
+    
+    return best_match
+
+
 # ==================== 公开接口 ====================
 
 def fetch_ohlcv(
@@ -46,15 +84,21 @@ def fetch_ohlcv(
         3. Alpha Vantage（备用网络源）
         4. IBKR API（最终兜底 + 实盘行情，需本地运行 TWS/IB Gateway）
     """
-    # 生成缓存文件名：symbol + 日期范围，保证不同参数不会混用
-    cache_filename = f"{symbol}_{start_date}_{end_date}.csv"
-    cache_path = config.CACHE_DIR / cache_filename
+    # --- 第 1 层：检查本地缓存（精确匹配或覆盖范围更大的缓存）---
+    cache_path = _find_covering_cache(symbol, start_date, end_date)
+    if cache_path is not None:
+        df = _try_load_cache(cache_path)
+        if df is not None:
+            # 过滤到请求的日期范围
+            req_start = pd.Timestamp(start_date)
+            req_end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+            df = df[(df.index >= req_start) & (df.index < req_end)]
+            print(f"[DataCollector] 命中本地缓存: {cache_path.name}，过滤后 {len(df)} 条")
+            return df
 
-    # --- 第 1 层：检查本地缓存 ---
-    df = _try_load_cache(cache_path)
-    if df is not None:
-        print(f"[DataCollector] 命中本地缓存: {cache_filename}")
-        return df
+    # 精确缓存文件名（用于保存）
+    cache_filename = f"{symbol}_{start_date}_{end_date}.csv"
+    cache_path = config.MARKET_CACHE_DIR / cache_filename
 
     # --- 第 2 层：yfinance ---
     df = _try_yfinance(symbol, start_date, end_date)
@@ -138,6 +182,10 @@ def _try_yfinance(symbol: str, start_date: str, end_date: str) -> Optional[pd.Da
             "Close": "close", "Volume": "volume",
         })
         df = df[["open", "high", "low", "close", "volume"]].dropna()
+
+        # yfinance 返回的 index 带时区（如 UTC-04:00），日线数据不需要，统一去掉
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
 
         return df
 

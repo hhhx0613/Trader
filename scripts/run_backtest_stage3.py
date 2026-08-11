@@ -9,13 +9,14 @@
 同时跑规则基线作为对照组，最后输出统一对比表。
 
 三条决策路径：
-  - 规则基线：MA/RSI/MACD 多条件投票（main.py 逻辑）
-  - LLM 选股：LLM 分析新闻 → Top-K 等权 → 公式仓位
-  - VADER 选股：VADER 情绪分 → Top-K 等权 → 公式仓位
+  - 路径 A（规则基线）：MA/RSI/MACD 自适应投票 → 单股回测
+  - 路径 B（LLM 选股）：LLM 分析新闻 → Top-K 等权 → 波动率目标/逆波动率加权仓位
+  - 路径 C（VADER 选股）：VADER 情绪分 → Top-K 等权 → 波动率目标/逆波动率加权仓位
 
 用法：
-  python scripts/run_backtest_stage3.py
-  python scripts/run_backtest_stage3.py --pool AAPL NVDA MSFT --start 2026-07-07 --end 2026-08-06
+  python -m scripts.run_backtest_stage3
+  python -m scripts.run_backtest_stage3 --start 2026-07-07 --end 2026-08-06
+  python -m scripts.run_backtest_stage3 --pool AAPL NVDA MSFT --skip-vader
 """
 
 import sys
@@ -27,42 +28,57 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import argparse
+import numpy as np
 from datetime import datetime
 
 import pandas as pd
 
 from core.data.market_data import fetch_ohlcv
 from core.data.news_data import fetch_news
-from core.data.sentiment import analyze_news_sentiment
 from core.indicators import compute_all_indicators
 from core.strategy import generate_signals
 from core.backtest_engine import BacktestEngine
 from core.multi_stock_engine import MultiStockBacktestEngine
 from agents.decision_func import decide_formula_llm, decide_formula_vader
+from agents.stock_selector import DEFAULT_CANDIDATE_POOL
 from core import config
 
 
 # ==================== 数据下载 ====================
 
+# 指标预热期（日历天数）：ADX/RSI 等需要 14+ bar 预热，60 天足够
+INDICATOR_WARMUP_DAYS = 60
+
+
 def download_data(candidate_pool, start_date, end_date):
     """
     下载回测所需的全部数据（行情 + 新闻），只下载一次。
 
+    行情数据会多拉 INDICATOR_WARMUP_DAYS 天用于指标预热，
+    计算完指标后裁回 [start_date, end_date]，保证回测区间内指标已稳定。
+
     返回：
-      market_data: Dict[symbol, DataFrame]
+      market_data: Dict[symbol, DataFrame]（已含技术指标，仅回测区间）
       news_df: DataFrame（含 symbol 列）
     """
     print("\n" + "=" * 60)
     print("  [1/4] 数据采集（阶段 1）")
     print("=" * 60)
 
+    # 预热起始日：多拉 60 天给指标计算用
+    warmup_start = (pd.Timestamp(start_date) - pd.Timedelta(days=INDICATOR_WARMUP_DAYS)).strftime('%Y-%m-%d')
+
     # --- 行情数据 ---
-    print(f"\n  下载 {len(candidate_pool)} 只候选股行情...")
+    print(f"\n  下载 {len(candidate_pool)} 只候选股行情（含 {INDICATOR_WARMUP_DAYS} 天预热）...")
     market_data = {}
     for symbol in candidate_pool:
         try:
-            df = fetch_ohlcv(symbol=symbol, start_date=start_date, end_date=end_date)
+            df = fetch_ohlcv(symbol=symbol, start_date=warmup_start, end_date=end_date)
             if df is not None and len(df) > 0:
+                # 在扩展数据上计算指标（含预热期）
+                df = compute_all_indicators(df)
+                # 裁回回测区间
+                df = df[df.index >= pd.Timestamp(start_date)]
                 market_data[symbol] = df
                 print(f"    [OK] {symbol}：{len(df)} bars "
                       f"({df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')})")
@@ -114,8 +130,8 @@ def run_rule_baseline(market_data):
     results = {}
     for symbol, df in market_data.items():
         print(f"\n  --- {symbol} ---")
-        df_enriched = compute_all_indicators(df.copy())
-        df_enriched = generate_signals(df_enriched)
+        # download_data 已预计算指标，只需生成信号
+        df_enriched = generate_signals(df.copy())
 
         buy_count = (df_enriched["signal"] == config.SIGNAL_BUY).sum()
         sell_count = (df_enriched["signal"] == config.SIGNAL_SELL).sum()
@@ -147,13 +163,16 @@ def run_multi_stock_backtest(decide_func, market_data, news_df, candidate_pool, 
     return recorder
 
 
-def run_llm_and_vader(market_data, news_df, candidate_pool):
+def run_llm_and_vader(market_data, news_df, args):
     """
     跑 LLM 路径和 VADER 路径，返回两者的 recorder。
     """
     print("\n" + "=" * 60)
     print("  [3/4] 路径 B + C：LLM 选股 / VADER 选股（阶段 2-3）")
     print("=" * 60)
+
+    llm_recorder = None
+    vader_recorder = None
 
     # --- 路径 B：LLM ---
     print(f"\n  --- 路径 B：LLM Top-K ---")
@@ -162,22 +181,25 @@ def run_llm_and_vader(market_data, news_df, candidate_pool):
         return decide_formula_llm(date, market_state, candidate_pool, news_df, current_holdings)
 
     llm_recorder = run_multi_stock_backtest(
-        llm_decide, market_data, news_df, candidate_pool, label="LLM"
+        llm_decide, market_data, news_df, args.pool, label="LLM"
     )
     print(f"  [OK] LLM 回测完成，最终权益：${llm_recorder.equity_curve[-1][1]:,.2f}"
           if llm_recorder.equity_curve else "  [OK] LLM 回测完成（无净值）")
 
     # --- 路径 C：VADER ---
-    print(f"\n  --- 路径 C：VADER Top-K ---")
+    if not args.skip_vader:
+        print(f"\n  --- 路径 C：VADER Top-K ---")
 
-    def vader_decide(date, market_state, candidate_pool, news_df, current_holdings):
-        return decide_formula_vader(date, market_state, candidate_pool, news_df, current_holdings)
+        def vader_decide(date, market_state, candidate_pool, news_df, current_holdings):
+            return decide_formula_vader(date, market_state, candidate_pool, news_df, current_holdings)
 
-    vader_recorder = run_multi_stock_backtest(
-        vader_decide, market_data, news_df, candidate_pool, label="VADER"
-    )
-    print(f"  [OK] VADER 回测完成，最终权益：${vader_recorder.equity_curve[-1][1]:,.2f}"
-          if vader_recorder.equity_curve else "  [OK] VADER 回测完成（无净值）")
+        vader_recorder = run_multi_stock_backtest(
+            vader_decide, market_data, news_df, args.pool, label="VADER"
+        )
+        print(f"  [OK] VADER 回测完成，最终权益：${vader_recorder.equity_curve[-1][1]:,.2f}"
+              if vader_recorder.equity_curve else "  [OK] VADER 回测完成（无净值）")
+    else:
+        print(f"\n  [SKIP] VADER 路径已跳过（--skip-vader）")
 
     return llm_recorder, vader_recorder
 
@@ -190,65 +212,70 @@ def print_comparison_table(rule_results, llm_recorder, vader_recorder, market_da
     print("  [4/4] 对比表")
     print("=" * 60)
 
-    # 收集各路径的绩效
     rows = []
 
-    # 规则基线：取所有股票的平均
+    # 规则基线：逐股列出 + 平均
     if rule_results:
-        rule_returns = []
-        rule_drawdowns = []
         for sym, m in rule_results.items():
-            ret_str = m.get("累计收益率", "0.00%").replace("%", "")
-            dd_str = m.get("最大回撤", "0.00%").replace("%", "")
-            try:
-                rule_returns.append(float(ret_str))
-                rule_drawdowns.append(float(dd_str))
-            except ValueError:
-                pass
-        avg_ret = sum(rule_returns) / len(rule_returns) if rule_returns else 0
-        avg_dd = sum(rule_drawdowns) / len(rule_drawdowns) if rule_drawdowns else 0
-        rule_trades = sum(
-            int(m.get("总交易次数", 0)) for m in rule_results.values()
-        )
+            rows.append({
+                "路径": f"规则({sym})",
+                "累计收益率": m.get("累计收益率", "N/A"),
+                "最大回撤": m.get("最大回撤", "N/A"),
+                "夏普比率": m.get("夏普比率", "N/A"),
+                "交易次数": m.get("总交易次数", 0),
+            })
+        # 平均值
+        avg_ret = np.mean([
+            float(m.get("累计收益率", "0%").rstrip("%")) / 100
+            for m in rule_results.values()
+        ])
+        avg_dd = np.mean([
+            float(m.get("最大回撤", "0%").rstrip("%")) / 100
+            for m in rule_results.values()
+        ])
+        rule_trades = sum(int(m.get("总交易次数", 0)) for m in rule_results.values())
         rows.append({
-            "路径": "规则基线",
-            "累计收益率": f"{avg_ret:.2f}%",
-            "最大回撤": f"{avg_dd:.2f}%",
+            "路径": "规则基线(均)",
+            "累计收益率": f"{avg_ret:.2%}",
+            "最大回撤": f"{avg_dd:.2%}",
+            "夏普比率": "-",
             "交易次数": rule_trades,
         })
 
     # LLM 路径
     if llm_recorder and llm_recorder.equity_curve:
-        llm_metrics = llm_recorder.evaluate()
+        m = llm_recorder.evaluate()
         rows.append({
             "路径": "LLM Top-K",
-            "累计收益率": llm_metrics.get("累计收益率", "N/A"),
-            "最大回撤": llm_metrics.get("最大回撤", "N/A"),
-            "交易次数": llm_metrics.get("总交易次数", 0),
+            "累计收益率": m.get("累计收益率", "N/A"),
+            "最大回撤": m.get("最大回撤", "N/A"),
+            "夏普比率": m.get("夏普比率", "N/A"),
+            "交易次数": m.get("总交易次数", 0),
         })
 
     # VADER 路径
     if vader_recorder and vader_recorder.equity_curve:
-        vader_metrics = vader_recorder.evaluate()
+        m = vader_recorder.evaluate()
         rows.append({
             "路径": "VADER Top-K",
-            "累计收益率": vader_metrics.get("累计收益率", "N/A"),
-            "最大回撤": vader_metrics.get("最大回撤", "N/A"),
-            "交易次数": vader_metrics.get("总交易次数", 0),
+            "累计收益率": m.get("累计收益率", "N/A"),
+            "最大回撤": m.get("最大回撤", "N/A"),
+            "夏普比率": m.get("夏普比率", "N/A"),
+            "交易次数": m.get("总交易次数", 0),
         })
 
     # Buy & Hold 基准（第一只股票）
     first_sym = list(market_data.keys())[0]
     bh_df = market_data[first_sym]
     bh_ret = (bh_df.iloc[-1]["close"] - bh_df.iloc[0]["close"]) / bh_df.iloc[0]["close"]
-    import numpy as np
     prices = bh_df["close"].values
     peak = np.maximum.accumulate(prices)
     bh_dd = ((peak - prices) / peak).max()
     rows.append({
-        "路径": f"Buy&Hold ({first_sym})",
+        "路径": f"Buy&Hold({first_sym})",
         "累计收益率": f"{bh_ret:.2%}",
         "最大回撤": f"{bh_dd:.2%}",
+        "夏普比率": "-",
         "交易次数": "-",
     })
 
@@ -316,13 +343,25 @@ def save_all_results(rule_results, llm_recorder, vader_recorder, candidate_pool)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="阶段 1-3 端到端验证")
-    parser.add_argument("--pool", nargs="+", default=["AAPL", "NVDA"],
-                        help="候选股票池 (默认: AAPL NVDA)")
-    parser.add_argument("--start", default="2026-07-07", help="起始日期")
-    parser.add_argument("--end", default="2026-08-06", help="结束日期")
+    parser.add_argument(
+        "--pool", nargs="+", default=None,
+        help=f"候选股票池（默认：10 只跨行业候选）: {DEFAULT_CANDIDATE_POOL}",
+    )
+    parser.add_argument("--start", default=None, help="起始日期（默认 config.DEFAULT_START_DATE）")
+    parser.add_argument("--end", default=None, help="结束日期（默认 config.DEFAULT_END_DATE）")
     parser.add_argument("--skip-rule", action="store_true", help="跳过规则基线")
     parser.add_argument("--skip-vader", action="store_true", help="跳过 VADER 路径")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # 默认值
+    if args.pool is None:
+        args.pool = DEFAULT_CANDIDATE_POOL
+    if args.start is None:
+        args.start = config.DEFAULT_START_DATE
+    if args.end is None:
+        args.end = config.DEFAULT_END_DATE
+
+    return args
 
 
 def main():
@@ -347,7 +386,7 @@ def main():
 
     # 3. 路径 B + C：LLM / VADER
     llm_recorder, vader_recorder = run_llm_and_vader(
-        market_data, news_df, args.pool
+        market_data, news_df, args
     )
 
     # 4. 对比表

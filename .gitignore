@@ -20,9 +20,8 @@ build/
 *.swo
 
 # ==================== 项目数据 ====================
-# 缓存的行情数据（太大不上传）
-data/cache/*.csv
-data/cache/llm/*.json
+# 缓存目录（行情/新闻/LLM）
+data/cache/
 
 # 回测输出
 output/

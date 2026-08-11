@@ -20,12 +20,15 @@ PROJECT_ROOT = Path(__file__).parent
 
 # 本地数据缓存目录（存放下载的 K 线 CSV）
 CACHE_DIR = PROJECT_ROOT / "data" / "cache"
+MARKET_CACHE_DIR = CACHE_DIR / "market"
+NEWS_CACHE_DIR = CACHE_DIR / "news"
 
 # 回测输出目录（净值曲线、交易记录、评估报告）
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
 # 确保目录存在
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MARKET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -34,13 +37,28 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 默认交易标的（美股苹果，数据稳定、适合入门演示）
 DEFAULT_SYMBOL = "NVDA"
 
-# 默认回测时间范围（3 年日线，数据量适中）
-DEFAULT_START_DATE = "2023-07-01"
-DEFAULT_END_DATE = "2026-07-01"
+# 默认回测时间范围（最近一个月，跑通流程）
+DEFAULT_START_DATE = "2026-07-06"
+DEFAULT_END_DATE = "2026-08-06"
 
 # Alpha Vantage API Key（免费申请：https://www.alphavantage.co/support/#api-key）
-# 从 .env 文件或环境变量读取，未设置则跳过该数据源
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+# 支持多个 key 用逗号分隔，自动轮换以翻倍配额（如 "KEY1,KEY2"）
+_AV_KEYS_RAW = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+ALPHA_VANTAGE_API_KEYS = [k.strip() for k in _AV_KEYS_RAW.split(",") if k.strip()]
+# 兼容旧代码：第一个 key 作为默认
+ALPHA_VANTAGE_API_KEY = ALPHA_VANTAGE_API_KEYS[0] if ALPHA_VANTAGE_API_KEYS else ""
+
+# key 轮换计数器（每次调用 get_next_av_key 自动切换）
+_av_key_idx = 0
+
+def get_next_av_key() -> str:
+    """获取下一个 Alpha Vantage API key（round-robin 轮换）。"""
+    global _av_key_idx
+    if not ALPHA_VANTAGE_API_KEYS:
+        return ""
+    key = ALPHA_VANTAGE_API_KEYS[_av_key_idx % len(ALPHA_VANTAGE_API_KEYS)]
+    _av_key_idx += 1
+    return key
 
 # IBKR TWS/IB Gateway API 端口（IB Gateway 模拟盘默认 4002）
 IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
@@ -51,18 +69,18 @@ IBKR_PORT = int(os.getenv("IBKR_PORT", "4002"))
 # 新闻多段请求（PPO 训练时需要更长的新闻历史，打开此开关）
 # AV News API 单次最多返回 1000 条（约覆盖 14-20 天），
 # 开启后会将日期范围切成多段分别请求再合并，消耗更多 API 配额。
-NEWS_MULTI_SEGMENT = False
+NEWS_MULTI_SEGMENT = True
 NEWS_SEGMENT_DAYS = 14  # 每段覆盖的天数（AV 1000 条 ≈ 14 天高产量股票）
-NEWS_DAILY_QUOTA = 20   # 单次运行最多消耗的新闻 API 次数（留 5 次给其他请求）
+NEWS_DAILY_QUOTA = 25   # 单次运行最多消耗的新闻 API 次数（AV 免费版 25 次/天，按 IP 限额）
 
 
 # ==================== 技术指标参数 ====================
 
-# 短期均线周期（用于金叉/死叉判断）
-MA_SHORT = 5
+# EMA 短期周期（替代原 MA_SHORT，EMA 对近期价格更敏感）
+EMA_SHORT = 9
 
-# 长期均线周期
-MA_LONG = 20
+# EMA 长期周期（替代原 MA_LONG）
+EMA_LONG = 21
 
 # RSI 周期
 RSI_PERIOD = 14
@@ -81,12 +99,6 @@ MACD_SLOW = 26
 
 # MACD 信号线周期
 MACD_SIGNAL = 9
-
-# EMA 短期周期
-EMA_SHORT = 9
-
-# EMA 长期周期
-EMA_LONG = 21
 
 # ATR 周期
 ATR_PERIOD = 14
@@ -116,7 +128,7 @@ RISK_FREE_RATE = 0.04
 # ==================== 选股与调仓配置 ====================
 
 # Top-K 选股：LLM 选出置信度最高的 K 只股票等权持有
-TOP_K = 3
+TOP_K = 5  # 持有 5 只股票（分散化投资）
 
 # 调仓周期：每 N 个交易日调仓一次（5 ≈ 每周）
 REBALANCE_DAYS = 5
@@ -126,6 +138,14 @@ CONFIDENCE_THRESHOLD = 0.5
 
 # 最大仓位暴露上限（公式版：平均 confidence × 此值）
 MAX_EXPOSURE_RATIO = 1.0
+
+# 波动率目标（Volatility Targeting）：让组合年化波动率贴近此值
+# 业界常用 10%~15%，用于决定总暴露大小
+TARGET_VOLATILITY = 0.15
+
+# 回退波动率：当某只股票 ATR=0 或缺失时使用的日波动率兜底值
+# 约等于年化 25% 波动，偏保守
+FALLBACK_VOLATILITY = 0.016
 
 
 # ==================== 风控参数 ====================
