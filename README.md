@@ -128,7 +128,6 @@ Trader/
 
 ## 📊 已知问题与待办
 
-- [ ] R5 换手惩罚死代码（`record_turnover()` 未被调用）
 - [ ] evaluate() 缺少换手率指标
 - [ ] PPO 环境（gym.Env）尚未实现
 - [ ] IBKR 模拟盘接入（阶段 5）
