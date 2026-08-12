@@ -231,6 +231,7 @@ def _fetch_complete_segment(
     seg_start_str: str,
     seg_end_str: str,
     quota_remaining: List[int],
+    cache_hit: List[int] = None,
 ) -> Optional[pd.DataFrame]:
     """
     获取已完成的段（从 complete 目录读取）。
@@ -242,9 +243,13 @@ def _fetch_complete_segment(
     # 检查缓存
     cached = _try_load_cache(cache_file)
     if cached is not None:
+        if cache_hit is not None:
+            cache_hit[0] = 1
         return cached
     
     # 缓存未命中，从 API 拉取
+    if cache_hit is not None:
+        cache_hit[0] = 0
     if quota_remaining[0] > 0:
         df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
         quota_remaining[0] -= 1
@@ -271,6 +276,7 @@ def _fetch_incomplete_segment(
     seg_start_str: str,
     seg_end_str: str,
     quota_remaining: List[int],
+    cache_hit: List[int] = None,
 ) -> Optional[pd.DataFrame]:
     """
     获取未完成的段（从 incomplete 目录读取，增量更新）。
@@ -291,10 +297,14 @@ def _fetch_incomplete_segment(
         last_date = cached["datetime"].max().normalize()
         if (today - last_date).days < 1:
             # 数据是最新的，直接返回
+            if cache_hit is not None:
+                cache_hit[0] = 1
             return cached
         # 否则需要增量更新
     
     # 从 API 拉取新数据
+    if cache_hit is not None:
+        cache_hit[0] = 0
     if quota_remaining[0] > 0:
         df = _try_alpha_vantage_news(symbol, seg_start_str, seg_end_str)
         quota_remaining[0] -= 1
@@ -366,33 +376,38 @@ def fetch_news(
     segments = _split_into_segments(start_date, end_date)
     all_dfs = []
     quota_remaining = [config.NEWS_DAILY_QUOTA]  # 用列表以便在函数间共享
+    cache_hit = [0]  # 标记当前段是否命中缓存（1=命中，0=走了API）
     today = pd.Timestamp.now().normalize()
-    
+        
     for seg_idx, (seg_start_str, seg_end_str) in enumerate(segments, 1):
         seg_end_dt = pd.Timestamp(seg_end_str)
         is_complete = seg_end_dt < today
-        
+            
         status = "已完成" if is_complete else "未完成（增量）"
         print(f"  [NewsCollector] 处理段 [{seg_idx}/{len(segments)}]：{seg_start_str} ~ {seg_end_str} [{status}]")
-        
+            
+        cache_hit[0] = 0
         if is_complete:
             # 已完成的段：从 complete 目录读取
             df = _fetch_complete_segment(
                 symbol, seg_start_str, seg_end_str,
-                quota_remaining=quota_remaining
+                quota_remaining=quota_remaining,
+                cache_hit=cache_hit,
             )
         else:
             # 未完成的段：从 incomplete 目录读取，增量更新
             df = _fetch_incomplete_segment(
                 symbol, seg_start_str, seg_end_str,
-                quota_remaining=quota_remaining
+                quota_remaining=quota_remaining,
+                cache_hit=cache_hit,
             )
-        
+            
         if df is not None and len(df) > 0:
             all_dfs.append(df)
-        
+            
         # 限流保护：AV 免费版 5次/分钟（12秒/次），用 15 秒留余量
-        if seg_idx < len(segments) and quota_remaining[0] > 0:
+        # 仅在真正调用了 API 时才 sleep，缓存命中跳过
+        if seg_idx < len(segments) and quota_remaining[0] > 0 and not cache_hit[0]:
             time.sleep(15)
     
     if not all_dfs:

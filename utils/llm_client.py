@@ -26,7 +26,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import utils.logger as log_utils
+logger = log_utils.get_logger(__name__)
+
 from core import config
+from utils.logger import log_llm_call
 
 
 class LLMClient:
@@ -51,7 +55,7 @@ class LLMClient:
             "base_url": "https://open.bigmodel.cn/api/paas/v4",
             "api_key_env": "GLM_API_KEY",
             "default_model": "glm-4",
-            "models": ["glm-4", "glm-3-turbo"],
+            "models": ["glm-4", "glm-4.5-air"],
         },
         "deepseek": {
             "base_url": "https://api.deepseek.com/v1",
@@ -91,6 +95,7 @@ class LLMClient:
         
         # 确定模型
         self.model = model or self.provider_config["default_model"]
+        logger.info(f"Initialized LLM client: provider={self.provider}, model={self.model}")
         
         # 初始化 OpenAI 客户端
         try:
@@ -107,7 +112,7 @@ class LLMClient:
         message: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1000,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """
         发送聊天消息，返回回复文本。
@@ -116,11 +121,12 @@ class LLMClient:
           message: 用户消息
           system_prompt: 系统提示词（可选）
           temperature: 温度参数（0.0-2.0）
-          max_tokens: 最大返回 token 数
+          max_tokens: 最大返回 token 数（None=不限制）
         
         返回：
           模型回复的文本内容
         """
+        logger.debug(f"LLM chat call: model={self.model}, temp={temperature}, tokens={max_tokens}")
         messages = []
         
         if system_prompt:
@@ -128,21 +134,29 @@ class LLMClient:
         
         messages.append({"role": "user", "content": message})
         
-        response = self.client.chat.completions.create(
+        kwargs = dict(
             model=self.model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
         )
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         
-        return response.choices[0].message.content
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+            result = response.choices[0].message.content
+            logger.debug(f"LLM chat completed, response length: {len(result) if result else 0}")
+            return result
+        except Exception as e:
+            logger.error(f"LLM chat error: {e}", exc_info=True)
+            raise
     
     def chat_json(
         self,
         message: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.1,
-        max_tokens: int = 1000,
+        max_tokens: Optional[int] = None,
     ) -> Dict:
         """
         发送聊天消息，返回 JSON 解析结果。
@@ -161,25 +175,46 @@ class LLMClient:
             max_tokens=max_tokens,
         )
         
+        result = None
+        error = None
+        
         try:
             # 尝试直接解析
-            return json.loads(response_text)
+            parsed = json.loads(response_text)
+            result = parsed
         except json.JSONDecodeError:
             # 尝试提取 JSON 部分
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 try:
-                    return json.loads(json_match.group())
+                    parsed = json.loads(json_match.group())
+                    result = parsed
                 except json.JSONDecodeError:
                     pass
-            
-            # 解析失败
+        
+        # 记录日志
+        if result is not None and "error" in result:
+            error = result.get("error")
+        
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            system_prompt=system_prompt or "",
+            user_message=message,
+            response=response_text,
+            result=result or {},
+            error=error,
+        )
+        
+        # 返回结果
+        if result is None:
             return {
                 "error": "JSON 解析失败",
                 "raw": response_text,
                 "provider": self.provider,
                 "model": self.model,
             }
+        return result
     
     def get_info(self) -> Dict:
         """

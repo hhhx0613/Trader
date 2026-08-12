@@ -15,6 +15,7 @@ Plan.md 阶段 3 对应：
 """
 
 from typing import List, Dict, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from agents.llm_analyst import LLMAnalystAgent
@@ -36,6 +37,66 @@ DEFAULT_CANDIDATE_POOL = [
 ]
 
 
+def _analyze_single_stock(
+    symbol: str,
+    date: str,
+    news_df: pd.DataFrame,
+    provider: str,
+    model: str,
+    calibrator,
+) -> Dict:
+    """
+    分析单只股票（供线程池调用）。
+
+    每只股票创建独立的 LLMAnalystAgent 实例，避免线程间共享 HTTP 连接。
+    """
+    try:
+        news_list = _get_news_for_symbol(news_df, symbol, date)
+
+        if not news_list:
+            return {
+                "symbol": symbol,
+                "direction": "neutral",
+                "confidence": 0.0,
+                "raw_confidence": 0.0,
+                "analysis": {"direction": "neutral", "confidence": 0.0},
+            }
+
+        # 每线程创建独立 agent（隔离 HTTP session + SQLite 连接）
+        agent = LLMAnalystAgent(provider=provider, model=model)
+        analysis = agent.analyze(symbol, date, news_list)
+
+        direction = analysis.get("direction", "neutral")
+        raw_confidence = float(analysis.get("confidence", 0.0))
+
+        if calibrator and direction != "neutral":
+            confidence = calibrator.calibrate(raw_confidence)
+            if abs(confidence - raw_confidence) > 0.01:
+                print(f"  [校准] {symbol}: {raw_confidence:.2f} → {confidence:.2f}")
+        else:
+            confidence = raw_confidence
+
+        print(f"  {symbol}: {direction} (confidence={confidence:.2f}, news={len(news_list)}条)")
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": confidence,
+            "raw_confidence": raw_confidence,
+            "analysis": analysis,
+        }
+
+    except Exception as e:
+        print(f"  [WARN] {symbol} 分析失败：{e}")
+        return {
+            "symbol": symbol,
+            "direction": "neutral",
+            "confidence": 0.0,
+            "raw_confidence": 0.0,
+            "analysis": {"direction": "neutral", "confidence": 0.0},
+        }
+
+
 def analyze_candidate_pool(
     date: str,
     candidate_pool: List[str],
@@ -43,9 +104,10 @@ def analyze_candidate_pool(
     provider: str = None,
     model: str = None,
     enable_calibration: bool = True,
+    max_workers: int = None,
 ) -> List[Dict]:
     """
-    对候选池中每只股票运行 LLM 分析。
+    对候选池中每只股票并行运行 LLM 分析。
 
     参数：
       date: 当前日期（格式 "YYYY-MM-DD"）
@@ -54,6 +116,7 @@ def analyze_candidate_pool(
       provider: LLM 提供商（默认 config.DEFAULT_LLM_PROVIDER）
       model: 模型名称（默认 config.DEFAULT_LLM_MODEL）
       enable_calibration: 是否启用置信度校准（默认 True）
+      max_workers: 最大并行线程数（默认 min(候选数, 10)）
 
     返回：
       分析结果列表，每项包含：
@@ -65,55 +128,27 @@ def analyze_candidate_pool(
     if model is None:
         model = config.DEFAULT_LLM_MODEL
 
-    agent = LLMAnalystAgent(provider=provider, model=model)
     calibrator = get_calibrator() if enable_calibration else None
+
+    print(f"\n[选股分析] {date}: 并行分析 {len(candidate_pool)} 只候选股...")
+
+    # 并行调用 LLM（I/O 密集型，线程池即可）
+    if max_workers is None:
+        max_workers = min(len(candidate_pool), 10)
+
     results = []
-
-    print(f"\n[选股分析] {date}: 分析 {len(candidate_pool)} 只候选股...")
-
-    for symbol in candidate_pool:
-        try:
-            # 获取该股票的新闻（按 symbol 过滤）
-            news_list = _get_news_for_symbol(news_df, symbol, date)
-
-            # 无新闻时直接跳过 LLM 调用，避免浪费 API 配额
-            if not news_list:
-                results.append({
-                    "symbol": symbol,
-                    "direction": "neutral",
-                    "confidence": 0.0,
-                    "raw_confidence": 0.0,
-                    "analysis": {"direction": "neutral", "confidence": 0.0},
-                })
-                continue
-
-            # LLM 分析
-            analysis = agent.analyze(symbol, date, news_list)
-
-            direction = analysis.get("direction", "neutral")
-            raw_confidence = float(analysis.get("confidence", 0.0))
-            
-            # 置信度校准：将 LLM 自报 confidence 校准为实际胜率
-            if calibrator and direction != "neutral":
-                confidence = calibrator.calibrate(raw_confidence)
-                if abs(confidence - raw_confidence) > 0.01:
-                    print(f"  [校准] {symbol}: {raw_confidence:.2f} → {confidence:.2f}")
-            else:
-                confidence = raw_confidence
-
-            print(f"  {symbol}: {direction} (confidence={confidence:.2f}, news={len(news_list)}条)")
-
-            results.append({
-                "symbol": symbol,
-                "direction": direction,
-                "confidence": confidence,
-                "raw_confidence": raw_confidence,  # 保留原始值用于后续校准训练
-                "analysis": analysis,
-            })
-
-        except Exception as e:
-            print(f"  [WARN] {symbol} 分析失败：{e}")
-            continue
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _analyze_single_stock,
+                symbol, date, news_df, provider, model, calibrator,
+            ): symbol
+            for symbol in candidate_pool
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                results.append(result)
 
     # 按 confidence 降序排列
     results.sort(key=lambda x: x["confidence"], reverse=True)

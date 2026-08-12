@@ -28,6 +28,14 @@ NEWS_CACHE_INCOMPLETE_DIR = NEWS_CACHE_DIR / "incomplete"  # 未完成的段（�
 # 回测输出目录（净值曲线、交易记录、评估报告）
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# 日志目录
+LOG_DIR = PROJECT_ROOT / "logs"
+
+# 日志文件大小（MB）和备份数量
+MAX_LOG_SIZE_MB = 20  # 每个日志文件最大 20MB
+LOG_BACKUP_COUNT = 10   # 保留 10 个历史版本
+DEFAULT_LOG_LEVEL = "DEBUG"  # 默认日志级别 (更详细)
+
 # 确保目录存在
 MARKET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,7 +184,7 @@ SIGNAL_HOLD = 0     # 持仓不动
 # ==================== LLM 配置 ====================
 
 # 默认 LLM 提供商（"glm" / "deepseek" / "openai"）
-DEFAULT_LLM_PROVIDER = "glm"
+DEFAULT_LLM_PROVIDER = "deepseek"
 
 # 默认 LLM 模型名称（为空时使用提供商的默认模型）
-DEFAULT_LLM_MODEL = "glm-4"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash"

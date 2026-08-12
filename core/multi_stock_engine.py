@@ -104,15 +104,28 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         print(f"  候选池：{candidate_pool}")
         print(f"  区间：{all_dates[0]} → {all_dates[-1]}")
         print(f"  总交易日：{len(all_dates)}")
-        print(f"  调仓周期：每 {config.REBALANCE_DAYS} 天")
+        if getattr(config, "REBALANCE_WEEKLY", False):
+            print(f"  调仓周期：每周第一个交易日（日历锚定）")
+        else:
+            print(f"  调仓周期：每 {config.REBALANCE_DAYS} 天")
         print(f"  Top-K：{config.TOP_K}")
         print(f"  初始资金：${self.initial_capital:,.2f}")
 
         # ========== 逐日遍历 ==========
         rebalance_counter = 0
+        prev_week_key = None
 
         for i, current_date in enumerate(all_dates):
-            is_rebalance_day = (rebalance_counter % config.REBALANCE_DAYS == 0)
+            if getattr(config, "REBALANCE_WEEKLY", False):
+                # 每个自然周（ISO 周）的第一个可交易日调仓：调仓日按日历固定，
+                # 不随回测起点漂移 → LLM 缓存 key 稳定、跨回测复用（Plan.md 假设 5）
+                iso = current_date.isocalendar()
+                week_key = (iso[0], iso[1])
+                is_rebalance_day = (week_key != prev_week_key)
+                prev_week_key = week_key
+            else:
+                # 旧行为：从 all_dates[0] 起每 REBALANCE_DAYS 个交易日计数
+                is_rebalance_day = (rebalance_counter % config.REBALANCE_DAYS == 0)
 
             # ========== 步骤 1：执行昨日待执行决策（以今日开盘价撮合）==========
             if self._pending_decision is not None:

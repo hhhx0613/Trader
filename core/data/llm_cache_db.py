@@ -288,12 +288,13 @@ class LLMCacheDB:
             print("[LLM Cache DB] 已清空所有缓存")
 
 
-# 全局实例（单例模式）
-_cache_db_instance = None
+# 全局实例（线程本地存储，每个线程独立连接 SQLite）
+import threading
+
+_local = threading.local()
 
 def get_cache_db() -> LLMCacheDB:
-    """获取全局缓存数据库实例"""
-    global _cache_db_instance
-    if _cache_db_instance is None:
-        _cache_db_instance = LLMCacheDB()
-    return _cache_db_instance
+    """获取当前线程的缓存数据库实例（线程安全）"""
+    if not hasattr(_local, 'cache_db_instance') or _local.cache_db_instance is None:
+        _local.cache_db_instance = LLMCacheDB()
+    return _local.cache_db_instance

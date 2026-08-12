@@ -45,7 +45,8 @@ pip install -r requirements.txt
 |-----|------|----------|
 | `FINNHUB_API_KEY` | 新闻数据（兜底，60 次/天） | https://finnhub.io/register |
 | `ALPHA_VANTAGE_API_KEY` | 新闻数据（主力，25 次/天） | https://www.alphavantage.co/support/#api-key |
-| `GLM_API_KEY` | **Llm 分析新闻**（必填！） | [智谱 AI 控制台](https://open.bigmodel.cn/dev/api/key) |
+| `DEEPSEEK_API_KEY` | **LLM 分析新闻**（默认，必填！） | [DeepSeek 平台](https://platform.deepseek.com/api_keys) |
+| `GLM_API_KEY` | LLM 分析（备选） | [智谱 AI 控制台](https://open.bigmodel.cn/dev/api/key) |
 
 ---
 
@@ -126,11 +127,16 @@ Trader/
 │   ├── market/               #   行情 CSV
 │   ├── news/                 #   新闻 CSV（合并 + 分段）
 │   └── llm/                  #   LLM 分析结果 SQLite
+├── utils/                     # 工具模块
+│   ├── llm_client.py         #   LLM API 统一客户端
+│   └── logger.py             #   日志系统（RotatingFile + LLM 审计）
 ├── scripts/
 │   ├── run_backtest_stage3.py # 端到端回测入口
 │   ├── ablation_experiment.py # Stage 4: L1 记忆消融实验
 │   ├── clear_llm_cache.py     # 清除 LLM 缓存工具
-│   └── data_fetch_tracker.py  # 新闻数据拉取进度追踪
+│   ├── data_fetch_tracker.py  # 新闻数据拉取进度追踪
+│   └── consolidate_news_cache.py # 新闻缓存归并工具
+├── tests/                     # 测试
 ├── docs/                      # 文档
 │   └── Plan.md               #   详细设计文档
 ├── config.py                  # 全局配置
@@ -144,8 +150,8 @@ Trader/
 ### 数据层
 - ✅ **Point-in-Time**：新闻严格按发布时间对齐，防前视偏差
 - ✅ **三层兜底**：本地缓存 → Alpha Vantage → Finnhub
-- ✅ **智能缓存**：基于全局锚点网格的段级缓存，天然去重、跨回测复用
-- ✅ **分段拉取**：自动将长历史切成 14 天一段逐段请求，最大化 API 配额利用率
+- ✅ **智能缓存**：基于全局锚点网格的段级缓存（28天段），天然去重、跨回测复用
+- ✅ **分段拉取**：自动将长历史切成 28 天一段逐段请求，效率翻倍
 
 ### 决策层
 - ✅ **LLM 缓存**：SQLite 存储，`(symbol, date, model)` 唯一键，避免重复调用
@@ -162,12 +168,20 @@ Trader/
 ## 📊 已知问题与待办
 
 - [ ] evaluate() 缺少换手率指标
-- [ ] PPO 环境（gym.Env）尚未实现
-- [ ] IBKR 模拟盘接入（阶段 5）
+- [ ] PPO 仓位融合器待验证（阶段 5）
+- [ ] IBKR 模拟盘接入（阶段 6）
 
 ---
 
 ## 📝 Version History
+
+- **v1.3 (2026-08-12)**: 工程化增强
+  - ✅ 日志系统：`utils/logger.py`（RotatingFile + 错误分离 + LLM 调用审计 JSONL）
+  - ✅ 并行化：LLM 选股分析 ThreadPoolExecutor 并行（线程安全 SQLite + 独立 Agent）
+  - ✅ 调仓日历锚定：`REBALANCE_WEEKLY` ISO 周切换，跨回测 LLM 缓存复用
+  - ✅ 新闻缓存优化：cache_hit 追踪，命中时跳过 15s sleep
+  - ✅ 默认 LLM 切换为 DeepSeek（`deepseek-v4-flash`）
+  - ✅ 段大小 14→28 天，AV 配额利用率翻倍
 
 - **v1.2 (2026-08-11)**: Stage 4 - L1 记忆模块完成
   - ✅ L1 记忆：LLM 分析时注入上次判断结果（从 SQLite 缓存加载）

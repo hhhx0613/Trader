@@ -29,6 +29,9 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+import utils.logger as log_utils
+logger = log_utils.get_logger(__name__)
+
 from core.data.news_data import get_news_at_date
 from core.data.llm_cache_db import get_cache_db
 from utils.llm_client import LLMClient
@@ -141,7 +144,6 @@ class LLMAnalystAgent:
       - 分析时从 SQLite 缓存检索该股票上次的判断结果
       - 将上次分析（方向/置信度/理由）注入 prompt
       - 让 LLM 判断有连贯性，避免反复横跳
-      - 与 LLM 缓存共用 SQLite，无需额外存储
     """
     
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None, enable_l1_memory: bool = True):
@@ -163,6 +165,7 @@ class LLMAnalystAgent:
             self.llm_client = LLMClient(provider=provider, model=model)
             # 更新为实际使用的模型
             self.model = self.llm_client.model
+            logger.info(f"LLMAnalystAgent initialized: model={self.model}, prompt_version={self.prompt_version}")
         except Exception as e:
             raise RuntimeError(f"LLM 客户端初始化失败：{e}")
     
@@ -193,8 +196,6 @@ class LLMAnalystAgent:
         # 调用 LLM API
         try:
             result = self._analyze_with_llm(symbol, date, news_list)
-            # L1 记忆：分析结果已自动保存到 SQLite 缓存（_save_cache）
-            # 下次分析时通过 _build_user_message 从缓存加载上次判断
             return result
         except Exception as e:
             print(f"[LLMAnalystAgent] LLM 调用失败：{e}")
@@ -220,7 +221,6 @@ class LLMAnalystAgent:
             message=user_message,
             system_prompt=system_prompt,
             temperature=0.1,  # 低温保证可复现性
-            max_tokens=2000,
         )
         
         # 检查是否有错误

@@ -30,6 +30,7 @@ if _PROJECT_ROOT not in sys.path:
 import argparse
 import numpy as np
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -117,36 +118,45 @@ def download_data(candidate_pool, start_date, end_date):
 
 # ==================== 路径 A：规则基线 ====================
 
+def _backtest_single_stock(symbol, df):
+    """对单只股票跑规则基线回测（供线程池调用）。"""
+    df_enriched = generate_signals(df.copy())
+
+    buy_count = (df_enriched["signal"] == config.SIGNAL_BUY).sum()
+    sell_count = (df_enriched["signal"] == config.SIGNAL_SELL).sum()
+    print(f"    信号：买入 {buy_count} 次，卖出 {sell_count} 次")
+
+    engine = BacktestEngine()
+    recorder = engine.run(df_enriched, symbol=symbol)
+    metrics = recorder.evaluate()
+
+    bh = recorder.evaluate_buy_and_hold(df)
+    if bh:
+        metrics.update(bh)
+
+    print(f"    累计收益率：{metrics.get('累计收益率', 'N/A')}")
+    return symbol, metrics
+
+
 def run_rule_baseline(market_data):
     """
-    对每只候选股跑规则基线（MA/RSI/MACD 多条件投票 + 单股回测引擎）。
+    对每只候选股并行跑规则基线（MA/RSI/MACD 多条件投票 + 单股回测引擎）。
     返回 Dict[symbol, metrics_dict]
     """
     print("\n" + "=" * 60)
     print("  [2/4] 路径 A：规则基线（阶段 0/1）")
-    print("  MA/RSI/MACD 多条件投票 → 单股回测")
+    print("  MA/RSI/MACD 多条件投票 → 单股回测（并行）")
     print("=" * 60)
 
     results = {}
-    for symbol, df in market_data.items():
-        print(f"\n  --- {symbol} ---")
-        # download_data 已预计算指标，只需生成信号
-        df_enriched = generate_signals(df.copy())
-
-        buy_count = (df_enriched["signal"] == config.SIGNAL_BUY).sum()
-        sell_count = (df_enriched["signal"] == config.SIGNAL_SELL).sum()
-        print(f"    信号：买入 {buy_count} 次，卖出 {sell_count} 次")
-
-        engine = BacktestEngine()
-        recorder = engine.run(df_enriched, symbol=symbol)
-        metrics = recorder.evaluate()
-
-        bh = recorder.evaluate_buy_and_hold(df)
-        if bh:
-            metrics.update(bh)
-
-        results[symbol] = metrics
-        print(f"    累计收益率：{metrics.get('累计收益率', 'N/A')}")
+    with ThreadPoolExecutor(max_workers=min(len(market_data), 10)) as executor:
+        futures = {
+            executor.submit(_backtest_single_stock, symbol, df): symbol
+            for symbol, df in market_data.items()
+        }
+        for future in as_completed(futures):
+            symbol, metrics = future.result()
+            results[symbol] = metrics
 
     return results
 
@@ -379,15 +389,63 @@ def main():
     # 1. 数据采集（一次下载，三条路径共用）
     market_data, news_df = download_data(args.pool, args.start, args.end)
 
-    # 2. 路径 A：规则基线
-    rule_results = {}
-    if not args.skip_rule:
-        rule_results = run_rule_baseline(market_data)
+    # 2. 三条路径并行执行
+    print("\n" + "=" * 60)
+    print("  三条路径并行执行（规则基线 / LLM / VADER）")
+    print("=" * 60)
 
-    # 3. 路径 B + C：LLM / VADER
-    llm_recorder, vader_recorder = run_llm_and_vader(
-        market_data, news_df, args
-    )
+    rule_results = {}
+    llm_recorder = None
+    vader_recorder = None
+
+    def _run_path_a():
+        if not args.skip_rule:
+            return run_rule_baseline(market_data)
+        return {}
+
+    def _run_path_b():
+        print("\n" + "=" * 60)
+        print("  路径 B：LLM Top-K（阶段 2-3）")
+        print("=" * 60)
+        print(f"\n  --- 路径 B：LLM Top-K ---")
+
+        def llm_decide(date, market_state, candidate_pool, news_df, current_holdings):
+            return decide_formula_llm(date, market_state, candidate_pool, news_df, current_holdings)
+
+        engine = MultiStockBacktestEngine(decide_func=llm_decide)
+        recorder = engine.run(market_data, news_df, args.pool)
+        if recorder.equity_curve:
+            print(f"  [OK] LLM 回测完成，最终权益：${recorder.equity_curve[-1][1]:,.2f}")
+        return recorder
+
+    def _run_path_c():
+        if args.skip_vader:
+            return None
+        print("\n" + "=" * 60)
+        print("  路径 C：VADER Top-K（阶段 2-3）")
+        print("=" * 60)
+        print(f"\n  --- 路径 C：VADER Top-K ---")
+
+        def vader_decide(date, market_state, candidate_pool, news_df, current_holdings):
+            return decide_formula_vader(date, market_state, candidate_pool, news_df, current_holdings)
+
+        engine = MultiStockBacktestEngine(decide_func=vader_decide)
+        recorder = engine.run(market_data, news_df, args.pool)
+        if recorder.equity_curve:
+            print(f"  [OK] VADER 回测完成，最终权益：${recorder.equity_curve[-1][1]:,.2f}")
+        return recorder
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_a = executor.submit(_run_path_a)
+        future_b = executor.submit(_run_path_b)
+        future_c = executor.submit(_run_path_c)
+
+        rule_results = future_a.result()
+        llm_recorder = future_b.result()
+        vader_recorder = future_c.result()
+
+    if args.skip_vader:
+        print(f"\n  [SKIP] VADER 路径已跳过（--skip-vader）")
 
     # 4. 对比表
     print_comparison_table(rule_results, llm_recorder, vader_recorder, market_data)

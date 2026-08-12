@@ -23,6 +23,11 @@ import sys
 import argparse
 from pathlib import Path
 
+# Initialize logging first!
+import utils.logger as log_utils
+log_utils.init_logger(level=logging.INFO)
+logger = log_utils.get_logger(__name__)
+
 import pandas as pd
 import numpy as np
 import matplotlib

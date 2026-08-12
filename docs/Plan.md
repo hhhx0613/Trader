@@ -302,6 +302,38 @@ final_score = w1·normalized_sentiment + w2·normalized_momentum + w3·normalize
 
 **验证方式**：统计不同股票的 news_count 分布 + 消融实验。
 
+### 假设 4：新闻分段缓存锚定到固定日历网格
+
+**现状问题**：`_fetch_news_segmented_av` 的段边界从请求的 `start_date` 开始按 `NEWS_SEGMENT_DAYS` 步进，段窗口随请求起点漂移。不同时间/不同区间拉取会产生**重叠的分段缓存**（缓存目录已出现 30 天与 14 天两套重叠段，如 `AAPL_news_seg_2025-08-07_2025-09-05` 与 `..._2025-08-11_2025-08-24`），同一批新闻被重复请求，浪费本就稀缺的 Alpha Vantage 配额（25 次/天，PPO 训练数据瓶颈）。
+
+**改进思路**：段边界锚定到**全局固定网格**——选一个全局锚点（周一），段 = `[anchor + 14k, anchor + 14k + 13]`。任何请求区间都映射到同一批段文件，天然去重、跨回测复用。选 14 天而非自然月：AV 单次上限 1000 条，AAPL/NVDA 高新闻量股一个月可能超限被截断丢数据。
+
+**实现位置**：`config.py`（`NEWS_SEGMENT_ANCHOR`）、`core/data/news_data.py`（`_fetch_news_segmented_av` 段循环改为网格对齐）；配套一次性归并脚本把旧重叠段重整到新网格并归档。
+
+**为什么可能有效**：消除重复请求 → 相同配额覆盖更长历史。**为什么可能无效/风险**：网格末段会拉取略超回测 end_date 的数据（PIT 消费端已过滤，无未来函数风险）。
+
+**验证方式**：对比重整前后同一区间的实际 AV 请求次数与缓存命中率。
+
+### 假设 5：调仓日锚定到固定日历（每周第一个交易日）
+
+**现状问题**：`MultiStockBacktestEngine` 的 `rebalance_counter` 从 `all_dates[0]` 计数，调仓日随回测起点漂移（7.6 起始 vs 7.7 起始 → 整串调仓日错位）。LLM 缓存按 `(symbol, analysis_date, model)` 精确日期为 key，调仓日漂移导致同一周被重复分析、**跨回测无法复用 LLM 缓存，浪费 GLM-4 token**。
+
+**改进思路**：调仓日 = 每个自然周（ISO 周）的第一个可交易日，不再依赖起点计数。任何起点下，从第二个自然周起调仓日完全对齐 → LLM 缓存 key 稳定、跨回测复用；并与 7 天新闻 lookback 窗口对齐。用 `config.REBALANCE_WEEKLY` 开关保留旧 `REBALANCE_DAYS` 计数模式以便消融。
+
+**实现位置**：`config.py`（`REBALANCE_WEEKLY`）、`core/multi_stock_engine.py`（调仓判定改为 ISO 周切换）。
+
+**验证方式**：不同起点跑同一后续区间，统计 LLM 缓存命中率提升；确认净值曲线在对齐区间一致。
+
+### 假设 6：PPO 状态向量新增「信号新鲜度」维度
+
+**现状问题**：LLM 信号为周频（仅调仓日更新），PPO 训练环境按日频步进，`_compute_llm_features` 静默前向填充上一次信号，PPO 无法感知手上观点已过期几天。
+
+**改进思路**：状态向量新增一维 `llm_signal_age`（当前日距最近一次 LLM 信号的天数，归一化），让 PPO 学会对陈旧信号打折。`PPOEnv`（训练，日频）计算真实 age；`PPOPolicy`（回测推理，仅调仓日决策，信号恒新鲜）取 0。`STATE_DIMS` 从 17 → 18，旧模型需重训。
+
+**实现位置**：`core/ppo/ppo_env.py`（`STATE_DIMS` + `_compute_llm_features`）、`core/ppo/ppo_policy.py`（`_build_state_vector` 补齐同维）。
+
+**验证方式**：消融实验——有 vs 无 `signal_age` 维度，对比周中减仓响应与夏普/回撤。
+
 ---
 
 ## 七、MVP 路径
