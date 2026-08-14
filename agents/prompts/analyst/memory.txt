@@ -1,0 +1,9 @@
+
+## 你上次对 {symbol} 的分析（{prev_date}）
+
+- 方向：{prev_dir}
+- 置信度：{prev_conf}
+- 理由：{reasons_str}
+{outcome_line}
+
+请结合最新新闻，给出新的判断。如果判断发生变化，请说明原因。

@@ -1,6 +1,27 @@
 """
 全局配置文件
 所有可调参数集中在此处管理，方便后续修改和实验对比。
+
+=== Python 环境配置 ===
+请使用 Conda 的 trader 环境运行本项目：
+
+```bash
+# 激活环境
+conda activate trader
+
+# 运行回测脚本
+python scripts/run_backtest.py
+
+# 运行测试
+pytest tests/
+```
+
+如果未创建 conda 环境，请先执行：
+```bash
+conda create -n trader python=3.10
+conda activate trader
+pip install -r requirements.txt
+```
 """
 
 import os
@@ -49,9 +70,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 默认交易标的（美股苹果，数据稳定、适合入门演示）
 DEFAULT_SYMBOL = "NVDA"
 
-# 默认回测时间范围（最近一个月，跑通流程）
-DEFAULT_START_DATE = "2026-07-06"
-DEFAULT_END_DATE = "2026-08-06"
+# 默认回测时间范围（一年数据）
+DEFAULT_START_DATE = "2025-08-11"
+DEFAULT_END_DATE = "2026-08-09"
 
 # Alpha Vantage API Key（免费申请：https://www.alphavantage.co/support/#api-key）
 # Alpha Vantage API Key（单个 key）
@@ -161,6 +182,10 @@ MAX_POSITION_RATIO = 1.0
 
 # 单笔最大亏损比例（占总资金的比例，超过则止损）
 MAX_SINGLE_LOSS_RATIO = 0.02  # 2%
+
+# ATR 动态止损配置
+USE_ATR_STOP = True           # 是否启用 ATR 动态止损
+ATR_STOP_MULTIPLIER = 2.5     # ATR 倍数，常用 2x-3x
 
 # 单日最大回撤比例（超过则当日禁止新开仓）
 MAX_DAILY_DRAWDOWN = 0.05  # 5%

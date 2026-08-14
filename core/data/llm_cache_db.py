@@ -9,7 +9,8 @@ LLM 缓存数据库管理器（SQLite）
 
 表结构：
   - llm_analysis_cache: 存储 LLM 分析结果
-  - 索引：symbol, analysis_date, model（加速查询）
+  - 索引：symbol, analysis_date, model, prompt_version（加速查询）
+  - UNIQUE 约束包含 prompt_version：prompt/记忆模板一变即触发缓存失效重算
 """
 
 import sqlite3
@@ -53,14 +54,20 @@ class LLMCacheDB:
                     model TEXT NOT NULL,
                     direction TEXT,
                     confidence REAL,
+                    composite_score REAL,
                     reasons TEXT,
                     sources TEXT,
-                    prompt_version TEXT,
+                    prompt_version TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol, analysis_date, model)
+                    UNIQUE(symbol, analysis_date, model, prompt_version)
                 )
             """)
             
+            # 存量库迁移：旧表无 composite_score 列时补加（Plan.md 假设 7 B 档）
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_analysis_cache)")}
+            if "composite_score" not in cols:
+                conn.execute("ALTER TABLE llm_analysis_cache ADD COLUMN composite_score REAL")
+
             # 创建索引（加速查询）
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_symbol 
@@ -77,25 +84,26 @@ class LLMCacheDB:
             
             conn.commit()
     
-    def get_cache(self, symbol: str, date: str, model: str) -> Optional[Dict]:
+    def get_cache(self, symbol: str, date: str, model: str, prompt_version: str = "") -> Optional[Dict]:
         """
         查询缓存
-        
+
         Args:
             symbol: 股票代码
             date: 分析日期（格式：YYYY-MM-DD）
             model: LLM 模型名称
-        
+            prompt_version: prompt 版本哈希（内容级 key 的一部分，prompt 或记忆模板一变即失效）
+
         Returns:
             缓存的分析结果字典，不存在则返回 None
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("""
-                SELECT symbol, analysis_date, model, direction, confidence, 
-                       reasons, sources, prompt_version, created_at
+                SELECT symbol, analysis_date, model, direction, confidence,
+                       reasons, sources, prompt_version, created_at, composite_score
                 FROM llm_analysis_cache
-                WHERE symbol=? AND analysis_date=? AND model=?
-            """, (symbol, date, model))
+                WHERE symbol=? AND analysis_date=? AND model=? AND prompt_version=?
+            """, (symbol, date, model, prompt_version))
             
             row = cursor.fetchone()
             if row:
@@ -108,7 +116,8 @@ class LLMCacheDB:
                     "reasons": json.loads(row[5]) if row[5] else [],
                     "sources": json.loads(row[6]) if row[6] else [],
                     "prompt_version": row[7],
-                    "created_at": row[8]
+                    "created_at": row[8],
+                    "composite_score": row[9],
                 }
             return None
     
@@ -128,14 +137,15 @@ class LLMCacheDB:
                 conn.execute("""
                     INSERT OR REPLACE INTO llm_analysis_cache
                     (symbol, analysis_date, model, direction, confidence, 
-                     reasons, sources, prompt_version)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     composite_score, reasons, sources, prompt_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     data["symbol"],
                     data["analysis_date"],
                     data.get("model", "glm-4"),
                     data.get("direction"),
                     data.get("confidence"),
+                    data.get("composite_score"),
                     json.dumps(data.get("reasons", []), ensure_ascii=False),
                     json.dumps(data.get("sources", []), ensure_ascii=False),
                     data.get("prompt_version", "v1.0")
@@ -146,27 +156,28 @@ class LLMCacheDB:
             print(f"[LLM Cache DB] 保存失败：{e}")
             return False
     
-    def get_previous_analysis(self, symbol: str, before_date: str, model: str) -> Optional[Dict]:
+    def get_previous_analysis(self, symbol: str, before_date: str, model: str, prompt_version: str = "") -> Optional[Dict]:
         """
         获取某只股票在指定日期之前的最近一次分析结果（用于 L1 记忆）。
-        
+
         Args:
             symbol: 股票代码
             before_date: 截止日期（不包含该日期，格式：YYYY-MM-DD）
             model: LLM 模型名称
-        
+            prompt_version: prompt 版本（记忆只回溯同版本历史，避免旧版判断污染新链）
+
         Returns:
             最近一次分析结果字典，不存在则返回 None
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("""
-                SELECT symbol, analysis_date, model, direction, confidence, 
+                SELECT symbol, analysis_date, model, direction, confidence,
                        reasons, sources, prompt_version
                 FROM llm_analysis_cache
-                WHERE symbol=? AND analysis_date<? AND model=?
+                WHERE symbol=? AND analysis_date<? AND model=? AND prompt_version=?
                 ORDER BY analysis_date DESC
                 LIMIT 1
-            """, (symbol, before_date, model))
+            """, (symbol, before_date, model, prompt_version))
             
             row = cursor.fetchone()
             if row:

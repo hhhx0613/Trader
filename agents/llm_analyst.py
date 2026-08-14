@@ -19,6 +19,7 @@ LLM Analyst Agent（新闻分析师）
 
 import json
 import sys
+import math
 import hashlib
 import pandas as pd
 from typing import Dict, List, Optional
@@ -40,95 +41,60 @@ from utils.llm_client import LLMClient
 _LLM_CACHE_DIR = Path(__file__).parent.parent / "core" / "data" / "cache" / "llm"
 _LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==================== System Prompt（v2.0 结构化多维打分框架）====================
-# 设计原则：
-#   - 约束模型的思考维度（事件影响性、预期差、时效性、传导确定性）
-#   - 不设定关键词到分数的硬映射（避免退化为 VADER 式词典匹配）
-#   - 让 LLM 发挥语义理解优势，同时输出可解释、可追溯的结构化评分
+# ==================== Prompt 文件加载 ====================
+# 设计：
+#   - prompt 按 agent 分目录：agents/prompts/{agent_name}/*.txt
+#   - prompt_version 由该 agent 所有 prompt 文件内容的 hash 自动派生
+#   - 改任何文件 → hash 变 → 该 agent 的缓存自动失效
+#   - 调仓日按 ISO 周日历锚定 → 记忆链与回测窗口解耦 → 换窗口不会级联雪崩
 
-_SYSTEM_PROMPT = """\
-你是专业股票分析师。请对给定的股票新闻进行结构化多维分析，判断市场情绪和股价方向。
+_PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-## 分析框架
+# composite_score 聚合的压缩尺度：raw 求和 → tanh(raw / _COMPOSITE_SCALE)
+# 唯一待标定旋钮（Plan.md 假设 7）：单条实质新闻 score≈4 时给出约 0.6 的强度，
+# 两条同向叠加接近饱和。改此值不影响 prompt_version（不参与缓存 key）。
+_COMPOSITE_SCALE = 6.0
 
-对每条新闻，从以下 4 个维度独立打分：
 
-### 1. 事件影响性（impact：-2 ~ +2）
-对公司基本面（营收、利润、市场份额、技术壁垒）的实质影响程度。
-- +2：重大利好（超预期财报、重大合同、突破性产品）
-- +1：温和利好（小幅超预期、正面合作、分析师上调评级）
--  0：中性（例行公告、人事变动、行业一般动态）
-- -1：温和利空（小幅不及预期、监管关注、竞争加剧）
-- -2：重大利空（财报暴雷、核心产品失败、高管丑闻、重大诉讼）
+def load_prompts(agent_name: str) -> tuple[dict, str]:
+    """
+    加载某 agent 的所有 prompt 文件，返回 (内容字典, 版本标识)。
+    
+    参数：
+      agent_name: agent 名称，对应 prompts/{agent_name}/ 目录
+    
+    返回：
+      (prompts_dict, version)
+      - prompts_dict: {文件名stem: 内容}，如 {"system": "...", "user": "..."}
+      - version: 所有文件内容的 md5 hash 前 8 位
+    
+    设计：
+      - 版本自动派生，改任何文件 → hash 变 → 缓存自动失效
+      - 每个 agent 独立版本，互不影响
+    """
+    prompts_dir = _PROMPTS_DIR / agent_name
+    if not prompts_dir.exists():
+        raise FileNotFoundError(f"Prompt 目录不存在：{prompts_dir}")
+    
+    prompts = {}
+    hash_parts = []
+    
+    # 按文件名排序加载，保证 hash 稳定
+    for f in sorted(prompts_dir.glob("*.txt")):
+        content = f.read_text(encoding="utf-8")
+        prompts[f.stem] = content
+        hash_parts.append(content)
+    
+    # 版本 = 所有文件内容的 hash，自动派生
+    version = hashlib.md5("|".join(hash_parts).encode()).hexdigest()[:8]
+    return prompts, version
 
-### 2. 预期差（expectation_gap：-2 ~ +2）
-与市场已有共识的偏离程度。
-- +2：远超市场共识的意外利好
-- +1：略超市场预期
--  0：符合预期，或新闻本身未涉及预期对比
-- -1：略低于市场预期
-- -2：远低于预期的意外利空
 
-### 3. 时效性系数（timeliness：0.5 / 1.0 / 1.5）
-影响持续时间的估计。
-- 0.5：短期噪音（1-3 天内消化，如日内波动、未经证实的传闻、技术面反弹）
-- 1.0：中期影响（1-4 周内逐步反映，如季度财报、产品发布）
-- 1.5：长期结构性变化（1-3 个月以上持续影响，如战略转型、行业格局变化）
-
-### 4. 传导确定性（certainty：0.5 / 1.0 / 1.5）
-从事件到股价变动的逻辑链可靠性。
-- 0.5：逻辑链弱或存在多重不确定性（传闻、间接影响、需多步传导）
-- 1.0：逻辑链较清晰（直接影响、有历史参照）
-- 1.5：因果关系明确且可验证（已公告的重大事件、历史同类事件均有明确反应）
-
-### 单条新闻得分计算
-score = (impact + expectation_gap) × timeliness × certainty
-理论范围 [-6, +6]
-
-### 综合得分（composite_score）
-所有新闻 score 的加权平均（时效性高的权重更大），归一化到 [-1, 1]。
-归一化方法：composite_score = tanh(加权平均 score / 3.0)
-
-## 输出格式
-
-严格按以下 JSON 结构输出，不要添加任何其他文字：
-
-{
-  "per_news": [
-    {
-      "index": 1,
-      "impact": 1,
-      "expectation_gap": 0,
-      "timeliness": 1.0,
-      "certainty": 1.0,
-      "score": 1.0,
-      "reasoning": "简要说明打分理由（50字以内）"
-    }
-  ],
-  "composite_score": 0.75,
-  "direction": "bullish",
-  "confidence": 0.8,
-  "key_factors": ["因素1", "因素2"],
-  "reasons": ["综合原因1", "综合原因2"]
-}
-
-## 字段说明
-- per_news：每条新闻的维度打分（与新闻列表序号对应）
-- composite_score：综合得分，[-1, 1]，正=看涨，负=看跌
-- direction：bullish（composite_score > 0.1）/ neutral（-0.1 ~ 0.1）/ bearish（< -0.1）
-- confidence：置信度，硬性规则如下：
-  - 5+ 条有实质内容的新闻：0.8-1.0
-  - 2-4 条新闻：0.5-0.7
-  - 0-1 条新闻：0.0-0.4
-- key_factors：影响判断的核心因素（不超过 3 个）
-- reasons：综合判断理由（不超过 3 条）
-
-## 约束
-1. 只输出 JSON，不要任何额外文字或 markdown 标记
-2. 每条 news 的 reasoning 不超过 50 字
-3. composite_score 必须在 [-1, 1] 范围内
-4. 如果无新闻，per_news 为空数组，direction 为 neutral，confidence 为 0.0
-"""
+# Analyst agent 的 prompt
+_ANALYST_PROMPTS, _ANALYST_PROMPT_VERSION = load_prompts("analyst")
+_SYSTEM_PROMPT = _ANALYST_PROMPTS["system"]
+_USER_TEMPLATE = _ANALYST_PROMPTS["user"]
+_MEMORY_TEMPLATE = _ANALYST_PROMPTS["memory"]
 
 
 class LLMAnalystAgent:
@@ -157,9 +123,11 @@ class LLMAnalystAgent:
         """
         self.provider = provider
         self.model = model
-        self.prompt_version = "v2.0"  # 结构化多维打分框架
+        # prompt_version 由该 agent 所有 prompt 文件内容的 hash 自动派生
+        # 改任何文件 → hash 变 → 缓存自动失效
+        self.prompt_version = _ANALYST_PROMPT_VERSION
         self.enable_l1_memory = enable_l1_memory
-        
+
         # 初始化 LLM 客户端
         try:
             self.llm_client = LLMClient(provider=provider, model=model)
@@ -168,83 +136,141 @@ class LLMAnalystAgent:
             logger.info(f"LLMAnalystAgent initialized: model={self.model}, prompt_version={self.prompt_version}")
         except Exception as e:
             raise RuntimeError(f"LLM 客户端初始化失败：{e}")
-    
+
     def analyze(
         self,
         symbol: str,
         date: str,
         news_list: List[Dict],
+        price_series: Optional[pd.Series] = None,
     ) -> Dict:
         """
         分析新闻，生成结构化观点。
-        
+
         参数：
           symbol: 股票代码（如 "AAPL"）
           date: 分析日期（格式 "YYYY-MM-DD"）
           news_list: 新闻列表（由 get_news_at_date 返回）
-        
+          price_series: 该股票的收盘价序列（index=日期字符串或 Timestamp，value=float）。
+                        用于 L1 记忆注入「上次判断后的实际市场反应」。
+                        为 None 时降级为旧的一致性记忆（不注入收益反馈）。
+
         返回：
           {
             "symbol": "AAPL",
-            "direction": "bullish | neutral | bearish",
-            "confidence": 0.0-1.0,
+            "per_news": [{"impact": 1, "expectation_gap": 0, "timeliness": 1.0, "certainty": 1.0, "score": 1.0, ...}],
+            "composite_score": 0.75,  # 代码计算：tanh(Σ score / _COMPOSITE_SCALE)
+            "direction": "bullish",   # 代码计算：composite_score > 0.1 → bullish
+            "confidence": 0.8,        # LLM 评估：基于信息质量
+            "key_factors": ["...", "..."],
             "reasons": ["...", "..."],
-            "sources": ["新闻标题/链接"],
             "analysis_date": "2023-06-15"
           }
         """
         # 调用 LLM API
         try:
-            result = self._analyze_with_llm(symbol, date, news_list)
+            result = self._analyze_with_llm(symbol, date, news_list, price_series)
             return result
         except Exception as e:
             print(f"[LLMAnalystAgent] LLM 调用失败：{e}")
             raise
-    
-    def _analyze_with_llm(self, symbol: str, date: str, news_list: List[Dict]) -> Dict:
+
+    def _analyze_with_llm(self, symbol: str, date: str, news_list: List[Dict],
+                          price_series: Optional[pd.Series] = None) -> Dict:
         """
         使用 LLM 客户端分析新闻（带缓存）。
         """
-        # 构建 prompt（system = 固定框架，user = 每次变化的新闻数据）
+        # 构建 prompt（system = 固定框架，user = 每次变化的新闻数据 + L1 记忆）
         system_prompt = self._build_system_prompt()
-        user_message = self._build_user_message(symbol, date, news_list)
-        
+        user_message = self._build_user_message(symbol, date, news_list, price_series)
+
         # 检查缓存（可复现性：相同输入直接返回缓存结果）
-        cache_key = self._compute_cache_key(symbol, date, system_prompt, user_message)
+        cache_key = self._compute_cache_key(symbol, date)
         cached = self._load_cache(cache_key)
         if cached is not None:
             print(f"  [LLM Cache] 命中缓存: {symbol} @ {date}")
             return cached
-        
+
         # 调用 LLM 客户端
         response = self.llm_client.chat_json(
             message=user_message,
             system_prompt=system_prompt,
             temperature=0.1,  # 低温保证可复现性
         )
-        
+
         # 检查是否有错误
         if "error" in response:
             raise RuntimeError(f"LLM 返回错误：{response['error']}")
-        
+
+        # 代码计算 score / composite_score / direction（LLM 不擅长精确数学）
+        self._compute_scores(response)
+
         # 添加元数据
         response["symbol"] = symbol
         response["analysis_date"] = date
         response["prompt_version"] = self.prompt_version
-        
+
         # 写入缓存
         self._save_cache(cache_key, response)
-        
+
         return response
     
     def _build_system_prompt(self) -> str:
-        """返回固定的分析框架 prompt（见模块级常量 _SYSTEM_PROMPT）。"""
+        """返回分析框架 prompt（从 prompts/ 目录加载）。"""
         return _SYSTEM_PROMPT
 
-    def _build_user_message(self, symbol: str, date: str, news_list: List[Dict]) -> str:
+    def _compute_scores(self, response: Dict) -> None:
+        """
+        根据 LLM 返回的 per_news 维度打分，计算 score / composite_score / direction。
+        直接在 response 上修改（原地更新）。
+
+        设计（Plan.md 假设 7）：
+          - LLM 只负责语义评估（四维打分），不擅长精确数学
+          - composite_score 是「求和 + tanh 压缩」得到的有符号连续强度信号：
+                raw = Σ_i (impact_i + gap_i) * timeliness_i * certainty_i
+                composite_score = tanh(raw / _COMPOSITE_SCALE)  ∈ (-1, 1)
+          - 用求和而非加权平均：中性噪音 score≈0 不改变求和 → 天然不稀释；
+            多条同向新闻自动叠加；单条极端事件自动主导；无需任何权重方案，
+            certainty 仅作乘数用一次，消除双重计权。
+          - direction 由 composite_score 阈值决定，退居次要（仅供选股门槛与日志）
+        """
+        per_news = response.get("per_news", [])
+
+        if not per_news:
+            response["composite_score"] = 0.0
+            response["direction"] = "neutral"
+            return
+
+        # 计算每条新闻的 score，并直接求和为 raw（中性 score≈0 不贡献，不稀释）
+        raw = 0.0
+        for news in per_news:
+            impact = news.get("impact", 0)
+            exp_gap = news.get("expectation_gap", 0)
+            timeliness = news.get("timeliness", 1.0)
+            certainty = news.get("certainty", 1.0)
+
+            score = (impact + exp_gap) * timeliness * certainty
+            news["score"] = round(score, 4)
+            raw += score
+
+        # 求和 → tanh 压缩到 [-1, 1]
+        composite_score = math.tanh(raw / _COMPOSITE_SCALE)
+        response["composite_score"] = round(composite_score, 4)
+
+        # direction 由 composite_score 阈值决定
+        if composite_score > 0.1:
+            response["direction"] = "bullish"
+        elif composite_score < -0.1:
+            response["direction"] = "bearish"
+        else:
+            response["direction"] = "neutral"
+
+    def _build_user_message(self, symbol: str, date: str, news_list: List[Dict],
+                            price_series: Optional[pd.Series] = None) -> str:
         """
         构建 user message（每次调用变化的新闻数据）。
-        如果启用 L1 记忆，会从 SQLite 缓存加载该股票上次的分析结果。
+        如果启用 L1 记忆，会从 SQLite 缓存加载该股票上次的分析结果，
+        并根据 price_series 计算「上次判断后的实际市场反应」注入 prompt。
         """
         # 格式化新闻列表（处理可能的 NaN 值）
         news_lines = []
@@ -265,49 +291,94 @@ class LLMAnalystAgent:
 
         news_text = "\n\n".join(news_lines) if news_lines else "（无新闻）"
 
-        # L1 记忆：从 SQLite 缓存加载上次分析结果
+        # L1 记忆：从 SQLite 缓存加载上次分析结果（同 prompt_version 内）
         memory_text = ""
         if self.enable_l1_memory:
             cache_db = get_cache_db()
-            prev = cache_db.get_previous_analysis(symbol, date, self.model)
+            prev = cache_db.get_previous_analysis(
+                symbol, date, self.model, self.prompt_version
+            )
             if prev:
                 reasons_str = "；".join(prev.get("reasons", [])[:2]) if prev.get("reasons") else "无"
-                memory_text = f"""
+                prev_date = prev['analysis_date']
+                prev_dir = prev['direction']
+                prev_conf = prev['confidence']
 
-## 你上次对 {symbol} 的分析（{prev['analysis_date']}）
+                # 计算「上次判断后的实际市场反应」（PIT 安全：只用 ≤ current_date 的历史价）
+                outcome_text = ""
+                if price_series is not None:
+                    try:
+                        # 用 asof 兼容不同 index 类型（str / Timestamp）
+                        close_prev = price_series.asof(prev_date)
+                        close_curr = price_series.asof(date)
+                        # 容错：若 asof 返回 NaN 或 prev_date 在序列之前，跳过
+                        if pd.notna(close_prev) and pd.notna(close_curr) and close_prev > 0:
+                            realized = close_curr / close_prev - 1.0
+                            # 命中判定：bullish+涨 / bearish+跌 → 正确；neutral → 未验证
+                            if prev_dir == "neutral":
+                                verdict = "未验证（上次弃权）"
+                            elif (prev_dir == "bullish" and realized > 0) or \
+                                 (prev_dir == "bearish" and realized < 0):
+                                verdict = "判断正确"
+                            else:
+                                verdict = "判断错误"
+                            outcome_text = (
+                                f"之后实际收益 **{realized:+.1%}**，**{verdict}**。"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[L1 Memory] 计算实际收益失败 {symbol} {prev_date}->{date}: {e}")
 
-- 方向：{prev['direction']}
-- 置信度：{prev['confidence']:.2f}
-- 理由：{reasons_str}
+                # 构建 outcome 行（有实际收益时加上）
+                outcome_line = f"- {outcome_text}" if outcome_text else ""
 
-请结合最新新闻，给出新的判断。如果判断发生变化，请说明原因。"""
+                # 用模板填充记忆块
+                memory_text = _MEMORY_TEMPLATE.format(
+                    symbol=symbol,
+                    prev_date=prev_date,
+                    prev_dir=prev_dir,
+                    prev_conf=f"{prev_conf:.2f}",
+                    reasons_str=reasons_str,
+                    outcome_line=outcome_line,
+                )
 
-        return f"请分析 {symbol} 在 {date} 的新闻：{memory_text}\n\n## 新闻内容\n\n{news_text}"
+        # 用模板填充最终 user message
+        return _USER_TEMPLATE.format(
+            symbol=symbol,
+            date=date,
+            memory_text=memory_text,
+            news_text=news_text,
+        )
 
     # ==================== LLM 输出缓存（SQLite）====================
 
-    def _compute_cache_key(self, symbol: str, date: str, system_prompt: str, user_message: str) -> tuple:
+    def _compute_cache_key(self, symbol: str, date: str) -> tuple:
         """
         计算缓存 key（用于 SQLite 查询）。
-        返回 (symbol, date, model) 三元组。
+        返回 (symbol, date, model, prompt_version) 四元组。
+
+        设计：
+          - prompt_version 由该 agent 所有 prompt 文件内容的 hash 自动派生
+          - 调仓日按 ISO 周日历锚定 → 记忆链与回测窗口解耦 → 换窗口不会级联雪崩
+          - 记忆内容与实际收益都是「被这四元组唯一决定的确定性函数」，不进 key
         """
-        return (symbol, date, self.model)
+        return (symbol, date, self.model, self.prompt_version)
 
     def _load_cache(self, cache_key: tuple) -> Optional[Dict]:
         """从 SQLite 数据库加载 LLM 缓存。"""
-        symbol, date, model = cache_key
+        symbol, date, model, prompt_version = cache_key
         cache_db = get_cache_db()
-        return cache_db.get_cache(symbol, date, model)
+        return cache_db.get_cache(symbol, date, model, prompt_version)
 
     def _save_cache(self, cache_key: tuple, data: Dict):
         """将 LLM 输出保存到 SQLite 数据库。"""
-        symbol, date, model = cache_key
+        symbol, date, model, prompt_version = cache_key
         cache_db = get_cache_db()
-        
+
         # 添加 model 字段到 data
         data_to_save = data.copy()
         data_to_save["model"] = model
-        
+        data_to_save["prompt_version"] = prompt_version
+
         cache_db.save_cache(data_to_save)
 
 
@@ -337,7 +408,7 @@ def analyze_stock_news(
     news_list = get_news_at_date(news_df, symbol, date)
     
     # 创建 agent 并分析
-    agent = LLMAnalystAgent(provider=provider, model=model)
+    agent = LLMAnalystAgent(provider=provider, model=model, enable_l1_memory=False)
     analysis = agent.analyze(symbol, date, news_list)
     
     return analysis

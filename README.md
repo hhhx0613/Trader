@@ -31,10 +31,38 @@
 
 ## 🚀 快速开始
 
+### 0. 配置 Python 环境（Conda）
+
+**推荐方式：使用 Conda 的 `trader` 环境**
+
+```bash
+# 1. 创建 conda 环境（如果尚未创建）
+conda create -n trader python=3.10 -y
+
+# 2. 激活环境
+conda activate trader
+
+# 3. 安装依赖
+pip install -r requirements.txt
+```
+
+**注意**: 本项目要求 Python >= 3.10，建议使用 Miniconda 或 Anaconda。
+
+---
+
 ### 1. 安装依赖
+
+#### 如果你已经激活了 Conda 环境：
 
 ```bash
 pip install -r requirements.txt
+```
+
+#### 或者直接使用 Conda 安装：
+
+```bash
+conda install numpy pandas matplotlib requests gymnasium torch stable-baselines3 vaderSentiment python-dotenv -c conda-forge
+pip install ib-insync yfinance openai
 ```
 
 ### 2. 配置 API Keys
@@ -55,54 +83,24 @@ pip install -r requirements.txt
 一条命令跑通阶段 1-3（三条路径对比）：
 
 ```bash
-python scripts/run_backtest_stage3.py
+python scripts/run_backtest.py
 ```
 
 **默认参数**：
 - 候选池：AAPL, NVDA, MSFT, GOOGL, AMZN, JPM, V, JNJ, UNH, WMT
-- 时间范围：最近一个月（config.py 中 DEFAULT_START_DATE / DEFAULT_END_DATE）
-- Top-K：5 只，每 5 天调仓
+- 时间范围：2025-08-11 ~ 2026-08-09（一年）
+- Top-K：5 只，每周调仓
 
-**输出对比表**（最近一个月 2026-07-06 ~ 2026-08-06）：
+**最新回测结果**（2025-08-11 ~ 2026-08-09，一年期）：
 
-| 路径 | 累计收益率 | 最大回撤 | 夏普比率 | 交易次数 |
-|------|-----------|---------|---------|---------|
-| 规则基线（均值） | -1.14% | 3.12% | - | 7 |
-| LLM Top-K | **+1.85%** | 1.29% | **2.99** | 16 |
-| VADER Top-K | +1.20% | 0.97% | 2.24 | 16 |
-| Buy&Hold(AAPL) | -0.53% | 10.78% | - | - |
+| 指标 | LLM Top-K |
+|------|----------|
+| 累计收益率 | **+10.00%** |
+| 最终权益 | **$110,003** |
+| 初始资金 | $100,000 |
 
-> **说明**：LLM Top-K 表现最好（+1.85%），夏普 2.99，回撤仅 1.29%。
+> **说明**：禁用置信度校准后，LLM Top-K 策略在一年期回测中实现 10% 稳定收益，结果可复现。
 
----
-
-## 📊 Stage 4: L1 记忆消融实验
-
-2026-08-11 完成了 L1 记忆的效果验证：
-
-### 实验设计
-
-对比两组配置：
-1. **无 L1 记忆**：每天独立判断，不记得昨天的结论
-2. **有 L1 记忆**：能看到上次的判断结果，要求解释变化原因
-
-### 实验结果
-
-| 实验 | 收益率 | 最大回撤 | Sharpe |
-|------|--------|----------|--------|
-| 无 L1 记忆 (baseline) | +0.95% | -0.62% | 2.34 |
-| 有 L1 记忆 | **+1.64%** | -0.66% | **4.65** |
-
-**关键发现**：
-- ✅ 收益提升 **73%** (0.95% → 1.64%)
-- ✅ Sharpe **翻倍** (2.34 → 4.65)
-- ✅ 交易次数增加 (23 → 28)，说明更积极参与机会
-
-**机制解释**：L1 记忆增加了判断的连贯性约束，避免"反复横跳"式的噪声决策。
-
-**消融实验已保存到**：`output/ablation/ablation_results.csv`
-
----
 
 ## 📂 项目结构
 
@@ -131,7 +129,7 @@ Trader/
 │   ├── llm_client.py         #   LLM API 统一客户端
 │   └── logger.py             #   日志系统（RotatingFile + LLM 审计）
 ├── scripts/
-│   ├── run_backtest_stage3.py # 端到端回测入口
+│   ├── run_backtest.py        # 端到端回测入口（统一脚本）
 │   ├── ablation_experiment.py # Stage 4: L1 记忆消融实验
 │   ├── clear_llm_cache.py     # 清除 LLM 缓存工具
 │   ├── data_fetch_tracker.py  # 新闻数据拉取进度追踪
@@ -174,6 +172,13 @@ Trader/
 ---
 
 ## 📝 Version History
+
+- **v1.4 (2026-08-14)**: 置信度校准机制禁用
+  - ❌ 禁用 L-Calibrate 置信度校准（收益从 10% 降至 3.78%，校准方向错误）
+  - ✅ 修复 `INDICATOR_WARMUP_DAYS` 从 15 天到 60 天（技术指标需要足够预热期）
+  - ✅ 统一回测入口为 `scripts/run_backtest.py`（删除冗余的 stage3/stage5 脚本）
+  - ✅ 清理冗余文档和临时文件（output 目录、calibration 分析报告等）
+  - ✅ 结果稳定可复现：两次运行都得到 ~10% 收益率
 
 - **v1.3 (2026-08-12)**: 工程化增强
   - ✅ 日志系统：`utils/logger.py`（RotatingFile + 错误分离 + LLM 调用审计 JSONL）

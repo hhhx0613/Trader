@@ -1,16 +1,19 @@
 """
-选股模块：从候选池中选出 Top-K 股票（等权持有）
+选股模块：从候选池中选出 Top-K 股票
 
 职责：
   1. 接收候选股票池
   2. 对每只股票运行 LLM 分析（按 symbol 过滤新闻）
-  3. 按置信度排序，选出 Top-K（bullish + confidence 最高）
+  3. 按 composite_score × confidence 排序，选出 Top-K
+     - composite_score（代码从 per_news 确定性计算）：信号方向+强度
+     - confidence（LLM 评估的证据质量）：信号可信度
+     - 乘积 = 期望信号强度，同时要求方向明确且证据可靠
   4. 持有优先：仍在 Top-K 的持仓不动，只替换掉出榜的
-  5. 返回：选中的 K 只股票 + 各自置信度
+  5. 返回：选中的 K 只股票 + 各自 composite_score 和 confidence
 
 Plan.md 阶段 3 对应：
-  - 选股(每周)：LLM 分析候选池 → 按置信度排序返回 Top-K(默认 K=5)
-  - 不足 K 只达标(confidence >= 阈值)则减少持仓数，全不达标则空仓
+  - 选股(每周)：LLM 分析候选池 → 按 composite_score × confidence 排序返回 Top-K(默认 K=5)
+  - 不足 K 只达标则减少持仓数，全不达标则空仓
   - 持有优先：仍在 Top-K 的持仓不动，只替换掉出榜的
 """
 
@@ -22,6 +25,22 @@ from agents.llm_analyst import LLMAnalystAgent
 from agents.confidence_calibrator import get_calibrator
 from core.data.news_data import get_news_at_date
 from core import config
+
+# 全局开关：禁用 L1 记忆（消融实验时临时设为 True，需同步清空 LLM 缓存）
+_DISABLE_L1_MEMORY = False
+
+# 校准数据收集器：回测过程中收集 LLM 决策，回测结束后用于训练校准表
+_collected_decisions: List[Dict] = []
+
+
+def get_collected_decisions() -> List[Dict]:
+    """获取回测过程中收集的 LLM 决策记录"""
+    return _collected_decisions
+
+
+def clear_collected_decisions() -> None:
+    """清空收集的决策记录（新一轮回测前调用）"""
+    _collected_decisions.clear()
 
 
 # 默认候选池（10 只股票，跨行业分散化）
@@ -44,11 +63,16 @@ def _analyze_single_stock(
     provider: str,
     model: str,
     calibrator,
+    market_data: Optional[Dict] = None,
 ) -> Dict:
     """
     分析单只股票（供线程池调用）。
 
     每只股票创建独立的 LLMAnalystAgent 实例，避免线程间共享 HTTP 连接。
+
+    参数：
+      market_data: 可选，行情数据 {symbol: DataFrame}，用于 L1 记忆注入
+                   「上次判断后的实际市场反应」。为 None 时降级为旧的一致性记忆。
     """
     try:
         news_list = _get_news_for_symbol(news_df, symbol, date)
@@ -57,16 +81,28 @@ def _analyze_single_stock(
             return {
                 "symbol": symbol,
                 "direction": "neutral",
+                "composite_score": 0.0,
                 "confidence": 0.0,
                 "raw_confidence": 0.0,
-                "analysis": {"direction": "neutral", "confidence": 0.0},
+                "analysis": {"direction": "neutral", "confidence": 0.0, "composite_score": 0.0},
             }
 
+        # 提取该股票的收盘价序列（Close 列），供 L1 记忆计算实际收益
+        price_series = None
+        if market_data is not None and symbol in market_data:
+            df = market_data[symbol]
+            if isinstance(df, pd.DataFrame) and "close" in df.columns:
+                price_series = df["close"]
+
         # 每线程创建独立 agent（隔离 HTTP session + SQLite 连接）
-        agent = LLMAnalystAgent(provider=provider, model=model)
-        analysis = agent.analyze(symbol, date, news_list)
+        agent = LLMAnalystAgent(
+            provider=provider, model=model,
+            enable_l1_memory=not _DISABLE_L1_MEMORY,
+        )
+        analysis = agent.analyze(symbol, date, news_list, price_series=price_series)
 
         direction = analysis.get("direction", "neutral")
+        composite_score = float(analysis.get("composite_score", 0.0))
         raw_confidence = float(analysis.get("confidence", 0.0))
 
         if calibrator and direction != "neutral":
@@ -76,13 +112,24 @@ def _analyze_single_stock(
         else:
             confidence = raw_confidence
 
-        print(f"  {symbol}: {direction} (confidence={confidence:.2f}, news={len(news_list)}条)")
+        ranking_score = composite_score * confidence
+        print(f"  {symbol}: {direction} (score={composite_score:+.3f}, conf={confidence:.2f}, rank={ranking_score:.3f}, news={len(news_list)}条)")
+
+        # 收集决策记录（用于回测后训练校准表）
+        _collected_decisions.append({
+            "symbol": symbol,
+            "date": str(date),
+            "direction": direction,
+            "confidence": raw_confidence,  # 记录原始 confidence，校准前
+        })
 
         return {
             "symbol": symbol,
             "direction": direction,
+            "composite_score": composite_score,
             "confidence": confidence,
             "raw_confidence": raw_confidence,
+            "ranking_score": ranking_score,
             "analysis": analysis,
         }
 
@@ -91,9 +138,11 @@ def _analyze_single_stock(
         return {
             "symbol": symbol,
             "direction": "neutral",
+            "composite_score": 0.0,
             "confidence": 0.0,
             "raw_confidence": 0.0,
-            "analysis": {"direction": "neutral", "confidence": 0.0},
+            "ranking_score": 0.0,
+            "analysis": {"direction": "neutral", "confidence": 0.0, "composite_score": 0.0},
         }
 
 
@@ -103,8 +152,9 @@ def analyze_candidate_pool(
     news_df: pd.DataFrame,
     provider: str = None,
     model: str = None,
-    enable_calibration: bool = True,
+    enable_calibration: bool = False,  
     max_workers: int = None,
+    market_data: Optional[Dict] = None,
 ) -> List[Dict]:
     """
     对候选池中每只股票并行运行 LLM 分析。
@@ -115,13 +165,14 @@ def analyze_candidate_pool(
       news_df: 新闻 DataFrame（包含 symbol 列，用于按股票过滤）
       provider: LLM 提供商（默认 config.DEFAULT_LLM_PROVIDER）
       model: 模型名称（默认 config.DEFAULT_LLM_MODEL）
-      enable_calibration: 是否启用置信度校准（默认 True）
-      max_workers: 最大并行线程数（默认 min(候选数, 10)）
+      enable_calibration: 是否启用置信度校准（默认 False，已禁用 - 原因见 calibration_removal_report.md）
+      max_workers: 最大并行线程数（默认 min(候选数，10)）
+      market_data: 可选，行情数据 {symbol: DataFrame}，用于 L1 记忆注入实际收益反馈
 
     返回：
       分析结果列表，每项包含：
-        {"symbol": "AAPL", "direction": "bullish", "confidence": 0.8, "analysis": {...}}
-      按 confidence 降序排列。
+        {"symbol": "AAPL", "direction": "bullish", "composite_score": 0.6, "confidence": 0.8, "ranking_score": 0.48, ...}
+      按 ranking_score（= composite_score × confidence）降序排列。
     """
     if provider is None:
         provider = config.DEFAULT_LLM_PROVIDER
@@ -141,7 +192,7 @@ def analyze_candidate_pool(
         futures = {
             executor.submit(
                 _analyze_single_stock,
-                symbol, date, news_df, provider, model, calibrator,
+                symbol, date, news_df, provider, model, calibrator, market_data,
             ): symbol
             for symbol in candidate_pool
         }
@@ -150,8 +201,8 @@ def analyze_candidate_pool(
             if result:
                 results.append(result)
 
-    # 按 confidence 降序排列
-    results.sort(key=lambda x: x["confidence"], reverse=True)
+    # 按 ranking_score（= composite_score × confidence）降序排列
+    results.sort(key=lambda x: x.get("ranking_score", 0.0), reverse=True)
     return results
 
 
@@ -164,6 +215,7 @@ def select_top_k(
     confidence_threshold: float = None,
     provider: str = None,
     model: str = None,
+    market_data: Optional[Dict] = None,
 ) -> Dict:
     """
     从候选池中选出 Top-K 股票（持有优先）。
@@ -177,6 +229,7 @@ def select_top_k(
       confidence_threshold: 置信度阈值（默认 config.CONFIDENCE_THRESHOLD）
       provider: LLM 提供商
       model: 模型名称
+      market_data: 可选，行情数据 {symbol: DataFrame}，用于 L1 记忆注入实际收益反馈
 
     返回：
       {
@@ -203,12 +256,13 @@ def select_top_k(
         news_df=news_df,
         provider=provider,
         model=model,
+        market_data=market_data,
     )
 
-    # 2. 筛选达标股票：direction == "bullish" 且 confidence >= 阈值
+    # 2. 筛选达标股票：composite_score > 0.1（bullish 门槛）且 confidence >= 阈值
     qualified = [
         r for r in all_results
-        if r["direction"] == "bullish" and r["confidence"] >= confidence_threshold
+        if r.get("composite_score", 0.0) > 0.1 and r["confidence"] >= confidence_threshold
     ]
 
     print(f"  [筛选] 达标股票：{len(qualified)} 只 "
@@ -218,11 +272,12 @@ def select_top_k(
         print(f"  [结果] 无股票达到阈值 {confidence_threshold}，选择空仓")
         return {
             "holdings": [],
+            "avg_composite_score": 0.0,
             "avg_confidence": 0.0,
             "all_analysis": all_results,
         }
 
-    # 3. 取 Top-K（已按 confidence 降序排列）
+    # 3. 取 Top-K（已按 ranking_score = composite_score × confidence 降序排列）
     top_k_stocks = qualified[:top_k]
     top_k_symbols = {r["symbol"] for r in top_k_stocks}
 
@@ -244,7 +299,7 @@ def select_top_k(
         if new_entries:
             print(f"  [持有优先] 新进：{new_entries}")
 
-        # 最终持仓 = 保留的 + 新股（按 confidence 排序取 Top-K）
+        # 最终持仓 = 保留的 + 新股（按 ranking_score 排序取 Top-K）
         # 保留的优先占位，剩余名额给新股
         final_symbols = list(retained)
         remaining_slots = top_k - len(final_symbols)
@@ -253,13 +308,15 @@ def select_top_k(
                 final_symbols.append(r["symbol"])
                 remaining_slots -= 1
 
-        # 构建最终持仓列表（保持 confidence 排序）
+        # 构建最终持仓列表（保持 ranking_score 排序）
         final_holdings = []
         for r in top_k_stocks:
             if r["symbol"] in final_symbols:
                 final_holdings.append({
                     "symbol": r["symbol"],
+                    "composite_score": r.get("composite_score", 0.0),
                     "confidence": r["confidence"],
+                    "ranking_score": r.get("ranking_score", 0.0),
                     "direction": r["direction"],
                 })
         # 也加入保留的（可能在 qualified 之外但仍在持仓中）
@@ -269,24 +326,34 @@ def select_top_k(
         final_holdings = [
             {
                 "symbol": r["symbol"],
+                "composite_score": r.get("composite_score", 0.0),
                 "confidence": r["confidence"],
+                "ranking_score": r.get("ranking_score", 0.0),
                 "direction": r["direction"],
             }
             for r in top_k_stocks
         ]
 
-    # 5. 计算平均置信度
+    # 5. 统计汇总
     avg_confidence = (
         sum(h["confidence"] for h in final_holdings) / len(final_holdings)
         if final_holdings else 0.0
     )
+    avg_score = (
+        sum(h["composite_score"] for h in final_holdings) / len(final_holdings)
+        if final_holdings else 0.0
+    )
 
-    print(f"  [结果] 最终持仓 {len(final_holdings)} 只："
-          f"{', '.join(h['symbol'] + f'({h['confidence']:.2f})' for h in final_holdings)}")
-    print(f"  [结果] 平均置信度：{avg_confidence:.2f}")
+    holdings_str = ", ".join(
+        f"{h['symbol']}(score={h['composite_score']:+.2f},conf={h['confidence']:.2f})"
+        for h in final_holdings
+    )
+    print(f"  [结果] 最终持仓 {len(final_holdings)} 只：{holdings_str}")
+    print(f"  [结果] 平均 composite_score：{avg_score:+.3f}，平均 confidence：{avg_confidence:.2f}")
 
     return {
         "holdings": final_holdings,
+        "avg_composite_score": avg_score,
         "avg_confidence": avg_confidence,
         "all_analysis": all_results,
     }

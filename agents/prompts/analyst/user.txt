@@ -1,0 +1,6 @@
+请分析 {symbol} 在 {date} 的新闻：
+{memory_text}
+
+## 新闻内容
+
+{news_text}

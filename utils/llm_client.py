@@ -157,64 +157,96 @@ class LLMClient:
         system_prompt: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
+        max_retries: int = 1,
     ) -> Dict:
         """
         发送聊天消息，返回 JSON 解析结果。
         
-        参数和返回：
-          同 chat()，但返回解析后的 JSON 字典
+        参数：
+          message: 用户消息
+          system_prompt: 系统提示词
+          temperature: 温度参数
+          max_tokens: 最大 token 数
+          max_retries: 空响应或解析失败时的重试次数（默认 1）
+        
+        返回：
+          解析后的 JSON 字典
           如果解析失败，返回 {"error": "JSON 解析失败", "raw": response_text}
         """
         import json
         import re
+        import time
         
-        response_text = self.chat(
-            message=message,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        
-        result = None
-        error = None
-        
-        try:
-            # 尝试直接解析
-            parsed = json.loads(response_text)
-            result = parsed
-        except json.JSONDecodeError:
-            # 尝试提取 JSON 部分
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
+        for attempt in range(max_retries + 1):
+            response_text = self.chat(
+                message=message,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            
+            result = None
+            parse_error = None
+            
+            # 空响应 → 视为解析失败，触发重试
+            if not response_text or not response_text.strip():
+                parse_error = "空响应"
+            else:
                 try:
-                    parsed = json.loads(json_match.group())
+                    # 尝试直接解析
+                    parsed = json.loads(response_text)
                     result = parsed
                 except json.JSONDecodeError:
-                    pass
-        
-        # 记录日志
-        if result is not None and "error" in result:
-            error = result.get("error")
-        
-        log_llm_call(
-            provider=self.provider,
-            model=self.model,
-            system_prompt=system_prompt or "",
-            user_message=message,
-            response=response_text,
-            result=result or {},
-            error=error,
-        )
-        
-        # 返回结果
-        if result is None:
+                    # 尝试提取 JSON 部分
+                    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group())
+                            result = parsed
+                        except json.JSONDecodeError:
+                            parse_error = "JSON 提取失败"
+                    else:
+                        parse_error = "无 JSON 内容"
+            
+            # 解析成功，记录日志并返回
+            if result is not None:
+                error = result.get("error") if "error" in result else None
+                log_llm_call(
+                    provider=self.provider,
+                    model=self.model,
+                    system_prompt=system_prompt or "",
+                    user_message=message,
+                    response=response_text,
+                    result=result,
+                    error=error,
+                )
+                return result
+            
+            # 解析失败，判断是否重试
+            if attempt < max_retries:
+                logger.warning(
+                    f"LLM 响应解析失败（{parse_error}），{2 ** attempt}s 后重试 "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(2 ** attempt)
+                continue
+            
+            # 最后一次也失败，记录日志并返回错误
+            log_llm_call(
+                provider=self.provider,
+                model=self.model,
+                system_prompt=system_prompt or "",
+                user_message=message,
+                response=response_text,
+                result={},
+                error=f"JSON 解析失败（{parse_error}，已重试 {max_retries} 次）",
+            )
             return {
-                "error": "JSON 解析失败",
+                "error": f"JSON 解析失败（{parse_error}）",
                 "raw": response_text,
                 "provider": self.provider,
                 "model": self.model,
             }
-        return result
     
     def get_info(self) -> Dict:
         """

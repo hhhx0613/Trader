@@ -159,6 +159,7 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                     candidate_pool=candidate_pool,
                     news_df=news_df,
                     current_holdings=current_holding_symbols,
+                    market_data=enriched_data,  # 透传行情，供 L1 记忆注入实际收益反馈
                 )
 
                 # 风控禁止买入时，只允许减仓/清仓
@@ -316,12 +317,16 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         for symbol, holding in list(self.holdings.items()):
             price = self._get_close_price(market_data, symbol, current_date)
             if price and holding["entry_price"] > 0:
+                # 获取 ATR 值
+                atr_value = self._get_atr(market_data, symbol, current_date)
+                
                 risk_status = self.risk_manager.check_risk(
                     current_date=current_date,
                     current_equity=portfolio_value,
                     holding_shares=holding["shares"],
                     entry_price=holding["entry_price"],
                     current_price=price,
+                    atr_value=atr_value,  # 新增 ATR 参数
                 )
 
                 if risk_status["force_sell"]:
@@ -331,12 +336,14 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
 
         # 第 2 步：检查总回撤（只在未触发强制平仓时才检查）
         if not force_liquidate:
+            # 总回撤检查不需要 ATR
             risk_status = self.risk_manager.check_risk(
                 current_date=current_date,
                 current_equity=portfolio_value,
                 holding_shares=0,
                 entry_price=0.0,
                 current_price=0.0,
+                atr_value=None,  # 总回撤不检查 ATR
             )
             allow_buy = risk_status["allow_buy"]
             if not allow_buy and not halt_reason:
@@ -361,6 +368,16 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         if symbol not in market_data or date not in market_data[symbol].index:
             return None
         return float(market_data[symbol].loc[date, "close"])
+
+    def _get_atr(self, market_data: Dict, symbol: str, date) -> Optional[float]:
+        """获取某股票某天的 ATR 值。"""
+        if symbol not in market_data or date not in market_data[symbol].index:
+            return None
+        df = market_data[symbol]
+        row = df.loc[date]
+        if "atr" not in row.index:
+            return None
+        return float(row["atr"])
 
     def _calculate_portfolio_value(self, market_data: Dict, current_date) -> float:
         """计算组合总价值（现金 + 所有持仓市值）。"""

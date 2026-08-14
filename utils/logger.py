@@ -186,6 +186,8 @@ def log_llm_call(
         "timestamp": datetime.now().isoformat(),
         "provider": provider,
         "model": model,
+        "system_prompt": system_prompt,
+        "user_message": user_message,
         "system_prompt_length": len(system_prompt),
         "user_message_length": len(user_message),
         "response_length": len(response) if response else 0,

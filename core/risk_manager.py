@@ -5,8 +5,9 @@
   对策略信号进行安全审核，在风险超标时拦截交易或强制平仓。
   风控是独立于策略之外的"硬护栏"——无论策略多看好，风控都有最终否决权。
 
-阶段1 实现的风控规则（极简版，阶段4会扩展为独立风控Agent）：
+阶段 1 实现的风控规则（极简版，阶段 4 会扩展为独立风控 Agent）：
   R1: 单笔止损 —— 持仓浮亏超过总资金 2% → 强制卖出
+  R1a: ATR 动态止损 —— 股价跌破持仓成本 - N×ATR → 强制卖出
   R2: 单日最大回撤 —— 当日账户回撤超过 5% → 禁止新开仓
   R3: 最大仓位限制 —— 持仓不超过总资金的 100%
   R4: 连亏降仓 —— 连续亏损 N 笔后降低仓位比例
@@ -19,6 +20,7 @@
     阶段2的 PPO 和阶段4的多Agent都会沿用这个设计
 """
 
+from typing import Tuple, Optional
 from . import config
 
 
@@ -55,6 +57,45 @@ class RiskManager:
         # R5: 换手惩罚累计（记录当期调仓交易笔数）
         self.turnover_count = 0
 
+    def check_atr_stop(
+        self,
+        entry_price: float,
+        current_price: float,
+        atr_value: float,
+    ) -> Tuple[bool, str]:
+        """
+        ATR 动态止损检查。
+        
+        参数：
+          entry_price   : 持仓成本价
+          current_price : 当前股价
+          atr_value     : 当前 ATR 值
+          
+        返回：
+          (force_sell: bool, reason: str)
+          如果 force_sell=True，reason 包含触发原因和止损位信息
+        """
+        if not getattr(config, "USE_ATR_STOP", False):
+            return False, ""
+        
+        if atr_value <= 0 or entry_price <= 0:
+            return False, ""
+        
+        # 计算止损价位
+        stop_distance = config.ATR_STOP_MULTIPLIER * atr_value
+        stop_price = entry_price - stop_distance
+        
+        # 检查是否跌破止损位
+        if current_price < stop_price:
+            loss_pct = (entry_price - current_price) / entry_price * 100
+            reason = (
+                f"ATR 止损：现价${current_price:.2f} "
+                f"低于止损位${stop_price:.2f} (-{loss_pct:.1f}%)"
+            )
+            return True, reason
+        
+        return False, ""
+
     def check_risk(
         self,
         current_date,
@@ -62,6 +103,7 @@ class RiskManager:
         holding_shares: int,
         entry_price: float,
         current_price: float,
+        atr_value: Optional[float] = None,  # 新增：ATR 值
     ) -> dict:
         """
         在每个时间步调用，检查所有风控规则。
@@ -91,6 +133,18 @@ class RiskManager:
         allow_buy = True
         force_sell = False
         halt_reason = ""
+
+        # ---------- R1a: ATR 动态止损 ----------
+        if getattr(config, "USE_ATR_STOP", False) and atr_value is not None and holding_shares > 0:
+            atr_force_sell, atr_reason = self.check_atr_stop(
+                entry_price=entry_price,
+                current_price=current_price,
+                atr_value=atr_value,
+            )
+            if atr_force_sell:
+                force_sell = True
+                if not halt_reason:
+                    halt_reason = atr_reason
 
         # ---------- R1: 单笔止损 ----------
         # 持仓浮亏占总资金比例超过阈值 → 强制平仓

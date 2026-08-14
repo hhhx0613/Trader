@@ -2,7 +2,10 @@
 决策函数：把 LLM 分析结果转换为交易决策
 
 Plan.md 阶段 3 决策逻辑：
-  1. 选股(每周)：LLM 按 confidence 排序选出 Top-K（confidence 仅用于筛选）
+  1. 选股(每周)：LLM 分析候选池 → 按 composite_score × confidence 排序选出 Top-K
+     - composite_score（代码从 per_news 确定性计算）：信号方向+强度
+     - confidence（LLM 评估的证据质量）：信号可信度
+     - 乘积 = 期望信号强度，同时要求方向明确且证据可靠
   2. 仓位：波动率目标定总暴露 + 逆波动率定个股权重（业界标准，无需建模）
      - 总暴露 = TARGET_VOLATILITY / σ_portfolio，截断到 MAX_POSITION_RATIO
      - 个股权重 w_i = (1/σ_i) / Σ(1/σ_j)，σ_i 由 ATR/price 近似
@@ -89,12 +92,13 @@ def decide_formula_llm(
     candidate_pool: List[str] = None,
     news_df=None,
     current_holdings: Set[str] = None,
+    market_data: Dict = None,
 ) -> Dict:
     """
     公式版决策函数：LLM Top-K 选股 + 波动率目标/逆波动率加权仓位
 
     流程（纯客观，无主观调整）：
-      1. LLM 按 confidence 排序选出 Top-K（confidence 仅用于筛选，不决定仓位）
+      1. LLM 分析候选池 → 按 composite_score × confidence 排序选出 Top-K
       2. 仓位由波动率目标 + 逆波动率加权决定（业界标准，无需建模）
 
     参数：
@@ -103,6 +107,8 @@ def decide_formula_llm(
       candidate_pool: 候选股票池
       news_df: 新闻 DataFrame（包含 symbol 列）
       current_holdings: 当前持有的股票集合（用于持有优先）
+      market_data: 可选，行情数据 {symbol: DataFrame}，用于 L1 记忆注入实际收益反馈
+                   （由 multi_stock_engine 透传；旧调用链不传则降级为一致性记忆）
 
     返回：
       {
@@ -127,6 +133,7 @@ def decide_formula_llm(
             confidence_threshold=config.CONFIDENCE_THRESHOLD,
             provider=config.DEFAULT_LLM_PROVIDER,
             model=config.DEFAULT_LLM_MODEL,
+            market_data=market_data,
         )
     else:
         # 没有新闻数据时，不交易
@@ -161,12 +168,13 @@ def decide_formula_vader(
     candidate_pool: List[str] = None,
     news_df=None,
     current_holdings: Set[str] = None,
+    market_data: Dict = None,
 ) -> Dict:
     """
     VADER 规则版决策函数（对照基线）
 
     与 decide_formula_llm 接口完全一致，但用 VADER 情绪分代替 LLM 分析。
-    用于论文消融实验：“LLM vs 规则情绪”对比。
+    用于论文消融实验："LLM vs 规则情绪"对比。
 
     逻辑：
       1. 对每只候选股，取时点对齐的新闻，用 VADER 打分
@@ -174,6 +182,7 @@ def decide_formula_vader(
       3. 按 confidence 排序取 Top-K，等权 + 公式仓位
 
     参数和返回格式同 decide_formula_llm。
+    注：market_data 为保持接口一致而接受，VADER 路径不使用。
     """
     if candidate_pool is None:
         candidate_pool = DEFAULT_CANDIDATE_POOL

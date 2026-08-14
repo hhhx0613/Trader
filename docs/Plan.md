@@ -21,7 +21,7 @@
 
 ### 决策流程
 
-1. **LLM Analyst Agents**：读取每只股的新闻/财报 + 历史分析上下文（L1 记忆）→ 输出结构化观点（方向、置信度、理由）→ 对候选池排序，选出 Top-K（默认 K=3）
+1. **LLM Analyst Agents**：读取每只股的新闻/财报 + 历史分析上下文（L1 记忆）→ 输出结构化观点（方向、置信度、理由）→ 对候选池排序，选出 Top-K（默认 K=5）
 2. **置信度校准层**：用历史 `(LLM自报confidence → 实际胜率)` 映射表校准 LLM 输出，修正系统性偏差
 3. **PPO 融合器**：输入 = 校准后 LLM 观点 + 技术数值 + 市场环境特征 + 账户状态 → 输出总仓位档位（离散：0%/25%/50%/75%/100%）
 4. **规则风控**：只缩减仓位或否决，不凭空加仓；含单股上限、总回撤上限、换手惩罚
@@ -31,8 +31,8 @@
 
 | 决策 | 方案 | 理由 |
 |------|------|------|
-| 选股 | 等权 Top-K + 每周调仓 + 持有优先 | 等权是学术界公认强基线；持有优先降低换手 |
-| 仓位 | PPO 仅做总仓位暴露，不做逐股权重 | 窄任务，数据少、定位清晰、好论证 |
+| 选股 | Top-K（默认 K=5）按 `composite_score × confidence` 排序 + 每周调仓 + 持有优先 | composite_score 编码方向+强度，confidence 编码证据质量；乘积 = 期望信号强度，同时要求方向明确且证据可靠 |
+| 仓位 | 波动率目标定总暴露 + 逆波动率定个股权重（阶段 3 公式版）/ PPO 仅做总仓位暴露（阶段 5）；**PPO 日频决策，LLM 周频选股** | **波动率目标+逆波动率加权是业界标准风险平价近似，优于简单等权；PPO 解耦后各展所长** |
 | 技术面 | 不用 LLM，交给量化指标 + PPO | 数值推理弱、不可复现、成本高 |
 | 牛熊适配 | 单 PPO + regime 特征，不训练多个 PPO | 避免数据切碎和未来函数 |
 | 数据缺失 | 返回空 DataFrame 或抛错，禁止模拟数据兜底 | 保证实验真实性 |
@@ -44,7 +44,7 @@
 
 ### 阶段 0 · 现状盘点 + 决策接口预留（0.5–1 周）✅
 
-盘点已有模块并冻结：`market_data.py`（三层兜底 + 缓存）、`indicators.py`、`recorder.py`、`strategy.py`（规则基线）。在 `backtest_engine.py` 中预留外部决策回调接口 `decide(date, market_state) → {holdings: [symbol×K], exposure: 0~1}`，支持持有 K 只等权标的与按周调仓。
+盘点已有模块并冻结：`market_data.py`（三层兜底 + 缓存）、`indicators.py`、`recorder.py`、`strategy.py`（规则基线）。在 `backtest_engine.py` 中预留外部决策回调接口 `decide(date, market_state, candidate_pool, news_df, current_holdings, market_data) → {holdings: [{symbol, weight}], exposure: 0~1}`，支持持有 K 只标的（逆波动率加权）与按周调仓。
 
 **交付**：资产清单 + 冻结边界说明；规则基线回测结果留档（对照组）；引擎支持外部决策回调。
 
@@ -56,7 +56,7 @@
 
 - **新闻数据源**（混合收集）：Finnhub（最近 30 天，免费 60 次/天）→ Alpha Vantage（历史新闻）→ 本地缓存 CSV
 - **时点对齐**：t 时刻只能使用发布时间 ≤ t 的文本；新闻用发布时间戳，财报用实际公布日
-- **离线预下载**：全历史新闻情绪预拉取，存本地 CSV，避免逐日调 API
+- **离线预下载**：全历史新闻情绪预拉取，存本地 CSV，避免逐日调 API。缓存分 `complete/`（已完成段，回测用）和 `incomplete/`（未完成段，实盘增量用）两个目录管理
 - **禁止模拟数据**：缺失时观点填中性、置信度 0，记录日志
 
 **交付**：按 `(symbol, date)` 可查的本地文本/情绪数据集。
@@ -81,7 +81,7 @@
 ```
 
 - **可复现性**：固定温度、记录 prompt 版本、缓存 LLM 输出
-- **对照基线**：保留 VADER 规则情绪分，作为"LLM vs 规则"对比项
+- **对照基线**：实现 `decide_formula_vader` 完整 VADER 决策路径（VADER 情绪 → Top-K 选股 + 波动率目标仓位），作为"LLM vs 规则"消融对照
 
 **交付**：`agents/llm_analyst.py`、`agents/decision_func.py`、`tests/test_stage2.py`。
 
@@ -91,9 +91,16 @@
 
 用公式打通决策链，跑出第一份端到端回测结果。
 
-- **选股**（每周）：LLM 分析候选池 → 按 confidence 排序返回 Top-K；持有优先
-- **仓位**：组合内等权（各 1/K）；总仓位暴露 = 平均 confidence × 风控上限
-- **风控**：复用 `risk_manager.py` 硬规则（止损、回撤、连亏降仓）+ 单股上限
+- **选股**（每周）：LLM 分析候选池 → 按 `composite_score × confidence` 排序返回 Top-K；持有优先
+  - `composite_score`（代码从 per_news 确定性计算）：信号方向+强度
+  - `confidence`（LLM 评估的证据质量）：信号可信度
+  - 乘积 = 期望信号强度，同时要求方向明确且证据可靠
+  - 入选门槛：`composite_score > 0.1`（bullish）且 `confidence >= CONFIDENCE_THRESHOLD`
+- **仓位**：波动率目标定总暴露 + 逆波动率定个股权重
+  - 总暴露 = `TARGET_VOLATILITY / σ_portfolio`，截断到 `MAX_POSITION_RATIO`
+  - 个股权重 `w_i = (1/σ_i) / Σ(1/σ_j)`，σ_i 由 ATR/price 近似
+  - 配置：`TARGET_VOLATILITY=0.15`、`FALLBACK_VOLATILITY=0.016`
+- **风控**：复用 `risk_manager.py` 硬规则（ATR 动态止损 `ATR_STOP_MULTIPLIER=2.5`、回撤、连亏降仓、换手惩罚 `TURNOVER_PENALTY_RATIO=0.001`）+ 单股上限
 - **执行**：回测引擎按调仓周期执行，`recorder.py` 记录
 
 **交付**：`scripts/run_backtest_stage3.py`；完整可回测策略 + 净值曲线 + 绩效指标。
@@ -116,7 +123,7 @@
 **L1 · 分析上下文记忆**：让 LLM 每次分析时"记得"自己之前的判断。
 
 - **存储内容**：每次分析的 `(symbol, date, direction, confidence, key_factors)`
-- **注入方式**：`_build_user_message` 时拼接最近 N 次该股票的分析历史，含实际结果反馈
+- **注入方式**：`_build_user_message` 时拼接最近 N 次该股票的分析历史，含实际结果反馈（通过 `price_series` 计算上次分析后的真实市场收益）
 - **注入示例**：
   ```
   上次你分析 AAPL（2026-07-28）的判断：
@@ -126,19 +133,23 @@
   本次新闻如下：[...]
   请分析是否需要调整观点。
   ```
-- **存储位置**：SQLite `analysis_history` 表，复用 `llm_cache.db`
+- **存储位置**：复用 `llm_analysis_cache` 表（通过 `get_previous_analysis(symbol, before_date)` 查询上一条记录），无需新建独立表
+- **回测开关**：`stock_selector._DISABLE_L1_MEMORY = True`（回测时默认禁用，确保 LLM 缓存命中率；实盘时设为 False 启用闭环记忆）
 
 **L-Calibrate · 置信度校准**：
 
 - **原理**：维护 `(LLM自报confidence区间 → 实际胜率)` 映射表
 - **应用**：在 `decide_func` 中用校准后 confidence 替代 LLM 原始输出计算仓位
+- **存储**：JSON 文件 `data/cache/llm/calibration.json`（数据量极小、无需 SQL 查询、便于检查调试）
+- **分箱**：5 个箱 `[0,0.2),[0.2,0.4)...[0.8,1.0]`，最少 3 个样本才校准
 - **论文价值**：独立消融实验——"原始 confidence vs 校准 confidence"的绩效对比
 
 #### 新增模块
 
-- `agents/memory.py`：记忆读写接口（`get_analysis_history`, `get_calibration_map`）
-- `agents/confidence_calibrator.py`：置信度校准器
-- SQLite 新增表：`analysis_history`、`calibration_map`
+- `agents/confidence_calibrator.py`：置信度校准器（JSON 存储，分箱统计）
+- `core/data/llm_cache_db.py`：L1 记忆查询（`get_previous_analysis`，复用 `llm_analysis_cache` 表）
+- `agents/llm_analyst.py`：记忆注入（`_build_memory_context`，含实际收益反馈闭环）
+- 缓存 key 为四元组 `(symbol, date, model, prompt_version)`，prompt 版本由文件内容 hash 自动派生
 
 **交付**：多 Agent 协同信号 + 记忆基础设施；消融实验：无记忆 vs 有记忆（L1）、原始 vs 校准 confidence。
 
@@ -148,13 +159,36 @@
 
 将阶段 3 的公式仓位替换为 PPO，感知市场风格。
 
-- **状态向量**（紧凑，抗过拟合）：
-  - LLM 观点（3–5 维）+ 技术数值（5–8 维）+ 市场环境特征（4 维）+ 账户状态（3 维）
-- **动作**：离散仓位档位 {0%, 25%, 50%, 75%, 100%}
-- **奖励**：α·log_return − β·drawdown − γ·trade_cost
+**核心设计：周频选股 × 日频仓位**（方案 B）
+
+- **LLM Analyst**：每周调仓日调用一次，分析所有候选股新闻 → 选出 Top-K（等权持有）→ 缓存信号
+- **PPO 融合器**：**日频决策**，输入 = 校准后 LLM 观点（含`signal_age`新鲜度）+ 技术数值 + 市场环境特征 + 账户状态 → 输出总仓位档位（离散：0%/25%/50%/75%/100%）
+- **执行逻辑**：
+  - **调仓日（周一）**：LLM 刷新选股 → 更新 Top-K；PPO 决定总仓位档位 → 调仓到目标仓位等权分配给 Top-K
+  - **非调仓日（周二 - 周五）**：LLM 信号前向填充，`signal_age`逐渐增大；PPO 根据最新技术指标微调总仓位（不换手股票）
+- **奖励**：α·log_return − β·drawdown − γ·trade_cost（日频，捕捉周内波动）
 - **框架**：Stable-Baselines3 PPO，64×64 网络，纯 CPU，多种子训练
 
-**交付**：PPO 仓位版策略；与阶段 3 公式版的对照实验。
+**为何采用方案 B**：
+| | 纯周频 (50 样本/年) | 方案 B: 周频选股×日频仓位 (250 样本/年) |
+|---|---|---|
+| 训练样本量 | ❌ 太少，易过拟合 | ✅ 足够（配合 n_epochs=10 复用~2500 次更新） |
+| LLM 调用成本 | ✅ 低（50 次/年） | ✅ 中等（250 次/年，但周频已优化） |
+| 应对突发事件 | ❌ 迟钝（只能干挨一周打） | ✅ 灵敏（周三暴跌周四可减仓） |
+| 接近真实交易 | ⚠️ 一般 | ✅ 最接近（真实交易员每日看盘定仓位） |
+| 状态一致性好坏 | ❌ 差（周中信号过期靠填充） | ✅ 好（每天指标都是新鲜的） |
+
+**状态向量**（紧凑，抗过拟合）：
+  - LLM 观点（5 维）+ 技术数值（6 维）+ 市场环境特征（4 维）+ 账户状态（3 维）
+  - **新增 `llm_signal_age`**：当前距上次 LLM 分析的天数/7，让 PPO 学会对陈旧观点打折
+
+**动作空间**：离散仓位档位 {0%, 25%, 50%, 75%, 100%}（不变）
+
+**执行约束**：
+  - 非调仓日 PPO 只调总仓位，不换手股票（降低无意义频繁交易）
+  - 换手惩罚需调大，避免 PPO 学到"每天微调"策略
+
+**交付**：PPO 仓位版策略（日频×周频解耦）；与阶段 3 公式版的对照实验；消融实验——日频 vs 周频 PPO。
 
 ---
 
@@ -210,8 +244,8 @@
 
 | 层次 | 存储 | 消费者 | 核心数据 |
 |------|------|--------|----------|
-| L1 分析上下文 | SQLite `analysis_history` | LLM Analyst（注入 prompt） | 历史分析的 direction/confidence/key_factors + 实际结果 |
-| L-Calibrate 置信度校准 | SQLite `calibration_map` | `decide_func`（仓位计算） | LLM 自报 confidence 区间 → 实际胜率映射 |
+| L1 分析上下文 | `llm_analysis_cache` 表（复用） | LLM Analyst（注入 prompt） | 历史分析的 direction/confidence/key_factors + 实际结果（通过 price_series 计算） |
+| L-Calibrate 置信度校准 | JSON `calibration.json` | `decide_func`（仓位计算） | LLM 自报 confidence 区间 → 实际胜率映射 |
 
 **反馈闭环**：
 
@@ -223,15 +257,17 @@
 
 **技术选型**：
 
-- **全部基于 SQLite**：复用现有 `llm_cache.db`，不引入新基础设施
+- **L1 记忆复用 `llm_cache.db`**：不新建独立表，通过 `get_previous_analysis` 查询 `llm_analysis_cache` 中同 symbol 的上条记录
+- **校准表用 JSON 文件**：数据量极小（5 个箱），JSON 更轻量、便于检查调试
 - **记忆注入有上限**：每次 prompt 最多注入最近 5 条分析历史，避免 token 爆炸
 
 **模块规划**：
 
 | 文件 | 职责 |
 |------|------|
-| `agents/memory.py` | 记忆读写统一接口（`get_analysis_history`, `get_calibration_map`） |
-| `agents/confidence_calibrator.py` | 置信度校准器 |
+| `agents/confidence_calibrator.py` | 置信度校准器（JSON 存储，分箱统计，全局单例） |
+| `core/data/llm_cache_db.py` | L1 记忆查询（`get_previous_analysis`），LLM 缓存管理 |
+| `agents/llm_analyst.py` | 记忆注入（`_build_memory_context`），四维结构化打分 |
 
 **消融实验**：
 
@@ -293,28 +329,29 @@ final_score = w1·normalized_sentiment + w2·normalized_momentum + w3·normalize
 
 ### 假设 3：新闻覆盖率偏差修正
 
-**现状问题**：LLM prompt 中 confidence 与新闻条数硬绑定（5+ 条 → 0.8-1.0），导致大票天然占优。
+**现状问题**：LLM prompt 中 confidence 曾与新闻条数存在倾向性关联（5+ 条 → 0.8-1.0），导致大票天然占优。
 
-**候选改进**：
+**已缓解**：prompt 已更新置信度评估标准，明确区分「多条独立事件印证→高」与「同一事件多源报道→中」，并引入信息增量递减原则，解耦了 confidence 与新闻条数的硬绑定。
 
-- 在 prompt 中解耦 confidence 与新闻条数的硬绑定
-- 或在选股时对 confidence 做覆盖率归一化（`confidence / log(1 + news_count)`）
+**候选改进**（若缓解不足）：
+
+- 在选股时对 confidence 做覆盖率归一化（`confidence / log(1 + news_count)`）
 
 **验证方式**：统计不同股票的 news_count 分布 + 消融实验。
 
-### 假设 4：新闻分段缓存锚定到固定日历网格
+### 假设 4：新闻分段缓存锚定到固定日历网格 ✅ 已实现
 
 **现状问题**：`_fetch_news_segmented_av` 的段边界从请求的 `start_date` 开始按 `NEWS_SEGMENT_DAYS` 步进，段窗口随请求起点漂移。不同时间/不同区间拉取会产生**重叠的分段缓存**（缓存目录已出现 30 天与 14 天两套重叠段，如 `AAPL_news_seg_2025-08-07_2025-09-05` 与 `..._2025-08-11_2025-08-24`），同一批新闻被重复请求，浪费本就稀缺的 Alpha Vantage 配额（25 次/天，PPO 训练数据瓶颈）。
 
-**改进思路**：段边界锚定到**全局固定网格**——选一个全局锚点（周一），段 = `[anchor + 14k, anchor + 14k + 13]`。任何请求区间都映射到同一批段文件，天然去重、跨回测复用。选 14 天而非自然月：AV 单次上限 1000 条，AAPL/NVDA 高新闻量股一个月可能超限被截断丢数据。
+**改进思路**：段边界锚定到**全局固定网格**——选一个全局锚点（周一），段 = `[anchor + Nk, anchor + Nk + (N-1)]`。任何请求区间都映射到同一批段文件，天然去重、跨回测复用。选 28 天而非 14 天：AV 单次上限 1000 条，28 天段（约 829 条）更接近限制但不超限，减少段数和 API 调用次数。
 
-**实现位置**：`config.py`（`NEWS_SEGMENT_ANCHOR`）、`core/data/news_data.py`（`_fetch_news_segmented_av` 段循环改为网格对齐）；配套一次性归并脚本把旧重叠段重整到新网格并归档。
+**实现位置**：`config.py`（`NEWS_SEGMENT_ANCHOR="2020-01-06"`、`NEWS_SEGMENT_DAYS=28`）、`core/data/news_data.py`（`_fetch_news_segmented_av` 段循环改为网格对齐）；配套一次性归并脚本把旧重叠段重整到新网格并归档。
 
 **为什么可能有效**：消除重复请求 → 相同配额覆盖更长历史。**为什么可能无效/风险**：网格末段会拉取略超回测 end_date 的数据（PIT 消费端已过滤，无未来函数风险）。
 
 **验证方式**：对比重整前后同一区间的实际 AV 请求次数与缓存命中率。
 
-### 假设 5：调仓日锚定到固定日历（每周第一个交易日）
+### 假设 5：调仓日锚定到固定日历（每周第一个交易日） ✅ 已实现
 
 **现状问题**：`MultiStockBacktestEngine` 的 `rebalance_counter` 从 `all_dates[0]` 计数，调仓日随回测起点漂移（7.6 起始 vs 7.7 起始 → 整串调仓日错位）。LLM 缓存按 `(symbol, analysis_date, model)` 精确日期为 key，调仓日漂移导致同一周被重复分析、**跨回测无法复用 LLM 缓存，浪费 GLM-4 token**。
 
@@ -324,15 +361,50 @@ final_score = w1·normalized_sentiment + w2·normalized_momentum + w3·normalize
 
 **验证方式**：不同起点跑同一后续区间，统计 LLM 缓存命中率提升；确认净值曲线在对齐区间一致。
 
-### 假设 6：PPO 状态向量新增「信号新鲜度」维度
+### 假设 6：PPO 状态向量新增「信号新鲜度」维度 ✅ 已实现
 
-**现状问题**：LLM 信号为周频（仅调仓日更新），PPO 训练环境按日频步进，`_compute_llm_features` 静默前向填充上一次信号，PPO 无法感知手上观点已过期几天。
+**现状问题**：LLM 信号为周频（仅在调仓日更新），PPO 训练环境按日频步进，非调仓日使用上一次信号的前向填充，PPO 无法感知手上观点已过期几天，可能导致对陈旧信号的过度信任或错误依赖。
 
-**改进思路**：状态向量新增一维 `llm_signal_age`（当前日距最近一次 LLM 信号的天数，归一化），让 PPO 学会对陈旧信号打折。`PPOEnv`（训练，日频）计算真实 age；`PPOPolicy`（回测推理，仅调仓日决策，信号恒新鲜）取 0。`STATE_DIMS` 从 17 → 18，旧模型需重训。
+**改进思路**：状态向量新增一维 `llm_signal_age`（当前日距最近一次 LLM 信号的天数，归一化为 0-4），让 PPO 学会根据信号新鲜度自适应仓位策略。
+
+- **PPOEnv（训练）**：实时计算真实 age = `(current_date - last_llm_signal_date).days / 7`，clip 到 [0, 4]
+  - 调仓日：age = 0（信号新鲜）
+  - 周二：age ≈ 0.14（过期 1 天）
+  - 周五：age ≈ 0.57（过期 4 天）
+- **PPOPolicy（回测推理）**：仅调仓日决策 → signal_age = 0（始终新鲜）
+- **效果**：PPO 通过历史经验学会"高波动市里，信号已经过期 4 天了，应该轻仓避险；趋势行情里，过期也没关系，可以继续重仓"
+
+**预期价值**：在剧烈波动的市场环境中，能主动降低仓位以应对信息滞后风险。
 
 **实现位置**：`core/ppo/ppo_env.py`（`STATE_DIMS` + `_compute_llm_features`）、`core/ppo/ppo_policy.py`（`_build_state_vector` 补齐同维）。
 
-**验证方式**：消融实验——有 vs 无 `signal_age` 维度，对比周中减仓响应与夏普/回撤。
+**验证方式**：消融实验——有 vs 无 `signal_age` 维度，重点观察周中减仓响应能力和夏普比率/最大回撤变化。
+
+### 假设 7：LLM 输出改为「双正交连续信号」并接入 PPO ✅ 已实现（A 档 + B 档）
+
+**核心设计**：LLM 产出两个正交的连续量，分别承担不同职责：
+- `composite_score` ∈ [-1, 1]：**信号方向+强度**，代码从 per_news 四维打分确定性计算（`tanh(Σ(impact+gap)×timeliness×certainty / SCALE)`）
+- `confidence` ∈ [0, 1]：**证据质量/可信度**，LLM 基于 prompt 中明确定义的标准评估（多条独立事件印证→高，数量不足/矛盾/同一事件多源报道→中，稀少或噪音→低）；prompt 引导 LLM 在 per_news 打分时对同源重复报道递减计分（信息增量递减）
+- **选股排序**：`ranking_score = composite_score × confidence`（期望信号强度，无参数、无阈值、数学上有期望值解释）
+- `direction` = `sign(composite_score)`（±0.1 死区），仅用于日志和人类可读性，不参与决策逻辑
+
+**聚合公式改为「求和 + 压缩」**（终结权重之争）：
+```
+raw = Σ_i (impact_i + gap_i) · timeliness_i · certainty_i     # 最近≤10条新闻
+composite_score = tanh(raw / SCALE)                              # SCALE≈6，唯一待标定旋钮
+```
+- 中性噪音 score≈0 加进求和不改变结果 → 天然不稀释（解决"等权平均被噪音稀释"问题）
+- 多条同向新闻自动叠加（corroboration 增强）；单条极端事件自动主导
+- 无需任何权重方案；certainty 仅作乘数用一次，消除双重计权
+- `direction = sign(composite_score)`（保留 ±0.1 死区），仅用于日志和人类可读性
+
+**分层落地**：
+- **A 档（本假设先行，无副作用）** ✅：仅改 `_compute_scores` 聚合为求和 + tanh，定 SCALE（`_COMPOSITE_SCALE=6.0`）；选股逻辑不变。
+- **B 档（含 PPO 收益，需重训模型）** ✅：`llm_cache_db.py` 加 `composite_score` 列 + 迁移 ✅；`run_backtest_stage5.py` 查询补该列写入 `llm_signals` ✅；`ppo_env.py` / `ppo_policy.py` 把 `bullish_ratio`→`mean_signed_score`、`sentiment_std`→`max_abs_signed_score`（保持 18 维不变，仅升级语义） ✅；选股排序改为 `composite_score × confidence` ✅。**改后 `models/ppo_medium` 失效，须重训。**
+
+**为什么可能有效**：连续有符号信号信息量远大于三档标签/方向计数，且已归一化，利于 RL 收敛；结构化分析不再空转。**为什么可能无效/风险**：SCALE 与 tanh 饱和点需标定；PPO 特征语义变更需重训与重新调参，短期指标可能波动。
+
+**验证方式**：A 档——对比改前后同区间 `signed_score` 分布与选股结果是否更合理；B 档——消融实验"bullish_ratio vs mean_signed_score"作为 PPO LLM 特征，对比夏普比/最大回撤/换手率。
 
 ---
 
