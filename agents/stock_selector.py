@@ -22,25 +22,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from agents.llm_analyst import LLMAnalystAgent
-from agents.confidence_calibrator import get_calibrator
 from core.data.news_data import get_news_at_date
 from core import config
 
 # 全局开关：禁用 L1 记忆（消融实验时临时设为 True，需同步清空 LLM 缓存）
 _DISABLE_L1_MEMORY = False
-
-# 校准数据收集器：回测过程中收集 LLM 决策，回测结束后用于训练校准表
-_collected_decisions: List[Dict] = []
-
-
-def get_collected_decisions() -> List[Dict]:
-    """获取回测过程中收集的 LLM 决策记录"""
-    return _collected_decisions
-
-
-def clear_collected_decisions() -> None:
-    """清空收集的决策记录（新一轮回测前调用）"""
-    _collected_decisions.clear()
 
 
 # 默认候选池（10 只股票，跨行业分散化）
@@ -62,7 +48,6 @@ def _analyze_single_stock(
     news_df: pd.DataFrame,
     provider: str,
     model: str,
-    calibrator,
     market_data: Optional[Dict] = None,
 ) -> Dict:
     """
@@ -83,7 +68,6 @@ def _analyze_single_stock(
                 "direction": "neutral",
                 "composite_score": 0.0,
                 "confidence": 0.0,
-                "raw_confidence": 0.0,
                 "analysis": {"direction": "neutral", "confidence": 0.0, "composite_score": 0.0},
             }
 
@@ -103,32 +87,16 @@ def _analyze_single_stock(
 
         direction = analysis.get("direction", "neutral")
         composite_score = float(analysis.get("composite_score", 0.0))
-        raw_confidence = float(analysis.get("confidence", 0.0))
-
-        if calibrator and direction != "neutral":
-            confidence = calibrator.calibrate(raw_confidence)
-            if abs(confidence - raw_confidence) > 0.01:
-                print(f"  [校准] {symbol}: {raw_confidence:.2f} → {confidence:.2f}")
-        else:
-            confidence = raw_confidence
+        confidence = float(analysis.get("confidence", 0.0))
 
         ranking_score = composite_score * confidence
         print(f"  {symbol}: {direction} (score={composite_score:+.3f}, conf={confidence:.2f}, rank={ranking_score:.3f}, news={len(news_list)}条)")
-
-        # 收集决策记录（用于回测后训练校准表）
-        _collected_decisions.append({
-            "symbol": symbol,
-            "date": str(date),
-            "direction": direction,
-            "confidence": raw_confidence,  # 记录原始 confidence，校准前
-        })
 
         return {
             "symbol": symbol,
             "direction": direction,
             "composite_score": composite_score,
             "confidence": confidence,
-            "raw_confidence": raw_confidence,
             "ranking_score": ranking_score,
             "analysis": analysis,
         }
@@ -140,7 +108,6 @@ def _analyze_single_stock(
             "direction": "neutral",
             "composite_score": 0.0,
             "confidence": 0.0,
-            "raw_confidence": 0.0,
             "ranking_score": 0.0,
             "analysis": {"direction": "neutral", "confidence": 0.0, "composite_score": 0.0},
         }
@@ -152,7 +119,6 @@ def analyze_candidate_pool(
     news_df: pd.DataFrame,
     provider: str = None,
     model: str = None,
-    enable_calibration: bool = False,  
     max_workers: int = None,
     market_data: Optional[Dict] = None,
 ) -> List[Dict]:
@@ -165,7 +131,6 @@ def analyze_candidate_pool(
       news_df: 新闻 DataFrame（包含 symbol 列，用于按股票过滤）
       provider: LLM 提供商（默认 config.DEFAULT_LLM_PROVIDER）
       model: 模型名称（默认 config.DEFAULT_LLM_MODEL）
-      enable_calibration: 是否启用置信度校准（默认 False，已禁用 - 原因见 calibration_removal_report.md）
       max_workers: 最大并行线程数（默认 min(候选数，10)）
       market_data: 可选，行情数据 {symbol: DataFrame}，用于 L1 记忆注入实际收益反馈
 
@@ -179,8 +144,6 @@ def analyze_candidate_pool(
     if model is None:
         model = config.DEFAULT_LLM_MODEL
 
-    calibrator = get_calibrator() if enable_calibration else None
-
     print(f"\n[选股分析] {date}: 并行分析 {len(candidate_pool)} 只候选股...")
 
     # 并行调用 LLM（I/O 密集型，线程池即可）
@@ -192,7 +155,7 @@ def analyze_candidate_pool(
         futures = {
             executor.submit(
                 _analyze_single_stock,
-                symbol, date, news_df, provider, model, calibrator, market_data,
+                symbol, date, news_df, provider, model, market_data,
             ): symbol
             for symbol in candidate_pool
         }

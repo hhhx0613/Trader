@@ -72,7 +72,7 @@ class SentimentAnalyzer:
         if self.method == "vader":
             return self._analyze_vader(text)
         else:
-            return self._analyze_simple(text)
+            raise ValueError(f"不支持的分析方法: {self.method}")
     
     def analyze_batch(self, texts: List[str]) -> List[float]:
         """
@@ -98,42 +98,6 @@ class SentimentAnalyzer:
         scores = self.analyzer.polarity_scores(text)
         return scores["compound"]
     
-    def _analyze_simple(self, text: str) -> float:
-        """
-        简单规则版情绪分析（备用）。
-        
-        基于关键词匹配：
-          - 看涨词：+0.5
-          - 看跌词：-0.5
-          - 中性词：0.0
-        """
-        text_lower = text.lower()
-        
-        # 看涨关键词
-        bullish_words = [
-            "up", "rise", "gain", "grow", "strong", "bullish",
-            "profit", "beat", "surge", "rally", "optimistic",
-            "涨", "上升", "增长", "强劲", "看涨", "利润", "突破"
-        ]
-        
-        # 看跌关键词
-        bearish_words = [
-            "down", "fall", "drop", "decline", "weak", "bearish",
-            "loss", "miss", "crash", "plunge", "pessimistic",
-            "跌", "下降", "下跌", "疲软", "看跌", "亏损", "崩盘"
-        ]
-        
-        score = 0.0
-        for word in bullish_words:
-            if word in text_lower:
-                score += 0.3
-        
-        for word in bearish_words:
-            if word in text_lower:
-                score -= 0.3
-        
-        # 归一化到 [-1, 1]
-        return max(-1.0, min(1.0, score))
 
 
 # ==================== 便捷函数 ====================

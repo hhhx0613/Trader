@@ -80,7 +80,7 @@ pip install ib-insync yfinance openai
 
 ## 🔧 运行回测
 
-一条命令跑通阶段 1-3（三条路径对比）：
+一条命令跑通所有策略对比：
 
 ```bash
 python scripts/run_backtest.py
@@ -90,16 +90,26 @@ python scripts/run_backtest.py
 - 候选池：AAPL, NVDA, MSFT, GOOGL, AMZN, JPM, V, JNJ, UNH, WMT
 - 时间范围：2025-08-11 ~ 2026-08-09（一年）
 - Top-K：5 只，每周调仓
+- 对比策略：Buy & Hold 等权 / LLM Top-K / VADER Top-K
 
-**最新回测结果**（2025-08-11 ~ 2026-08-09，一年期）：
+**输出文件**（3 个，存于 `output/backtest_YYYYMMDD_HHMMSS/`）：
+- `summary_{ts}.csv` — 一行一个策略，全部核心指标对比
+- `equity_{ts}.csv` — 合并净值曲线（画图用）
+- `trades_{ts}.csv` — 全部交易记录（加“策略”列区分）
 
-| 指标 | LLM Top-K |
-|------|----------|
-| 累计收益率 | **+10.00%** |
-| 最终权益 | **$110,003** |
-| 初始资金 | $100,000 |
+**最新回测结果**（2025-08-11 ~ 2026-08-07，一年期）：
 
-> **说明**：禁用置信度校准后，LLM Top-K 策略在一年期回测中实现 10% 稳定收益，结果可复现。
+| 指标 | Buy & Hold | LLM Top-K | VADER Top-K |
+|------|-----------|----------|------------|
+| 最终权益 | **$132,050** | $110,003 | $112,036 |
+| 累计收益 | **+32.05%** | +10.00% | +12.04% |
+| 最大回撤 | 10.58% | 5.91% | **4.55%** |
+| 夏普比率 | **1.99** | 0.87 | 1.22 |
+| 年化收益 | **28.94%** | 9.88% | 11.70% |
+| 胜率 | — | 56.52% | **72.80%** |
+| 换手率 | 0 | 14.41 | **4.14** |
+
+> **结论**：本轮为单边牛市，等权 B&H（+32.05%）大幅跑赢两个主动策略（LLM +10%、VADER +12%）。主因是策略暴露度只有 30~50%（大量现金闲置）+ ATR 止损频繁触发砍掉上涨仓位。两个主动策略之间，VADER 全面优于 LLM（更高收益、更低回撤、更低换手率）。
 
 
 ## 📂 项目结构
@@ -107,38 +117,31 @@ python scripts/run_backtest.py
 ```
 Trader/
 ├── agents/                    # 决策模块
-│   ├── llm_analyst.py        #   GLM-4 LLM 分析新闻
+│   ├── llm_analyst.py        #   LLM 分析新闻
 │   ├── stock_selector.py     #   Top-K 选股（持有优先）
-│   └── decision_func.py      #   决策函数（LLM /VADER 双路径）
+│   └── decision_func.py      #   决策函数（LLM / VADER 双路径）
 ├── core/                      # 核心引擎
 │   ├── data/                  #   数据采集
 │   │   ├── market_data.py    #     行情（yfinance 优先）
-│   │   ├── news_data.py      #     新闻（AV 优先 +Finnhub 兜底）
+│   │   ├── news_data.py      #     新闻（AV 优先 + Finnhub 兜底）
 │   │   ├── sentiment.py      #     VADER 情绪打分
 │   │   └── llm_cache_db.py   #     LLM 缓存（SQLite）
-│   ├── backtest_engine.py    #   单股回测
 │   ├── multi_stock_engine.py #   多股回测（Top-K 组合）
+│   ├── backtest_engine.py    #   单股回测
 │   ├── risk_manager.py       #   风控（止损/回撤/连亏降仓）
+│   ├── recorder.py           #   交易记录 + 绩效评估
 │   ├── strategy.py           #   规则策略（MA/RSI/MACD 投票）
 │   └── indicators.py         #   技术指标计算
 ├── data/cache/                # 本地缓存（不上传 git）
-│   ├── market/               #   行情 CSV
-│   ├── news/                 #   新闻 CSV（合并 + 分段）
-│   └── llm/                  #   LLM 分析结果 SQLite
 ├── utils/                     # 工具模块
-│   ├── llm_client.py         #   LLM API 统一客户端
-│   └── logger.py             #   日志系统（RotatingFile + LLM 审计）
 ├── scripts/
 │   ├── run_backtest.py        # 端到端回测入口（统一脚本）
-│   ├── ablation_experiment.py # Stage 4: L1 记忆消融实验
 │   ├── clear_llm_cache.py     # 清除 LLM 缓存工具
-│   ├── data_fetch_tracker.py  # 新闻数据拉取进度追踪
-│   └── consolidate_news_cache.py # 新闻缓存归并工具
-├── tests/                     # 测试
-├── docs/                      # 文档
-│   └── Plan.md               #   详细设计文档
+│   └── data_fetch_tracker.py  # 新闻数据拉取进度追踪
+├── docs/
+│   └── Plan_v2.md            #   架构设计文档（权威）
 ├── config.py                  # 全局配置
-└── main.py                    # 单股回测入口
+└── output/                    # 回测结果（gitignore）
 ```
 
 ---
@@ -165,13 +168,15 @@ Trader/
 
 ## 📊 已知问题与待办
 
-- [ ] evaluate() 缺少换手率指标
-- [ ] PPO 仓位融合器待验证（阶段 5）
-- [ ] IBKR 模拟盘接入（阶段 6）
+- [ ] **主动策略跑输 B&H**：策略暴露度只有 30~50%（大量现金闲置），加上 ATR 止损频繁触发砍掉了上涨仓位 → 考虑提高目标暴露度 / 调低止损敏感度
+- [ ] PPO 仓位融合器待验证（阶段 6）
+- [ ] IBKR 模拟盘接入（阶段 7）
 
 ---
 
 ## 📝 Version History
+
+- **v1.5 (2026-09-02)**: 精简项目架构，统一回测输出格式（便于后续策略对比），当前为最小可跑版本（暂不含 PPO）
 
 - **v1.4 (2026-08-14)**: 置信度校准机制禁用
   - ❌ 禁用 L-Calibrate 置信度校准（收益从 10% 降至 3.78%，校准方向错误）

@@ -4,9 +4,8 @@
 
 用法：
   python scripts/run_backtest.py
-  python scripts/run_backtest.py --with-ppo
   python scripts/run_backtest.py --pool AAPL NVDA MSFT --start 2025-08-11 --end 2026-08-07
-  python scripts/run_backtest.py --skip-rule --skip-vader
+  python scripts/run_backtest.py --skip-vader
 """
 
 import sys
@@ -18,18 +17,15 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import argparse
-import numpy as np
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
 from core.data.market_data import fetch_ohlcv
 from core.data.news_data import fetch_news
 from core.indicators import compute_all_indicators
-from core.strategy import generate_signals
-from core.backtest_engine import BacktestEngine
 from core.multi_stock_engine import MultiStockBacktestEngine
+from core.recorder import Recorder
 from agents.decision_func import decide_formula_llm, decide_formula_vader
 from agents.stock_selector import DEFAULT_CANDIDATE_POOL
 from core import config
@@ -46,12 +42,6 @@ def parse_args():
                         help=f"起始日期（默认：{config.DEFAULT_START_DATE}）")
     parser.add_argument("--end", default=None,
                         help=f"结束日期（默认：{config.DEFAULT_END_DATE}）")
-    parser.add_argument("--with-ppo", action="store_true",
-                        help="启用 PPO 路径")
-    parser.add_argument("--ppo-mode", choices=["small", "medium", "large"],
-                        default="medium", help="PPO 模型规模")
-    parser.add_argument("--skip-rule", action="store_true",
-                        help="跳过规则基线")
     parser.add_argument("--skip-vader", action="store_true",
                         help="跳过 VADER 路径")
     args = parser.parse_args()
@@ -70,7 +60,7 @@ def parse_args():
 def download_data(candidate_pool, start_date, end_date):
     """下载行情数据和新闻数据"""
     print("\n" + "=" * 60)
-    print("  [1/4] 数据采集")
+    print("  [1/3] 数据采集")
     print("=" * 60)
 
     # 预热起始日：多拉 15 天给指标计算用
@@ -123,80 +113,127 @@ def download_data(candidate_pool, start_date, end_date):
     return market_data, news_df
 
 
-def run_multi_stock_backtest(decide_func, market_data, news_df, candidate_pool, label=""):
-    """
-    用指定的决策函数跑多股票回测。
-    返回 recorder
-    """
+def run_multi_stock_backtest(decide_func, market_data, news_df, candidate_pool):
+    """用指定的决策函数跑多股票回测，返回 recorder。"""
     engine = MultiStockBacktestEngine(decide_func=decide_func)
-    recorder = engine.run(market_data, news_df, candidate_pool)
+    return engine.run(market_data, news_df, candidate_pool)
+
+
+def create_buy_and_hold_recorder(market_data, initial_capital):
+    """构造 Buy & Hold 等权基准：第一天等权买入全池，持有不动。"""
+    symbols = list(market_data.keys())
+    n = len(symbols)
+    per_stock = initial_capital / n
+
+    # 各股首日收盘价买入
+    holdings = {}
+    for sym in symbols:
+        price = market_data[sym].iloc[0]["close"]
+        holdings[sym] = per_stock / price
+
+    # 以数据最长的股票为基准日期序列
+    ref = max(market_data.values(), key=len)
+    dates = ref.index
+
+    recorder = Recorder()
+    for date in dates:
+        equity = 0.0
+        for sym in symbols:
+            df = market_data[sym]
+            if date in df.index:
+                equity += holdings[sym] * df.loc[date, "close"]
+            else:
+                equity += holdings[sym] * df.iloc[-1]["close"]
+        recorder.log_equity(date, equity)
+
     return recorder
 
 
-def save_results(output_dir, rule_results=None, llm_recorder=None, 
-                 vader_recorder=None, ppo_recorder=None):
-    """保存所有路径的结果到 output/ 目录"""
+def save_results(output_dir, results: dict):
+    """保存回测结果：summary（对比表）+ equity（净值曲线）+ trades（交易明细）。
+
+    Args:
+        results: {策略名: Recorder} 字典，按插入顺序输出。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-
     saved = []
 
-    # 规则基线
-    if rule_results:
-        for sym, metrics in rule_results.items():
-            path = output_dir / f"rule_{sym}_{ts}.csv"
-            pd.DataFrame([metrics]).to_csv(path, index=False, encoding="utf-8-sig")
-            saved.append(str(path.name))
+    # --- 1. summary.csv：一行一个策略，核心指标对比 ---
+    summary_rows = []
+    for name, rec in results.items():
+        if rec and rec.equity_curve:
+            m = rec.evaluate()
+            summary_rows.append({"策略": name, **m})
 
-    # LLM
-    if llm_recorder and llm_recorder.trades:
-        trades = [{
-            "日期": t.date, "股票": t.symbol, "方向": t.direction,
-            "价格": f"{t.price:.2f}", "股数": t.shares,
-            "手续费": f"{t.commission:.2f}", "盈亏": f"{t.pnl:.2f}", "原因": t.reason,
-        } for t in llm_recorder.trades]
-        path = output_dir / f"llm_trades_{ts}.csv"
-        pd.DataFrame(trades).to_csv(path, index=False, encoding="utf-8-sig")
-        saved.append(path.name)
-    if llm_recorder and llm_recorder.equity_curve:
-        path = output_dir / f"llm_equity_{ts}.csv"
-        pd.DataFrame(llm_recorder.equity_curve, columns=["date", "equity"]).to_csv(path, index=False)
+    if summary_rows:
+        path = output_dir / f"summary_{ts}.csv"
+        pd.DataFrame(summary_rows).to_csv(path, index=False, encoding="utf-8-sig")
         saved.append(path.name)
 
-    # VADER
-    if vader_recorder and vader_recorder.trades:
-        trades = [{
-            "日期": t.date, "股票": t.symbol, "方向": t.direction,
-            "价格": f"{t.price:.2f}", "股数": t.shares,
-            "手续费": f"{t.commission:.2f}", "盈亏": f"{t.pnl:.2f}", "原因": t.reason,
-        } for t in vader_recorder.trades]
-        path = output_dir / f"vader_trades_{ts}.csv"
-        pd.DataFrame(trades).to_csv(path, index=False, encoding="utf-8-sig")
-        saved.append(path.name)
-    if vader_recorder and vader_recorder.equity_curve:
-        path = output_dir / f"vader_equity_{ts}.csv"
-        pd.DataFrame(vader_recorder.equity_curve, columns=["date", "equity"]).to_csv(path, index=False)
+    # --- 2. equity.csv：合并净值曲线（方便画图） ---
+    equity_dfs = []
+    for name, rec in results.items():
+        if rec and rec.equity_curve:
+            col = name.lower().replace("&", "and").replace(" ", "_").replace("__", "_")
+            df = pd.DataFrame(rec.equity_curve, columns=["date", col])
+            df["date"] = pd.to_datetime(df["date"])
+            equity_dfs.append(df)
+
+    if equity_dfs:
+        merged = equity_dfs[0]
+        for df in equity_dfs[1:]:
+            merged = merged.merge(df, on="date", how="outer")
+        merged = merged.sort_values("date").reset_index(drop=True)
+        path = output_dir / f"equity_{ts}.csv"
+        merged.to_csv(path, index=False)
         saved.append(path.name)
 
-    # PPO
-    if ppo_recorder and ppo_recorder.trades:
-        trades = [{
-            "日期": t.date, "股票": t.symbol, "方向": t.direction,
-            "价格": f"{t.price:.2f}", "股数": t.shares,
-            "手续费": f"{t.commission:.2f}", "盈亏": f"{t.pnl:.2f}", "原因": t.reason,
-        } for t in ppo_recorder.trades]
-        path = output_dir / f"ppo_trades_{ts}.csv"
-        pd.DataFrame(trades).to_csv(path, index=False, encoding="utf-8-sig")
-        saved.append(path.name)
-    if ppo_recorder and ppo_recorder.equity_curve:
-        path = output_dir / f"ppo_equity_{ts}.csv"
-        pd.DataFrame(ppo_recorder.equity_curve, columns=["date", "equity"]).to_csv(path, index=False)
+    # --- 3. trades.csv：合并交易记录 ---
+    all_trades = []
+    for name, rec in results.items():
+        if rec and rec.trades:
+            for t in rec.trades:
+                all_trades.append({
+                    "策略": name, "日期": t.date, "股票": t.symbol,
+                    "方向": t.direction, "价格": f"{t.price:.2f}", "股数": t.shares,
+                    "手续费": f"{t.commission:.2f}", "盈亏": f"{t.pnl:.2f}", "原因": t.reason,
+                })
+    if all_trades:
+        path = output_dir / f"trades_{ts}.csv"
+        pd.DataFrame(all_trades).to_csv(path, index=False, encoding="utf-8-sig")
         saved.append(path.name)
 
     if saved:
         print(f"\n  结果已保存到 {output_dir}:")
         for name in saved:
             print(f"    - {name}")
+
+
+def print_summary(results: dict):
+    """打印各策略的核心指标汇总对比表。"""
+    rows = []
+    for name, rec in results.items():
+        if rec and rec.equity_curve:
+            m = rec.evaluate()
+            rows.append((name, m))
+
+    if not rows:
+        return
+
+    print(f"\n{'=' * 72}")
+    print(f"  {'回测结果汇总':^68}")
+    print(f"{'=' * 72}")
+    print(f"  {'策略':<14} {'累计收益':>10} {'最大回撤':>10} {'夏普比率':>10} "
+          f"{'胜率':>10} {'交易数':>8} {'换手率':>10}")
+    print(f"  {'-' * 68}")
+
+    for label, m in rows:
+        print(f"  {label:<14} {m.get('累计收益率', 'N/A'):>10} {m.get('最大回撤', 'N/A'):>10} "
+              f"{m.get('夏普比率', 'N/A'):>10} {m.get('胜率', 'N/A'):>10} "
+              f"{str(m.get('总交易次数', 'N/A')):>8} {m.get('换手率', 'N/A'):>10}")
+
+    print(f"{'=' * 72}")
 
 
 def main():
@@ -209,117 +246,53 @@ def main():
     print(f"  时间：{args.start} ~ {args.end}")
     print(f"  初始资金：${config.INITIAL_CAPITAL:,.0f}")
     print(f"  Top-K: {config.TOP_K}  调仓周期：{config.REBALANCE_DAYS} 天")
-    if args.with_ppo:
-        print(f"  PPO 模式：{args.ppo_mode}")
-    else:
-        print(f"  PPO 模式：禁用")
 
     # 1. 数据采集
     market_data, news_df = download_data(args.pool, args.start, args.end)
 
-    # 2. 路径 A: 规则基线（单股回测）
-    rule_results = None
-    if not args.skip_rule:
-        print("\n" + "=" * 60)
-        print("  [2/4] 路径 A: 规则基线（单股回测）")
-        print("=" * 60)
+    # 2. 各策略回测
+    results = {}  # {策略名: Recorder}
 
-        rule_results = {}
+    # --- Buy & Hold 等权基准 ---
+    print(f"\n  --- Buy & Hold 等权基准 ---")
+    results["Buy & Hold"] = create_buy_and_hold_recorder(market_data, config.INITIAL_CAPITAL)
+    print(f"  [OK] 等权 B&H 完成")
 
-        def _backtest_single_stock(symbol, df):
-            """对单只股票跑规则基线回测（供线程池调用）。"""
-            df_enriched = generate_signals(df.copy())
-
-            buy_count = (df_enriched["signal"] == config.SIGNAL_BUY).sum()
-            sell_count = (df_enriched["signal"] == config.SIGNAL_SELL).sum()
-            print(f"    信号：买入 {buy_count} 次，卖出 {sell_count} 次")
-
-            engine = BacktestEngine()
-            recorder = engine.run(df_enriched, symbol=symbol)
-            metrics = recorder.evaluate()
-
-            bh = recorder.evaluate_buy_and_hold(df)
-            if bh:
-                metrics.update(bh)
-
-            print(f"    累计收益率：{metrics.get('累计收益率', 'N/A')}")
-            return symbol, metrics
-
-        with ThreadPoolExecutor(max_workers=min(4, len(market_data))) as executor:
-            futures = {
-                executor.submit(_backtest_single_stock, symbol, df): symbol
-                for symbol, df in market_data.items()
-            }
-            for future in as_completed(futures):
-                symbol, metrics = future.result()
-                rule_results[symbol] = metrics
-
-        print(f"\n  [OK] 规则基线完成：{len(rule_results)} 只股票")
-    else:
-        print("\n  [SKIP] 路径 A: 规则基线")
-
-    # 3. 路径 B/C: LLM/VADER 多股回测
-    print("\n" + "=" * 60)
-    print("  [3/4] 路径 B/C: LLM 选股 / VADER 选股")
-    print("=" * 60)
-
-    llm_recorder = None
-    vader_recorder = None
-
-    # --- 路径 B: LLM ---
-    print(f"\n  --- 路径 B: LLM Top-K ---")
+    # --- LLM Top-K ---
+    print(f"\n  --- LLM Top-K ---")
 
     def llm_decide(date, market_state, candidate_pool, news_df, current_holdings, market_data=None):
         return decide_formula_llm(date, market_state, candidate_pool, news_df, current_holdings, market_data=market_data)
 
-    llm_recorder = run_multi_stock_backtest(
-        llm_decide, market_data, news_df, args.pool, label="LLM"
-    )
+    llm_recorder = run_multi_stock_backtest(llm_decide, market_data, news_df, args.pool)
     if llm_recorder.equity_curve:
         print(f"  [OK] LLM 回测完成，最终权益：${llm_recorder.equity_curve[-1][1]:,.2f}")
+    results["LLM Top-K"] = llm_recorder
 
-    # --- 路径 C: VADER ---
+    # --- VADER Top-K ---
     if not args.skip_vader:
-        print(f"\n  --- 路径 C: VADER Top-K ---")
+        print(f"\n  --- VADER Top-K ---")
 
         def vader_decide(date, market_state, candidate_pool, news_df, current_holdings, market_data=None):
             return decide_formula_vader(date, market_state, candidate_pool, news_df, current_holdings, market_data=market_data)
 
-        vader_recorder = run_multi_stock_backtest(
-            vader_decide, market_data, news_df, args.pool, label="VADER"
-        )
+        vader_recorder = run_multi_stock_backtest(vader_decide, market_data, news_df, args.pool)
         if vader_recorder.equity_curve:
             print(f"  [OK] VADER 回测完成，最终权益：${vader_recorder.equity_curve[-1][1]:,.2f}")
+        results["VADER Top-K"] = vader_recorder
     else:
-        print(f"\n  [SKIP] 路径 C: VADER")
+        print(f"\n  [SKIP] VADER")
 
-    # 4. 路径 D: PPO (可选)
-    ppo_recorder = None
-    if args.with_ppo:
-        print("\n" + "=" * 60)
-        print("  [4/4] 路径 D: PPO 仓位融合器")
-        print("=" * 60)
-        
-        try:
-            from core.ppo.ppo_env import PPOEnv
-            from core.ppo.ppo_policy import PPOPolicy
-            from core.ppo.ppo_trainer import PPOTrainer
-            
-            print(f"\n  [INFO] PPO 功能已启用，但需要先完成阶段 5 开发")
-            print(f"  [WARN] 当前版本暂不支持 PPO，跳过此路径")
-            # TODO: 实现 PPO 路径
-        except ImportError as e:
-            print(f"  [ERROR] PPO 模块导入失败：{e}")
-    else:
-        print("\n  [SKIP] 路径 D: PPO (未启用)")
-
-    # 5. 保存结果
+    # 3. 保存结果
     print("\n" + "=" * 60)
-    print("  [5/5] 保存结果")
+    print("  保存结果")
     print("=" * 60)
 
     output_dir = config.OUTPUT_DIR / f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    save_results(output_dir, rule_results, llm_recorder, vader_recorder, ppo_recorder)
+    save_results(output_dir, results)
+
+    # 4. 终端汇总
+    print_summary(results)
 
     print("\n" + "=" * 60)
     print("  回测完成!")

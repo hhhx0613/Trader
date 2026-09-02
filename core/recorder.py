@@ -130,6 +130,24 @@ class Recorder:
         total_trades = len([t for t in self.trades if t.direction == "BUY"])
         total_commission = sum(t.commission for t in self.trades)
 
+        # --- 6. 换手率 ---
+        # SEC 标准：min(总买入, 总卖出) / 平均净值，避免买卖双重计算
+        total_buy_value = sum(
+            t.price * t.shares for t in self.trades if t.direction == "BUY"
+        )
+        total_sell_value = sum(
+            t.price * t.shares for t in self.trades if t.direction == "SELL"
+        )
+        avg_equity = equities.mean()
+        trading_days = len(equities)
+
+        if avg_equity > 0 and trading_days > 1:
+            turnover_ratio = min(total_buy_value, total_sell_value) / avg_equity
+            annualized_turnover = turnover_ratio * (252 / trading_days)
+        else:
+            turnover_ratio = 0.0
+            annualized_turnover = 0.0
+
         metrics = {
             "初始资金": f"${initial:,.2f}",
             "最终权益": f"${final:,.2f}",
@@ -144,6 +162,8 @@ class Recorder:
             "平均盈利": f"${avg_win:,.2f}",
             "平均亏损": f"${avg_loss:,.2f}",
             "总手续费": f"${total_commission:,.2f}",
+            "换手率": f"{turnover_ratio:.2f}",
+            "年化换手率": f"{annualized_turnover:.2f}",
         }
 
         return metrics
