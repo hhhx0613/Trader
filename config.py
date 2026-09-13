@@ -70,9 +70,14 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 默认交易标的（美股苹果，数据稳定、适合入门演示）
 DEFAULT_SYMBOL = "NVDA"
 
-# 默认回测时间范围（一年数据）
+# 默认回测时间范围（一年数据）——同时用作 PPO 阶段二（LLM 微调）区间
 DEFAULT_START_DATE = "2025-08-11"
 DEFAULT_END_DATE = "2026-08-09"
+
+# PPO 阶段一（纯数值主干）训练区间：长历史跨周期，避免在单一 regime 上过拟合。
+# 与阶段二区间不相交（阶段一 2015-2022 训练，阶段二 2025-2026 微调）。见 docs/Plan_v2.md。
+PPO_STAGE1_START_DATE = "2015-01-01"
+PPO_STAGE1_END_DATE = "2022-12-31"
 
 # Alpha Vantage API Key（免费申请：https://www.alphavantage.co/support/#api-key）
 # Alpha Vantage API Key（单个 key）

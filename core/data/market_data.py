@@ -158,17 +158,14 @@ def _try_yfinance(symbol: str, start_date: str, end_date: str) -> Optional[pd.Da
     返回的列名统一为小写（open, high, low, close, volume）。
     """
     try:
-        # Windows 上 curl_cffi SSL 证书路径问题，禁用验证即可
-        try:
-            import curl_cffi.requests.session as _s
-            _o = _s.BaseSession.__init__
-            _s.BaseSession.__init__ = lambda self, *a, **k: _o(self, *a, verify=False, **{x: v for x, v in k.items() if x != 'verify'})
-        except ImportError:
-            pass
-
         import yfinance as yf
 
-        df = yf.Ticker(symbol).history(
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+
+        df = yf.Ticker(symbol, session=session).history(
             start=start_date, end=end_date, auto_adjust=True
         )
 

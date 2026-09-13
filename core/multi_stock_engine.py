@@ -15,6 +15,8 @@ Plan.md 阶段 3 对应：
   - 非调仓日：持有不动，只记录净值
 """
 
+from collections import deque
+
 import pandas as pd
 from typing import Dict, List, Optional, Callable
 
@@ -34,19 +36,32 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         recorder.print_report(primary_df)
     """
 
-    def __init__(self, decide_func: Callable, initial_capital: float = None):
+    def __init__(
+        self,
+        decide_func: Callable,
+        initial_capital: float = None,
+        exposure_predictor: Optional[Callable] = None,
+    ):
         """
         参数：
           decide_func: 决策函数回调
             签名：decide_func(date, market_state, candidate_pool, news_df, current_holdings)
                   -> {"holdings": [{"symbol": str, "weight": float}], "exposure": float}
           initial_capital: 初始资金（默认 config.INITIAL_CAPITAL）
+          exposure_predictor: 可选，PPO 择时回调，签名 (date, symbols, account) -> exposure(float)。
+            挂载后在调仓日仅覆盖 decide_func 返回的 exposure（选股/个股权重不变）；
+            None 则沿用 decide_func 的公式暴露（向后兼容 B&H/LLM/VADER 路径）。
         """
         super().__init__(initial_capital)
         self.decide_func = decide_func
+        self.exposure_predictor = exposure_predictor
 
         # 待执行决策（前一天生成，今天开盘执行）
         self._pending_decision = None
+
+        # PPO 账户特征所需的运行时状态（run() 中逐日更新，重置时清零）
+        self._peak_equity = self.initial_capital   # 净值峰值 → drawdown
+        self._trade_window = deque(maxlen=20)       # 近 20 日是否换手 → recent_trades
 
     def run(
         self,
@@ -68,6 +83,8 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         # 重置状态
         self.reset()
         self._pending_decision = None
+        self._peak_equity = self.initial_capital
+        self._trade_window = deque(maxlen=20)
 
         if candidate_pool is None:
             candidate_pool = list(market_data.keys())
@@ -128,6 +145,7 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                 is_rebalance_day = (rebalance_counter % config.REBALANCE_DAYS == 0)
 
             # ========== 步骤 1：执行昨日待执行决策（以今日开盘价撮合）==========
+            trades_before = len(self.recorder.trades)
             if self._pending_decision is not None:
                 self._execute_rebalance(
                     current_date=current_date,
@@ -135,9 +153,12 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                     decision=self._pending_decision,
                 )
                 self._pending_decision = None
+            # 记录「今日是否发生换手」到近 20 日窗口（供 PPO 账户特征 recent_trades，口径对齐 env）
+            self._trade_window.append(1 if len(self.recorder.trades) > trades_before else 0)
 
             # ========== 步骤 2：风控检查（以收盘价计算浮盈亏）==========
             portfolio_value = self._calculate_portfolio_value(enriched_data, current_date)
+            self._peak_equity = max(self._peak_equity, portfolio_value)  # 净值峰值（供 drawdown 账户特征）
             risk_status = self._check_risk(current_date, portfolio_value, enriched_data)
 
             # 风控强制平仓
@@ -171,6 +192,13 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                         ]
                         if not decision["holdings"]:
                             decision["exposure"] = 0.0
+
+                # PPO 择时接管总暴露：只替换 exposure 档位，选股/个股权重保持 decide_func 原样。
+                # 账户 3 维由引擎运行时状态重建（decide_func 拿不到现金/持仓/净值，故接入点在此）。
+                if self.exposure_predictor is not None and decision.get("holdings"):
+                    account = self._build_account_state(portfolio_value)
+                    decision["exposure"] = self.exposure_predictor(
+                        current_date, candidate_pool, account)
 
                 # 存入待执行（明天开盘执行）
                 self._pending_decision = decision
@@ -387,3 +415,22 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
             if price:
                 total += holding["shares"] * price
         return total
+
+    def _build_account_state(self, portfolio_value: float) -> Dict:
+        """
+        重建 PPO numeric 的账户 3 维，口径对齐 env._get_obs：
+          current_exposure = 持仓市值 / 净值（当前实际暴露）
+          drawdown         = 净值距峰值回撤（正值）
+          recent_trades    = 近 20 日发生换手的天数
+        """
+        invested = portfolio_value - self.cash
+        current_exposure = invested / portfolio_value if portfolio_value > 0 else 0.0
+        drawdown = (
+            (self._peak_equity - portfolio_value) / self._peak_equity
+            if self._peak_equity > 0 else 0.0
+        )
+        return {
+            "current_exposure": current_exposure,
+            "drawdown": drawdown,
+            "recent_trades": int(sum(self._trade_window)),
+        }

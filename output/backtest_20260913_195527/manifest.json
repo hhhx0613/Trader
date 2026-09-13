@@ -1,0 +1,21 @@
+{
+  "experiment_id": "ppo_dailyfreq_20260913",
+  "status": "archived",
+  "purpose": "诊断旧日频 PPO 从训练环境迁移至真实回测时的表现",
+  "code_revision": "worktree based on 7ff7c02; PPO implementation was uncommitted at run time",
+  "test_period": "2025-08-11~2026-08-09",
+  "universe": "10 只大盘龙头",
+  "selection": "LLM Top-K=5",
+  "position_weights": "inverse volatility",
+  "exposure_rule": "旧日频 PPO，离散 {0, 25, 50, 75, 100}%",
+  "environment": "等权随机池、日频决策与轻成本；与真实回测不一致",
+  "cost_model": "回测实际手续费与滑点",
+  "model_path": "models/ppo_stage1_dailyfreq.zip",
+  "control_experiment": "llm_formula_20260902",
+  "output_files": [
+    "summary_20260913_195527.csv",
+    "equity_20260913_195527.csv",
+    "trades_20260913_195527.csv"
+  ],
+  "conclusion": "训练环境与真实周频 Top-K 回测存在口径鸿沟，模型淘汰，不作为后续比较基线。"
+}

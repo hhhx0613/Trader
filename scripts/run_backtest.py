@@ -28,6 +28,7 @@ from core.multi_stock_engine import MultiStockBacktestEngine
 from core.recorder import Recorder
 from agents.decision_func import decide_formula_llm, decide_formula_vader
 from agents.stock_selector import DEFAULT_CANDIDATE_POOL
+from core.ppo.predict import PPOExposurePredictor
 from core import config
 
 # 指标预热期（日历天数）：60 天覆盖 RSI/ADX 的预热窗口
@@ -113,9 +114,12 @@ def download_data(candidate_pool, start_date, end_date):
     return market_data, news_df
 
 
-def run_multi_stock_backtest(decide_func, market_data, news_df, candidate_pool):
-    """用指定的决策函数跑多股票回测，返回 recorder。"""
-    engine = MultiStockBacktestEngine(decide_func=decide_func)
+def run_multi_stock_backtest(decide_func, market_data, news_df, candidate_pool, exposure_predictor=None):
+    """用指定的决策函数跑多股票回测，返回 recorder。
+
+    exposure_predictor 非空时挂载 PPO 择时：调仓日仅覆盖总暴露，选股/权重不变。
+    """
+    engine = MultiStockBacktestEngine(decide_func=decide_func, exposure_predictor=exposure_predictor)
     return engine.run(market_data, news_df, candidate_pool)
 
 
@@ -268,6 +272,21 @@ def main():
     if llm_recorder.equity_curve:
         print(f"  [OK] LLM 回测完成，最终权益：${llm_recorder.equity_curve[-1][1]:,.2f}")
     results["LLM Top-K"] = llm_recorder
+
+    # --- PPO Top-K（LLM 选股 + PPO stage1 择时接管总暴露）---
+    # 与 LLM Top-K 同一选股，仅把「波动率目标公式暴露」换成 PPO 学出的档位 → 干净 A/B
+    print(f"\n  --- PPO Top-K ---")
+    if (config.PROJECT_ROOT / "models" / "ppo_stage1.zip").exists():
+        predictor = PPOExposurePredictor(args.pool, args.start, args.end)
+        ppo_recorder = run_multi_stock_backtest(
+            llm_decide, market_data, news_df, args.pool,
+            exposure_predictor=predictor.predict_exposure,
+        )
+        if ppo_recorder.equity_curve:
+            print(f"  [OK] PPO 回测完成，最终权益：${ppo_recorder.equity_curve[-1][1]:,.2f}")
+        results["PPO Top-K"] = ppo_recorder
+    else:
+        print(f"  [SKIP] 未找到 models/ppo_stage1.zip（先跑 scripts/train_ppo.py --stage 1）")
 
     # --- VADER Top-K ---
     if not args.skip_vader:

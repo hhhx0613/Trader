@@ -23,8 +23,11 @@ build/
 # 缓存目录（行情/新闻/LLM）
 data/cache/
 
-# 回测输出
-output/
+# 回测输出：原始 CSV 保持本地归档；仅版本化每次实验的可复现元数据。
+output/*
+!output/*/
+output/*/*
+!output/*/manifest.json
 
 # ==================== Conda ====================
 .conda/
