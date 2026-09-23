@@ -60,6 +60,8 @@ def parse_args():
     # 阶段二加载的阶段一模型路径
     p.add_argument("--stage1-model", default=None,
                    help=f"阶段二加载的阶段一模型路径（默认 models/{_STAGE1_NAME}）")
+    p.add_argument("--stage1-output", default=_STAGE1_NAME,
+                   help=f"阶段一模型输出名或路径（默认 models/{_STAGE1_NAME}.zip）")
     args = p.parse_args()
 
     if args.pool is None:
@@ -96,7 +98,7 @@ def main():
             symbol_pool=args.pool,
             total_timesteps=args.timesteps,
             seed=args.seed,
-            save_path=_STAGE1_NAME,
+            save_path=args.stage1_output,
             device=args.device,
             **env_kwargs,
         )

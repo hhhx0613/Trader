@@ -49,6 +49,7 @@ class RiskManager:
 
         # 记录上一个交易日，用于在新一天重置日内限制
         self.last_date = None
+        self.day_start_equity = initial_capital
 
         # R4: 连亏降仓状态
         self.consecutive_losses = 0       # 当前连续亏损笔数
@@ -104,6 +105,7 @@ class RiskManager:
         entry_price: float,
         current_price: float,
         atr_value: Optional[float] = None,  # 新增：ATR 值
+        day_start_equity: Optional[float] = None,
     ) -> dict:
         """
         在每个时间步调用，检查所有风控规则。
@@ -121,10 +123,13 @@ class RiskManager:
             force_sell     : bool，是否强制平仓（止损触发）
             halt_reason    : str，禁止交易的原因（空字符串 = 无限制）
         """
-        # 新的一天重置日内交易限制
+        # R2 只约束当日。基准取开盘撮合完成后的权益，避免把历史回撤误当成日内回撤。
         if current_date != self.last_date:
             self.daily_trading_halted = False
             self.last_date = current_date
+            self.day_start_equity = (
+                day_start_equity if day_start_equity is not None else current_equity
+            )
 
         # 更新历史最高净值
         if current_equity > self.peak_equity:
@@ -160,9 +165,9 @@ class RiskManager:
                 )
 
         # ---------- R2: 单日最大回撤 ----------
-        # 当日账户从最高点到当前的回撤超过阈值 → 禁止新开仓
-        if self.peak_equity > 0:
-            daily_drawdown = (self.peak_equity - current_equity) / self.peak_equity
+        # 当日开盘撮合后至当前的回撤超过阈值 → 仅禁止当日新开仓
+        if self.day_start_equity > 0:
+            daily_drawdown = (self.day_start_equity - current_equity) / self.day_start_equity
 
             if daily_drawdown >= config.MAX_DAILY_DRAWDOWN:
                 allow_buy = False
@@ -243,6 +248,7 @@ class RiskManager:
         self.peak_equity = self.initial_capital
         self.daily_trading_halted = False
         self.last_date = None
+        self.day_start_equity = self.initial_capital
         self.consecutive_losses = 0
         self.position_multiplier = 1.0
         self.turnover_count = 0

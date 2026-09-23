@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+pytest-cache-files-*/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 *.so
 *.egg-info/
 dist/
@@ -41,3 +46,8 @@ FinRL/
 # ==================== 日志文件 ====================
 *.log
 logs/
+
+# ==================== Notebook / model artifacts ====================
+.ipynb_checkpoints/
+models/checkpoints/
+models/*.tmp

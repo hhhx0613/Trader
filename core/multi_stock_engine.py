@@ -157,17 +157,15 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
             self._trade_window.append(1 if len(self.recorder.trades) > trades_before else 0)
 
             # ========== 步骤 2：风控检查（以收盘价计算浮盈亏）==========
+            day_start_equity = self._calculate_portfolio_open_value(enriched_data, current_date)
             portfolio_value = self._calculate_portfolio_value(enriched_data, current_date)
             self._peak_equity = max(self._peak_equity, portfolio_value)  # 净值峰值（供 drawdown 账户特征）
-            risk_status = self._check_risk(current_date, portfolio_value, enriched_data)
+            risk_status = self._check_risk(
+                current_date, portfolio_value, enriched_data, day_start_equity)
 
-            # 风控强制平仓
-            if risk_status.get("force_liquidate", False):
-                self._liquidate_all(
-                    current_date=current_date,
-                    market_data=enriched_data,
-                    reason=risk_status.get("halt_reason", "风控强制平仓"),
-                )
+            # 单股止损在收盘只清触发标的；组合级风控才应清空整个组合。
+            for symbol, reason in risk_status["stop_orders"]:
+                self._sell_all(symbol, current_date, enriched_data, reason)
 
             # ========== 步骤 3：生成今日决策（调仓日才生成）==========
             if is_rebalance_day:
@@ -199,6 +197,16 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                     account = self._build_account_state(portfolio_value)
                     decision["exposure"] = self.exposure_predictor(
                         current_date, candidate_pool, account)
+
+                account = self._build_account_state(portfolio_value)
+                self.recorder.log_decision({
+                    "date": current_date,
+                    "target_exposure": decision.get("exposure", 0.0),
+                    "actual_exposure": account["current_exposure"],
+                    "drawdown": account["drawdown"],
+                    "allow_buy": risk_status["allow_buy"],
+                    "holding_count": len(decision.get("holdings", [])),
+                })
 
                 # 存入待执行（明天开盘执行）
                 self._pending_decision = decision
@@ -279,7 +287,12 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         # ===== 第 1 步：卖出不在目标中的持仓 =====
         symbols_to_sell = set(self.holdings.keys()) - target_symbols
         for symbol in symbols_to_sell:
-            self._sell_all(symbol, current_date, market_data, reason="调仓卖出")
+            # 调仓决策由前一日收盘形成，所有调仓方向均在今日开盘成交。
+            # _sell_all 用于收盘风控强平，不能复用到调仓卖出。
+            open_price = self._get_open_price(market_data, symbol, current_date)
+            if open_price is not None:
+                self.sell(symbol, self.get_holding_shares(symbol), open_price,
+                          current_date, reason="调仓卖出")
 
         # ===== 第 2 步：计算目标持仓的目标股数 =====
         portfolio_value = self._calculate_portfolio_value(market_data, current_date)
@@ -331,15 +344,16 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         for symbol in symbols:
             self._sell_all(symbol, current_date, market_data, reason)
 
-    def _check_risk(self, current_date, portfolio_value: float, market_data: Dict) -> Dict:
+    def _check_risk(
+        self, current_date, portfolio_value: float, market_data: Dict, day_start_equity: float,
+    ) -> Dict:
         """
         风控检查。
 
         返回：
-          {"allow_buy": bool, "force_liquidate": bool, "halt_reason": str}
+          {"allow_buy": bool, "stop_orders": [(symbol, reason), ...]}
         """
-        force_liquidate = False
-        halt_reason = ""
+        stop_orders = []
 
         # 第 1 步：逐只检查单股止损
         for symbol, holding in list(self.holdings.items()):
@@ -355,34 +369,26 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
                     entry_price=holding["entry_price"],
                     current_price=price,
                     atr_value=atr_value,  # 新增 ATR 参数
+                    day_start_equity=day_start_equity,
                 )
 
                 if risk_status["force_sell"]:
-                    force_liquidate = True
-                    halt_reason = risk_status["halt_reason"]
-                    break
+                    stop_orders.append((symbol, risk_status["halt_reason"]))
 
-        # 第 2 步：检查总回撤（只在未触发强制平仓时才检查）
-        if not force_liquidate:
-            # 总回撤检查不需要 ATR
-            risk_status = self.risk_manager.check_risk(
-                current_date=current_date,
-                current_equity=portfolio_value,
-                holding_shares=0,
-                entry_price=0.0,
-                current_price=0.0,
-                atr_value=None,  # 总回撤不检查 ATR
-            )
-            allow_buy = risk_status["allow_buy"]
-            if not allow_buy and not halt_reason:
-                halt_reason = risk_status["halt_reason"]
-        else:
-            allow_buy = False
+        # 总账户回撤检查不需要 ATR，也不因单股止损而跳过。
+        risk_status = self.risk_manager.check_risk(
+            current_date=current_date,
+            current_equity=portfolio_value,
+            holding_shares=0,
+            entry_price=0.0,
+            current_price=0.0,
+            atr_value=None,
+            day_start_equity=day_start_equity,
+        )
 
         return {
-            "allow_buy": allow_buy,
-            "force_liquidate": force_liquidate,
-            "halt_reason": halt_reason,
+            "allow_buy": risk_status["allow_buy"],
+            "stop_orders": stop_orders,
         }
 
     def _get_open_price(self, market_data: Dict, symbol: str, date) -> Optional[float]:
@@ -412,6 +418,15 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         total = self.cash
         for symbol, holding in self.holdings.items():
             price = self._get_close_price(market_data, symbol, current_date)
+            if price:
+                total += holding["shares"] * price
+        return total
+
+    def _calculate_portfolio_open_value(self, market_data: Dict, current_date) -> float:
+        """开盘撮合完成后的账户权益，作为 R2 的当日基准。"""
+        total = self.cash
+        for symbol, holding in self.holdings.items():
+            price = self._get_open_price(market_data, symbol, current_date)
             if price:
                 total += holding["shares"] * price
         return total

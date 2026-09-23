@@ -57,6 +57,9 @@ class Recorder:
         # 每日净值记录：[(date, equity), ...]
         self.equity_curve: List[tuple] = []
 
+        # 调仓级诊断记录：用于审阅 PPO 的目标暴露与回撤，而非参与绩效计算。
+        self.decisions: List[dict] = []
+
     def log_trade(self, trade: Trade):
         """记录一笔交易。"""
         self.trades.append(trade)
@@ -64,6 +67,10 @@ class Recorder:
     def log_equity(self, date, equity: float):
         """记录当日账户总权益（现金 + 持仓市值）。"""
         self.equity_curve.append((date, equity))
+
+    def log_decision(self, record: dict):
+        """记录一次已生成的调仓决策及其决策前账户状态。"""
+        self.decisions.append(record)
 
     # ==================== 绩效评估 ====================
 
@@ -287,3 +294,4 @@ class Recorder:
         """清空所有记录（用于多次回测实验）。"""
         self.trades.clear()
         self.equity_curve.clear()
+        self.decisions.clear()

@@ -88,6 +88,10 @@ class LLMCacheDB:
         """
         查询缓存
 
+        按自然日查询，兼容 SQLite 中带午夜时间的 ``analysis_date``。缓存的业务键是
+        交易日而非时间字符串，因此调用方传 ``YYYY-MM-DD`` 或带时间的 Timestamp
+        都应命中同一条 PIT 信号。
+
         Args:
             symbol: 股票代码
             date: 分析日期（格式：YYYY-MM-DD）
@@ -102,7 +106,9 @@ class LLMCacheDB:
                 SELECT symbol, analysis_date, model, direction, confidence,
                        reasons, sources, prompt_version, created_at, composite_score
                 FROM llm_analysis_cache
-                WHERE symbol=? AND analysis_date=? AND model=? AND prompt_version=?
+                WHERE symbol=? AND DATE(analysis_date)=DATE(?) AND model=? AND prompt_version=?
+                ORDER BY analysis_date DESC
+                LIMIT 1
             """, (symbol, date, model, prompt_version))
             
             row = cursor.fetchone()
@@ -120,7 +126,7 @@ class LLMCacheDB:
                     "composite_score": row[9],
                 }
             return None
-    
+
     def save_cache(self, data: Dict) -> bool:
         """
         保存缓存（INSERT OR REPLACE）

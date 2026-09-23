@@ -1,7 +1,7 @@
 # 量化交易 LLM 多 Agent 系统毕设
 
-> **一句话总结**：LLM 分析新闻做选股，PPO 训练总仓位控制，规则基线作为对照。  
-> **当前状态**：✅ 阶段 0-4 全部完成（无 PPO，纯规则+LLM 决策验证）
+> **一句话总结**：LLM 分析新闻做 Top-K 选股，PPO 或波动率目标决定周频总暴露，规则风控只负责缩减或否决交易。
+> **当前状态**：PPO 已接入真实回测；训练与部署口径已对齐，但仍须通过多随机种子和滚动样本外的 Go/No-Go 验收。
 
 ---
 
@@ -9,10 +9,9 @@
 
 ```
 ┌─────────────────────────────────────┐
-│   Stage 5-7 (未来) ⏸️                │
-│   - PPO 强化学习                    │
-│   - 多 Agent 协同                   │
-│   - IBKR 模拟盘                      │
+│   PPO 总暴露控制 🔨                  │
+│   - 周频 PPO / 波动率目标公式         │
+│   - 同一 Top-K 的干净 A/B 比较        │
 └─────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────┐
@@ -21,7 +20,7 @@
 │   │数  │→│情绪/决策 │ →│回测撮合  │     │
 │   │据  │  │(LLM/VADER)│ │           │
 │   └───┘  └──────┘  └──────────┘     │
-│  规则基线 / LLM Top-K / VADER Top-K    │
+│  Buy & Hold / LLM / VADER / PPO Top-K │
 │   ↑                                 │
 │  Stage 4: L1 记忆 + 消融实验         │
 └─────────────────────────────────────┘
@@ -83,19 +82,26 @@ pip install ib-insync yfinance openai
 一条命令跑通所有策略对比：
 
 ```bash
-python scripts/run_backtest.py
+python scripts/run_backtest.py \
+  --purpose "验证的假设" \
+  --change-note "相对对照实验的改动" \
+  --known-limitations "当前已知局限性"
 ```
 
 **默认参数**：
 - 候选池：AAPL, NVDA, MSFT, GOOGL, AMZN, JPM, V, JNJ, UNH, WMT
 - 时间范围：2025-08-11 ~ 2026-08-09（一年）
 - Top-K：5 只，每周调仓
-- 对比策略：Buy & Hold 等权 / LLM Top-K / VADER Top-K
+- 对比策略：Buy & Hold 等权 / LLM Top-K / PPO Top-K / VADER Top-K（可选）
 
-**输出文件**（3 个，存于 `output/backtest_YYYYMMDD_HHMMSS/`）：
+**输出文件**（存于 `output/backtest_YYYYMMDD_HHMMSS/`）：
 - `summary_{ts}.csv` — 一行一个策略，全部核心指标对比
 - `equity_{ts}.csv` — 合并净值曲线（画图用）
 - `trades_{ts}.csv` — 全部交易记录（加“策略”列区分）
+- `decisions_{ts}.csv` — 调仓级目标暴露、实际暴露、回撤与 R2 状态（有 PPO 时）
+- `report_{ts}.md` 与 `manifest.json` — 单次实验摘要及可复现元数据
+
+每次回测还会自动追加 `docs/experiment_index.csv`，并重建 `docs/backtest_report.md`。前者用于结构化筛选和论文作图，后者优先展示收益、夏普、最大回撤及相对 LLM 基线差值。
 
 **最新回测结果**（2025-08-11 ~ 2026-08-07，一年期）：
 
@@ -139,9 +145,12 @@ Trader/
 │   ├── clear_llm_cache.py     # 清除 LLM 缓存工具
 │   └── data_fetch_tracker.py  # 新闻数据拉取进度追踪
 ├── docs/
-│   └── Plan_v2.md            #   架构设计文档（权威）
+│   ├── Plan_v2.md            #   架构设计文档（权威）
+│   ├── experiment_index.csv  #   自动维护的实验登记册
+│   └── backtest_report.md    #   自动生成的实验对比报告
 ├── config.py                  # 全局配置
-└── output/                    # 回测结果（gitignore）
+├── models/                    # PPO 模型归档
+└── output/                    # 不可覆盖的回测原始证据（原始 CSV 不上传 Git）
 ```
 
 ---
@@ -169,7 +178,7 @@ Trader/
 ## 📊 已知问题与待办
 
 - [ ] **主动策略跑输 B&H**：策略暴露度只有 30~50%（大量现金闲置），加上 ATR 止损频繁触发砍掉了上涨仓位 → 考虑提高目标暴露度 / 调低止损敏感度
-- [ ] PPO 仓位融合器待验证（阶段 6）
+- [ ] PPO Go/No-Go 验收：至少 3 个随机种子、滚动样本外窗口和 block bootstrap 相对收益/夏普区间
 - [ ] IBKR 模拟盘接入（阶段 7）
 
 ---
