@@ -74,6 +74,7 @@ python scripts/run_backtest.py \
 
 - 旧日频 PPO 为 `retired`：训练环境和真实回测口径不一致。
 - 周频对齐 PPO 为 `provisional`：相对公式 LLM 基线累计收益约 +1.25 个百分点、夏普持平，不能宣称优势。
+- 当前同口径一年基线：LLM +9.50%、夏普 0.79；真实 VADER +6.25%、夏普 0.38。旧 VADER +12.04% 使用了全历史新闻累积，已废弃。
 - 2026-09-22 PPO 调试运行均为 `historical_incomplete`，仅供诊断。
 - Buy & Hold 的风险暴露不同，不能直接用绝对收益推导选股 alpha。
 

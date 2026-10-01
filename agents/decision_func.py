@@ -33,6 +33,7 @@ from typing import Dict, List, Set
 from agents.stock_selector import select_top_k, DEFAULT_CANDIDATE_POOL
 from core import config
 from core.data.sentiment import SentimentAnalyzer
+from core.data.news_data import get_news_at_date
 
 
 def _stock_daily_vol(stock_state: Dict) -> float:
@@ -198,22 +199,15 @@ def decide_formula_vader(
     # 对每只候选股计算 VADER 情绪
     stock_scores = []
     for symbol in candidate_pool:
-        # 过滤该股的新闻
-        if "symbol" in news_df.columns:
-            symbol_news = news_df[news_df["symbol"] == symbol]
-        else:
-            symbol_news = news_df
-
-        # 时点对齐：只取 date 及之前的新闻
-        target_dt = pd.Timestamp(str(date).split(' ')[0]) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-        timely_news = symbol_news[symbol_news["datetime"] <= target_dt]
-
-        if len(timely_news) == 0:
+        # 与 LLM 路径相同：只取该股票截至调仓日的 PIT 近 7 天新闻，
+        # 禁止把数月前旧新闻反复累积进 VADER 基线。
+        timely_news = get_news_at_date(news_df, symbol, str(date))
+        if not timely_news:
             avg_sentiment = 0.0
         else:
             # 对标题+摘要打分，取平均
             scores = []
-            for _, row in timely_news.iterrows():
+            for row in timely_news:
                 text = f"{row.get('title', '')} {row.get('summary', '')}".strip()
                 if text:
                     scores.append(analyzer.analyze(text))
