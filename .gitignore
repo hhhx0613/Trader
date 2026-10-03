@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 pytest-cache-files-*/
 .pytest_cache/
+tmp/*
+!tmp/.gitkeep
 .coverage
 coverage.xml
 htmlcov/

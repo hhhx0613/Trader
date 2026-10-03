@@ -73,16 +73,26 @@ LangGraph 只保存单次运行的临时图状态，不能作为事实、审计�
 
 ### 阶段 1：可重放的数据与审计地基
 
-状态：未开始
+状态：完成
+
+- 开始日期：2026-10-03
+- trace_id：stage1-20261003-bootstrap
+- 分支或提交：当前工作树（提交前待补充）
+- 完成日期：2026-10-03
+- 实现范围：`core/research/` 的 Pydantic 数据契约、内容寻址原始载荷、SQLite WAL 追加式账本、PIT 规范化、Snapshot Builder 与只读审计 DataGateway；不包含研究 Agent、交易意图或订单。
+- 验证：`python -m pytest tests\\research\\test_stage1_snapshot.py -q --basetemp D:\\Codes\\Trader\\.stage1_pytest_verified`（6 passed）；`python -m pytest tests\\test_risk_manager.py -q --basetemp D:\\Codes\\Trader\\.risk_pytest_verified`（2 passed）；`python -m compileall -q core\\research` 通过。
+- 审计样本：离线 fixture 的 `trace-1`；测试为隔离临时数据库，不写入项目研究账本。
+- 已知限制：新闻、披露和行情的线上拉取仍由既有 Provider 提供；阶段一只接收其已获取记录并做规范化、PIT 校验和冻结，尚未接入任何 Agent 或线上调度。
+- 下一阶段前置条件：在冻结 Snapshot 上只经 DataGateway 读取事实；不得绕过账本或让 Agent 直接访问 Provider。
 
 目标：给定股票池和 as_of，离线构建并重放 PIT 合格的 ResearchSnapshot。
 
-- [ ] 锁定 LangGraph、Pydantic v2、cvxpy 依赖与版本；可选依赖不得在普通模块导入时强制加载。
-- [ ] 建立 contracts、追加式 store、SQLite 迁移和 research_ledger.db。
-- [ ] 建立 raw payload 存储、内容哈希、引用关系与保留规则。
-- [ ] 规范化 News、SEC Filing、Market Provider；实现 available_at PIT 校验、去重、转载过滤和离线 fixture。
-- [ ] 实现 Snapshot Builder，冻结股票池、来源版本、新闻、披露、行情与账户状态。
-- [ ] 实现只读 DataGateway；每次查询校验 symbol、snapshot_id、as_of 并记入审计账本。
+- [x] 锁定 LangGraph、Pydantic v2、cvxpy 依赖与版本；可选依赖不得在普通模块导入时强制加载。
+- [x] 建立 contracts、追加式 store、SQLite 迁移和 research_ledger.db。
+- [x] 建立 raw payload 存储、内容哈希、引用关系与保留规则。
+- [x] 规范化 News、SEC Filing、Market Provider；实现 available_at PIT 校验、去重、转载过滤和离线 fixture。
+- [x] 实现 Snapshot Builder，冻结股票池、来源版本、新闻、披露、行情与账户状态。
+- [x] 实现只读 DataGateway；每次查询校验 symbol、snapshot_id、as_of 并记入审计账本。
 
 验收：断网条件下可重建相同 Snapshot；未来数据、无可得时间数据和重复转载被拒绝并有原因码；EvidenceCard 可定位原始文件与哈希。
 

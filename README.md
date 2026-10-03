@@ -36,7 +36,15 @@ pip install -r requirements.txt
 
 ## 测试缓存
 
-pytest 的跨会话缓存已禁用，避免当前 Windows 环境遗留 `.pytest_cache` 或 `pytest-cache-files-*` 临时目录；这不影响测试运行。
+pytest 的跨会话缓存已禁用，避免当前 Windows 环境遗留 `.pytest_cache` 或 `pytest-cache-files-*` 临时目录；每次运行的 fixture 固定写入并覆盖 `tmp/pytest/`，该目录已由 Git 忽略。这不影响测试运行。
+
+阶段一研究数据层的离线回归测试：
+
+```bash
+python -m pytest tests/research/test_stage1_snapshot.py -q
+```
+
+它验证 PIT 拒绝、转载去重、冻结 Snapshot 的离线读取、内容哈希定位与 DataGateway 查询审计。该路径不导入 LangGraph、cvxpy 或 PPO 依赖。
 
 ## 运行回测
 
@@ -74,6 +82,8 @@ python scripts/run_backtest.py \
 ```text
 agents/                         LLM、VADER 与当前 Top-K 决策
 core/                           数据、指标、回测、风控与 PPO
+core/research/                  PIT Snapshot、原始载荷、审计账本与只读 DataGateway
+tests/research/                 阶段一离线数据与审计回归测试
 scripts/run_backtest.py         统一回测入口
 scripts/train_ppo.py            PPO 训练入口
 models/                         PPO 模型归档
