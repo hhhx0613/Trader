@@ -51,7 +51,7 @@ _LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 # composite_score 聚合的压缩尺度：raw 求和 → tanh(raw / _COMPOSITE_SCALE)
-# 唯一待标定旋钮（Plan.md 假设 7）：单条实质新闻 score≈4 时给出约 0.6 的强度，
+# 唯一待标定旋钮：单条实质新闻 score≈4 时给出约 0.6 的强度，
 # 两条同向叠加接近饱和。改此值不影响 prompt_version（不参与缓存 key）。
 _COMPOSITE_SCALE = 6.0
 
@@ -224,7 +224,7 @@ class LLMAnalystAgent:
         根据 LLM 返回的 per_news 维度打分，计算 score / composite_score / direction。
         直接在 response 上修改（原地更新）。
 
-        设计（Plan.md 假设 7）：
+        设计：
           - LLM 只负责语义评估（四维打分），不擅长精确数学
           - composite_score 是「求和 + tanh 压缩」得到的有符号连续强度信号：
                 raw = Σ_i (impact_i + gap_i) * timeliness_i * certainty_i

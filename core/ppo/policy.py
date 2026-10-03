@@ -6,7 +6,7 @@ PPO 策略网络（policy）
   - 阶段一：标准 ActorCriticPolicy + NumericExtractor（忽略 llm 分支，见 make_stage1_policy_kwargs）
   - 阶段二：ResidualLLMPolicy —— 冻结主干 + actor/critic 双旁路（residual adapter）
 
-关键设计（见 Plan_v2.md 阶段 6B）：
+关键设计：
   1. 主干永远只吃 numeric(13)，两阶段 features_dim 一致 → 主干权重可直接迁移。
   2. actor 与 critic 各挂一个旁路：critic 若看不到 LLM 特征，advantage A=Q−V 会系统性有偏。
   3. 旁路末层 zero-init → 阶段二起点严格等于阶段一策略，从零学「修正量」。
@@ -58,7 +58,7 @@ def make_stage1_policy_kwargs(net_arch: Optional[List[int]] = None) -> Dict:
     return {
         "features_extractor_class": NumericExtractor,
         "net_arch": net_arch or [64, 64],
-        "activation_fn": nn.Tanh,   # 对齐 Plan_v2「64×64 tanh 网络」
+        "activation_fn": nn.Tanh,   # 两层 64 单元 tanh 网络。
     }
 
 

@@ -63,7 +63,7 @@ class LLMCacheDB:
                 )
             """)
             
-            # 存量库迁移：旧表无 composite_score 列时补加（Plan.md 假设 7 B 档）
+            # 存量库迁移：旧表无 composite_score 列时补加。
             cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_analysis_cache)")}
             if "composite_score" not in cols:
                 conn.execute("ALTER TABLE llm_analysis_cache ADD COLUMN composite_score REAL")

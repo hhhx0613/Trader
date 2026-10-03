@@ -37,8 +37,6 @@ def _segment_bounds_for_grid(date: pd.Timestamp, anchor: pd.Timestamp, seg_days:
 
     段边界只依赖全局锚点 anchor 和段长 seg_days，与请求起点无关，
     因此不同区间/不同时间拉取都落在同一批段文件，天然去重、可跨回测复用。
-    见 Plan.md 假设 4。
-
     例：anchor=2020-01-06(周一), seg_days=14 →
         2026-07-06 属于段 [2026-07-06, 2026-07-19]。
     """

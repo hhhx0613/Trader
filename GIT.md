@@ -13,4 +13,4 @@
 
 ## 回测记录检查
 
-13. 若本次提交包含回测结果，确认 `docs/experiment_index.csv` 和自动生成的 `docs/backtest_report.md` 已随回测更新并纳入暂存；无需另建推送台账。
+13. 若本次提交包含回测结果，确认 `docs/experiment_index.csv` 与对应 `output/backtest_<run_id>/manifest.json` 已随回测更新并纳入暂存；无需另建推送台账。

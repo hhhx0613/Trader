@@ -1,7 +1,7 @@
 """
 多股票回测引擎（MultiStockBacktestEngine）
 
-Plan.md 阶段 3 对应：
+当前回测基线：
   - 支持持有 K 只等权标的
   - 按调仓周期（每 N 个交易日）执行调仓
   - 信号时序：T-1 收盘生成信号 → T 开盘执行（防前视偏差）
@@ -135,7 +135,7 @@ class MultiStockBacktestEngine(BaseBacktestEngine):
         for i, current_date in enumerate(all_dates):
             if getattr(config, "REBALANCE_WEEKLY", False):
                 # 每个自然周（ISO 周）的第一个可交易日调仓：调仓日按日历固定，
-                # 不随回测起点漂移 → LLM 缓存 key 稳定、跨回测复用（Plan.md 假设 5）
+                # 不随回测起点漂移 → LLM 缓存 key 稳定、跨回测复用。
                 iso = current_date.isocalendar()
                 week_key = (iso[0], iso[1])
                 is_rebalance_day = (week_key != prev_week_key)

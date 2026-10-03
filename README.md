@@ -1,26 +1,26 @@
-# 量化交易 LLM 系统
+# 可审计量化研究与模拟执行系统
 
-LLM 负责新闻/事件选股；周频 PPO 或波动率目标公式决定总暴露；规则风控只缩减或否决交易。目标是用可复现回测验证模块是否有增量价值，而非预设其有效。
+当前仓库保留 LLM、VADER 和 PPO 的统一回测基线；项目将逐步演进为从 PIT 数据研究到模拟执行的可审计多 Agent 应用。目标不是直接追求收益最大化，而是让每一项决策都能追溯其可得证据、研究论点、风险审查、成本约束和最终结果。
 
-## 当前状态
+权威开发计划见 [docs/Plan.md](docs/Plan.md)；毕设研究叙事见 [docs/agent_application_proposal.md](docs/agent_application_proposal.md)；历史实验以 [docs/experiment_index.csv](docs/experiment_index.csv) 为唯一结构化登记册。
 
-- LLM Top-K、VADER、Buy & Hold、公式暴露和 PPO Top-K 已接入统一回测入口。
-- PPO 训练/部署已对齐周频、逆波动率、真实成本、T+1 开盘成交、R1/R1a 单标的止损和 R2 当日禁买。
-- PPO 尚未通过 Go/No-Go：仍缺多种子、滚动样本外和 block bootstrap。
-- LLM alpha 尚未获证明；现有 alpha 审计的 LLM 结果为空，不能得出 LLM 无效的结论。
-- 权威架构见 [`docs/Plan_v2.md`](docs/Plan_v2.md)，待办见 [`docs/待修改清单.md`](docs/待修改清单.md)。
+## 当前基线
 
-## 架构
+- 统一回测入口包含 LLM Top-K、VADER、Buy & Hold、公式总暴露与 PPO Top-K。
+- LLM/VADER 只使用决策日可得的 PIT 新闻；交易按 T+1 开盘执行。
+- 个股权重使用逆波动率；PPO 或波动率目标公式控制组合总暴露；R1/R1a/R2 规则负责硬风控。
+- PPO 尚未通过多随机种子、滚动样本外和 block bootstrap 的 Go/No-Go 验证。
+- LLM alpha 尚未被充分证明；现有结果只能作为待复核基线，不能视为论文结论。
+
+## 目标架构
 
 ```text
-PIT 新闻/财报 → LLM 个股事件评分 → Top-K 选股
-                                      ↓
-市场数值特征 + 账户状态 → PPO 或波动率目标公式 → 总暴露
-                                      ↓
-                         逆波动率权重 → R1/R1a/R2 风控 → T+1 开盘执行
+PIT 数据 → EvidenceCard → 个股研究 Agent → ClaimCard
+        → 全局组合委员会 → PortfolioPolicy → 风控与成本门控
+        → 模拟执行 → OutcomeCard 与校准记忆
 ```
 
-`LLM Top-K` 与 `PPO Top-K` 使用相同选股和个股权重，只替换总暴露，形成 PPO 的干净 A/B。
+原始证据、LLM 论点和交易动作将严格分层。最终系统不固定 Top-K：委员会可在全股票池和当前持仓上下文中选择买入、持有、减仓、卖出或观望；确定性组合政策、成本模型和风险引擎将意图转换为可执行的股票加现金权重。
 
 ## 环境
 
@@ -32,7 +32,11 @@ conda activate trader
 pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env`，按需配置 `DEEPSEEK_API_KEY`、`ALPHA_VANTAGE_API_KEY`、`FINNHUB_API_KEY` 和 `GLM_API_KEY`。不要提交 `.env`、缓存或密钥。
+复制 `.env.example` 为 `.env`，按数据源和模型需要配置 `DEEPSEEK_API_KEY`、`ALPHA_VANTAGE_API_KEY`、`FINNHUB_API_KEY` 和 `GLM_API_KEY`。不要提交 `.env`、缓存或密钥。
+
+## 测试缓存
+
+pytest 的跨会话缓存已禁用，避免当前 Windows 环境遗留 `.pytest_cache` 或 `pytest-cache-files-*` 临时目录；这不影响测试运行。
 
 ## 运行回测
 
@@ -53,51 +57,31 @@ python scripts/run_backtest.py \
 - `--baseline-strategy "LLM Top-K"`：计算同次相对差值的基线。
 - `--status provisional|valid|invalid|retired`：未经审阅时使用 `provisional`。
 
-默认是 10 股候选池、Top-K=5、ISO 周调仓。PPO 模型不存在时会明确跳过 PPO 路径。
+当前基线默认使用 10 只候选股票、Top-K=5 和 ISO 周调仓；这不是目标 Agent 系统的持股数量限制。
 
-## 输出与论文溯源
+## 输出与实验治理
 
 每次运行建立不可覆盖的 `output/backtest_<run_id>/`：
 
-- `summary`：策略绩效；`equity`：净值曲线；`trades`：交易明细。
-- `decisions`：目标/实际暴露、回撤与 R2 状态（如有）。
-- `report`：单次摘要；`manifest.json`：参数、Git 状态、数据指纹、模型哈希、目的、改动和局限性。
+- `summary`、`equity`、`trades`、`decisions`：策略原始证据。
+- `report`：该次运行的人工审阅摘要。
+- `manifest.json`：参数、Git 状态、数据指纹、模型哈希、目的、改动和已知局限。
 
-同时自动更新：
-
-- [`docs/experiment_index.csv`](docs/experiment_index.csv)：唯一结构化登记册；一行是“实验 × 策略”。前列为状态、目的、收益、夏普、回撤、相对 LLM 差值、改动和问题。
-- [`docs/backtest_report.md`](docs/backtest_report.md)：自动生成的阅读版对比报告，先给关键指标，后给溯源细节。
-
-原始 CSV 留在本地 `output/` 作为证据；Git 版本化 `manifest.json`、登记册和总报告。缺元数据的历史运行标为 `historical_incomplete`，不能作为论文有效结论。
-
-## 当前结果如何解读
-
-- 旧日频 PPO 为 `retired`：训练环境和真实回测口径不一致。
-- 周频对齐 PPO 为 `provisional`：相对公式 LLM 基线累计收益约 +1.25 个百分点、夏普持平，不能宣称优势。
-- 当前同口径一年基线：LLM +9.50%、夏普 0.79；真实 VADER +6.25%、夏普 0.38。旧 VADER +12.04% 使用了全历史新闻累积，已废弃。
-- 2026-09-22 PPO 调试运行均为 `historical_incomplete`，仅供诊断。
-- Buy & Hold 的风险暴露不同，不能直接用绝对收益推导选股 alpha。
-
-详细结果见 [`docs/backtest_report.md`](docs/backtest_report.md)。
+回测同时追加 [docs/experiment_index.csv](docs/experiment_index.csv)。`provisional`、`invalid`、`retired` 或 `historical_incomplete` 记录只用于追溯，不能直接作为论文有效结论。项目不再维护会与登记册漂移的全局 Markdown 回测报告。
 
 ## 项目结构
 
 ```text
-agents/                     LLM、VADER、Top-K 决策
-core/                       数据、指标、回测、风控、PPO
-scripts/run_backtest.py     统一回测入口
-scripts/train_ppo.py        PPO 训练入口
-models/                     PPO 模型归档
-docs/Plan_v2.md             权威架构与决策
-docs/experiment_index.csv   自动维护的实验登记册
-docs/backtest_report.md     自动生成的对比报告
-output/                     原始回测证据
-data/cache/                 本地缓存（不提交 Git）
+agents/                         LLM、VADER 与当前 Top-K 决策
+core/                           数据、指标、回测、风控与 PPO
+scripts/run_backtest.py         统一回测入口
+scripts/train_ppo.py            PPO 训练入口
+models/                         PPO 模型归档
+docs/Plan.md                    唯一权威开发计划
+docs/agent_application_proposal.md  毕设研究提案
+docs/experiment_index.csv       实验结构化登记册
+output/                         单次回测原始证据
+data/cache/                     本地缓存（不提交 Git）
 ```
 
-## 后续优先级
-
-1. 修复并重做 LLM alpha 审计。
-2. 完成 PPO 多种子、滚动样本外与 bootstrap Go/No-Go 验收。
-3. 补齐模型训练元数据与关键确定性测试。
-4. Gate 结论明确后，清理或归档 Stage 2、多 Agent、IBKR 等非主路径内容。
+后续工作顺序以 [docs/development_plan.md](docs/development_plan.md) 的阶段任务为准。

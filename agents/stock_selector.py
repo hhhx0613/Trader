@@ -11,7 +11,7 @@
   4. 持有优先：仍在 Top-K 的持仓不动，只替换掉出榜的
   5. 返回：选中的 K 只股票 + 各自 composite_score 和 confidence
 
-Plan.md 阶段 3 对应：
+当前回测基线：
   - 选股(每周)：LLM 分析候选池 → 按 composite_score × confidence 排序返回 Top-K(默认 K=5)
   - 不足 K 只达标则减少持仓数，全不达标则空仓
   - 持有优先：仍在 Top-K 的持仓不动，只替换掉出榜的

@@ -4,7 +4,7 @@ PPO 训练环境（env）
 一个「周频总仓位决策」的 gymnasium 环境：每周调仓日 PPO 观察 numeric(13)+llm(5)，
 输出 5 档暴露 {0/25/50/75/100%}，环境按逆波动率权重配置组合、扣逐资产换手成本、给出差分夏普奖励。
 
-口径对齐真实回测（见 Plan_v2 阶段 6A，消除 env→真实回测的迁移鸿沟）：
+口径对齐真实回测（消除 env→真实回测的迁移鸿沟）：
   - 个股权重：逆波动率加权（σ=ATR/close），对齐 decision_func._position_sizing
   - 决策频率：周频（每 step = 一个 ISO 周，周内逐日累乘收益）
   - 持仓子池：默认 config.TOP_K 只，对齐真实回测选股数
@@ -32,7 +32,7 @@ from core.ppo.features import (
     NUMERIC_DIM, LLM_DIM, build_numeric_obs, zeros_llm, _LOOKBACK,
 )
 
-# 动作 → 总暴露档位（对齐 Plan_v2「离散 5 档 {0/25/50/75/100%}」）
+# 动作 → 总暴露档位：离散 5 档 {0/25/50/75/100%}。
 EXPOSURE_LEVELS = np.array([0.0, 0.25, 0.50, 0.75, 1.00], dtype=np.float32)
 
 # 单位成交额成本：滑点 + 换手惩罚；固定佣金按订单数折算到归一化账户。
@@ -139,7 +139,7 @@ class PPOEnv(gym.Env):
         if len(self._weeks) - 1 <= self._min_start_week + self._min_ep_weeks:
             raise ValueError(
                 f"行情数据太短（{len(self._all_dates)} 天 / {len(self._weeks) - 1} 个可执行周周期），"
-                f"不足以支撑 episode 随机化；请扩充历史数据（Plan_v2 建议 2015 至今）")
+                f"不足以支撑 episode 随机化；请扩充历史数据（建议 2015 至今）")
 
         # 观测/动作空间（两阶段结构一致，阶段一 llm 恒 0）
         self.observation_space = spaces.Dict({

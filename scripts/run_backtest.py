@@ -37,7 +37,6 @@ from core import config
 # 指标预热期（日历天数）：60 天覆盖 RSI/ADX 的预热窗口
 INDICATOR_WARMUP_DAYS = 60
 _REGISTRY_PATH = Path(_PROJECT_ROOT) / "docs" / "experiment_index.csv"
-_REPORT_PATH = Path(_PROJECT_ROOT) / "docs" / "backtest_report.md"
 
 _REGISTRY_COLUMNS = [
     "experiment_id", "status", "purpose", "strategy", "cumulative_return", "sharpe",
@@ -305,59 +304,8 @@ def _registry_rows(metadata, metrics_by_strategy, output_dir):
     return rows
 
 
-def _render_experiment_report(rows):
-    """从结构化登记册重建可读报告，避免手工报告和实验数据漂移。"""
-    groups = {}
-    for row in rows:
-        groups.setdefault(row["experiment_id"], []).append(row)
-
-    lines = [
-        "# 回测对比报告",
-        "",
-        "> 本文件由 `docs/experiment_index.csv` 自动生成，请勿手工编辑。",
-        "> `provisional`、`invalid` 和 `retired` 结果仅用于追溯，不得直接作为论文有效结论。",
-        "",
-        "## 关键对比",
-        "",
-        "| 实验 | 状态 | 策略 | 累计收益 | 夏普 | 最大回撤 | 相对 LLM 收益 | 相对 LLM 夏普 |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    percent = lambda value: "N/A" if value in (None, "") else f"{float(value):.2%}"
-    number = lambda value: "N/A" if value in (None, "") else f"{float(value):.2f}"
-    for row in sorted(rows, key=lambda item: (item["created_at"], item["experiment_id"], item["strategy"]), reverse=True):
-        lines.append(
-            f"| {row['experiment_id']} | {row['status']} | {row['strategy']} | "
-            f"{percent(row['cumulative_return'])} | {number(row['sharpe'])} | "
-            f"{percent(row['max_drawdown'])} | {percent(row['delta_return_vs_baseline'])} | "
-            f"{number(row['delta_sharpe_vs_baseline'])} |"
-        )
-    lines.append("")
-    for experiment_id, group in sorted(groups.items(), key=lambda item: item[1][0]["created_at"], reverse=True):
-        first = group[0]
-        lines.extend([
-            f"## {experiment_id}",
-            "",
-            f"- 时间：{first['created_at']}；状态：{first['status']}；区间：{first['test_period']}",
-            f"- 目的：{first['purpose']}",
-            f"- 改动：{first['change_note']}",
-            f"- 已知问题：{first['known_limitations']}",
-            f"- 证据：`{first['manifest_path']}`；代码：`{first['code_revision']}`；工作区脏：{first['git_dirty']}",
-            "",
-            "| 策略 | 累计收益 | 夏普 | 最大回撤 | 相对同次基线收益 | 相对同次基线夏普 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
-        ])
-        for row in group:
-            lines.append(
-                f"| {row['strategy']} | {percent(row['cumulative_return'])} | "
-                f"{number(row['sharpe'])} | {percent(row['max_drawdown'])} | "
-                f"{percent(row['delta_return_vs_baseline'])} | {number(row['delta_sharpe_vs_baseline'])} |"
-            )
-        lines.append("")
-    _REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
-
-
 def register_experiment(metadata, metrics_by_strategy, output_dir):
-    """追加结构化登记册并重建阅读版报告；任何单项失败都应使回测显式失败。"""
+    """追加结构化实验登记册；任何单项失败都应使回测显式失败。"""
     rows = _registry_rows(metadata, metrics_by_strategy, output_dir)
     _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
     existing_rows = []
@@ -376,9 +324,6 @@ def register_experiment(metadata, metrics_by_strategy, output_dir):
         writer = csv.DictWriter(file, fieldnames=_REGISTRY_COLUMNS)
         writer.writeheader()
         writer.writerows(all_rows)
-    _render_experiment_report(all_rows)
-
-
 def _write_report(path, metrics_by_strategy, metadata):
     """写入本次实验的简要 Markdown 摘要，供人工审阅。"""
     lines = [

@@ -1,7 +1,7 @@
 """
 决策函数：把 LLM 分析结果转换为交易决策
 
-Plan.md 阶段 3 决策逻辑：
+当前回测基线决策逻辑：
   1. 选股(每周)：LLM 分析候选池 → 按 composite_score × confidence 排序选出 Top-K
      - composite_score（代码从 per_news 确定性计算）：信号方向+强度
      - confidence（LLM 评估的证据质量）：信号可信度
