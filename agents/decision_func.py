@@ -32,8 +32,8 @@ import pandas as pd
 from typing import Dict, List, Set
 from agents.stock_selector import select_top_k, DEFAULT_CANDIDATE_POOL
 from core import config
-from core.data.sentiment import SentimentAnalyzer
-from core.data.news_data import get_news_at_date
+from core.legacy.sentiment import SentimentAnalyzer
+from core.legacy.news_data import get_news_at_date
 
 
 def _stock_daily_vol(stock_state: Dict) -> float:

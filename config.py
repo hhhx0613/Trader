@@ -45,6 +45,15 @@ MARKET_CACHE_DIR = CACHE_DIR / "market"
 NEWS_CACHE_DIR = CACHE_DIR / "news"
 NEWS_CACHE_COMPLETE_DIR = NEWS_CACHE_DIR / "complete"      # 已完成的段（回测用）
 NEWS_CACHE_INCOMPLETE_DIR = NEWS_CACHE_DIR / "incomplete"  # 未完成的段（实盘增量用）
+# SEC EDGAR 工作缓存（submissions/companyfacts 等 JSON）；审计权威在主线存储
+FILINGS_CACHE_DIR = CACHE_DIR / "filings"
+
+# ==================== 主线研究存储 ====================
+# 主线数据流：fetch → raw 正文库（按源分库）→ EvidenceCard（账本）→ Agent。
+# data/cache/ 下的旧 CSV/JSON 是旧基线工作副本，主线不读取。
+RESEARCH_DIR = PROJECT_ROOT / "data" / "research"
+RESEARCH_RAW_DIR = RESEARCH_DIR / "raw"          # news.db / market.db / filings.db
+RESEARCH_LEDGER_PATH = RESEARCH_DIR / "ledger.db"  # 审计账本（卡片/快照/研究对象）
 
 # 回测输出目录（净值曲线、交易记录、评估报告）
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -62,6 +71,7 @@ MARKET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NEWS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NEWS_CACHE_COMPLETE_DIR.mkdir(parents=True, exist_ok=True)
 NEWS_CACHE_INCOMPLETE_DIR.mkdir(parents=True, exist_ok=True)
+FILINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

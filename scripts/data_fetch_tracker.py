@@ -60,7 +60,7 @@ def compute_segments(start_date: str, end_date: str, segment_days: int) -> List[
     返回: [(seg_start, seg_end), ...]
     """
     import pandas as pd
-    from core.data.news_data import _split_into_segments
+    from core.legacy.news_data import _split_into_segments
 
     # 使用网格对齐的段拆分
     return _split_into_segments(start_date, end_date)
@@ -252,7 +252,7 @@ def fetch_missing_segments(progress: Dict, limit: int = 25) -> int:
     返回实际拉取次数。
     """
     # 导入拉取函数
-    from core.data.news_data import _try_alpha_vantage_news, _save_cache
+    from core.legacy.news_data import _try_alpha_vantage_news, _save_cache
 
     stocks_with_missing = [s for s in STOCKS if progress["stocks"][s]["missing_count"] > 0]
     if not stocks_with_missing:

@@ -25,8 +25,8 @@ import subprocess
 
 import pandas as pd
 
-from core.data.market_data import fetch_ohlcv
-from core.data.news_data import fetch_news
+from core.legacy.market_data import fetch_ohlcv
+from core.legacy.news_data import fetch_news
 from core.indicators import compute_all_indicators
 from core.multi_stock_engine import MultiStockBacktestEngine
 from core.recorder import Recorder

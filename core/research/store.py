@@ -16,14 +16,22 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from .contracts import EvidenceCard, ResearchSnapshot
+from .contracts import (
+    ClaimCard,
+    EvidenceCard,
+    PortfolioIntent,
+    ResearchPacket,
+    ResearchSnapshot,
+    ThesisBook,
+)
 
 
 OBJECT_TABLES = (
+    # 表集合包含后续阶段对象；阶段 4-6 启动时只需补契约类与 typed 方法，不再改表结构。
     "traces", "snapshots", "evidence_cards", "claim_cards", "research_packets",
-    "portfolio_intents", "intent_constraints", "target_portfolios",
+    "thesis_books", "portfolio_intents", "intent_constraints", "target_portfolios",
     "risk_projected_portfolios", "order_plans", "deferred_trades", "fills",
     "outcome_cards", "review_labels",
 )
@@ -52,18 +60,34 @@ class ResearchLedger:
         return conn
 
     def _migrate(self) -> None:
+        # 迁移按版本递增；已有库只补新增版本，不重建历史表。
         with self._connect() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-            if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 1").fetchone():
-                return
-            conn.execute("CREATE TABLE traces (trace_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT)")
-            for table in OBJECT_TABLES[1:]:
-                conn.execute(
-                    f"CREATE TABLE {table} (object_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL REFERENCES traces(trace_id), payload TEXT NOT NULL, created_at TEXT NOT NULL)"
-                )
-                conn.execute(f"CREATE INDEX idx_{table}_trace_id ON {table}(trace_id)")
-            conn.execute("CREATE TABLE gateway_queries (query_id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL REFERENCES traces(trace_id), snapshot_id TEXT NOT NULL, symbol TEXT NOT NULL, query_kind TEXT NOT NULL, requested_at TEXT NOT NULL, result_count INTEGER NOT NULL)")
-            conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))")
+            applied = {row["version"] for row in conn.execute("SELECT version FROM schema_migrations")}
+            if 1 not in applied:
+                conn.execute("CREATE TABLE traces (trace_id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT)")
+                for table in OBJECT_TABLES[1:]:
+                    conn.execute(
+                        f"CREATE TABLE {table} (object_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL REFERENCES traces(trace_id), payload TEXT NOT NULL, created_at TEXT NOT NULL)"
+                    )
+                    conn.execute(f"CREATE INDEX idx_{table}_trace_id ON {table}(trace_id)")
+                conn.execute("CREATE TABLE gateway_queries (query_id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL REFERENCES traces(trace_id), snapshot_id TEXT NOT NULL, symbol TEXT NOT NULL, query_kind TEXT NOT NULL, requested_at TEXT NOT NULL, result_count INTEGER NOT NULL)")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))")
+            if 2 not in applied:
+                # ThesisBook 未列入 v1 建表清单；契约冻结时补表，IF NOT EXISTS 保证新旧库一致。
+                conn.execute("CREATE TABLE IF NOT EXISTS thesis_books (object_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL REFERENCES traces(trace_id), payload TEXT NOT NULL, created_at TEXT NOT NULL)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_thesis_books_trace_id ON thesis_books(trace_id)")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (2, datetime('now'))")
+            if 3 not in applied:
+                # 全局卡注册表（"一条事实一张卡"）：按 content_hash+symbol 查已建卡片，
+                # 后续轮次的 Snapshot 复用旧卡 ID 而不重复建行。
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_content_hash ON evidence_cards(json_extract(payload, '$.content_hash'))")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))")
+            if 4 not in applied:
+                # freeze_snapshot 按窗口选卡：datetime() 归一不同时区偏移的 ISO 串后
+                # 可比较/排序；symbol 随小表扫描过滤，不另建索引。
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_available_at ON evidence_cards(datetime(json_extract(payload, '$.available_at')))")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))")
 
     @staticmethod
     def _dump(value: Any) -> str:
@@ -85,6 +109,34 @@ class ResearchLedger:
     def append_evidence(self, evidence: EvidenceCard) -> None:
         self._append("evidence_cards", evidence.evidence_id, evidence.trace_id, evidence.model_dump(mode="json"), evidence.created_at)
 
+    # 以下 typed append/get 方法与契约类一一对应；禁止绕过它们直接拼 SQL 写入对象表。
+
+    def append_claim(self, claim: ClaimCard) -> None:
+        self._append("claim_cards", claim.claim_id, claim.trace_id, claim.model_dump(mode="json"), claim.created_at)
+
+    def get_claim(self, claim_id: str) -> ClaimCard:
+        return ClaimCard.model_validate_json(self._get("claim_cards", claim_id)["payload"])
+
+    def append_packet(self, packet: ResearchPacket) -> None:
+        self._append("research_packets", packet.packet_id, packet.trace_id, packet.model_dump(mode="json"), packet.created_at)
+
+    def get_packet(self, packet_id: str) -> ResearchPacket:
+        return ResearchPacket.model_validate_json(self._get("research_packets", packet_id)["payload"])
+
+    def append_thesis_book(self, book: ThesisBook) -> None:
+        self._append("thesis_books", book.thesis_book_id, book.trace_id, book.model_dump(mode="json"), book.created_at)
+
+    def get_thesis_book(self, thesis_book_id: str) -> ThesisBook:
+        return ThesisBook.model_validate_json(self._get("thesis_books", thesis_book_id)["payload"])
+
+    def append_intent(self, intent: PortfolioIntent) -> None:
+        self._append("portfolio_intents", intent.intent_id, intent.trace_id, intent.model_dump(mode="json"), intent.created_at)
+
+    def get_intent(self, intent_id: str) -> PortfolioIntent:
+        return PortfolioIntent.model_validate_json(self._get("portfolio_intents", intent_id)["payload"])
+
+    # 组合/订单/复盘契约的 append/get 在阶段 4-6 定义对应契约类时一并补，不提前留空方法。
+
     def _append(self, table: str, object_id: str, trace_id: str, payload: dict[str, Any], created_at: datetime) -> None:
         if table not in OBJECT_TABLES[1:]:
             raise ValueError(f"unsupported ledger table: {table}")
@@ -102,8 +154,37 @@ class ResearchLedger:
         row = self._get("evidence_cards", evidence_id)
         return EvidenceCard.model_validate_json(row["payload"])
 
+    def find_evidence_by_content(self, content_hash: str, symbol: str) -> EvidenceCard | None:
+        """全局卡查找：同一内容在同一标的下只应有一张卡。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM evidence_cards WHERE json_extract(payload, '$.content_hash') = ? AND json_extract(payload, '$.symbol') = ?",
+                (content_hash, symbol.upper()),
+            ).fetchone()
+        return EvidenceCard.model_validate_json(row["payload"]) if row else None
+
     def list_evidence(self, snapshot: ResearchSnapshot, symbol: str) -> list[EvidenceCard]:
         return [self.get_evidence(item) for item in snapshot.evidence_ids if self.get_evidence(item).symbol == symbol]
+
+    def select_evidence(self, *, symbols: Iterable[str], available_from: datetime, available_to: datetime) -> list[EvidenceCard]:
+        """卡片池选卡：按标的与可得时间闭窗口 [from, to] 筛选，供 freeze_snapshot 使用。
+
+        比较走 datetime() UTC 归一，不受写入时的时区偏移写法影响；结果按
+        可得时间升序 + object_id 稳定排序，保证同一库同一窗口重放选出同一清单。
+        """
+        pool = tuple(str(symbol).strip().upper() for symbol in symbols)
+        if not pool or any(not symbol for symbol in pool):
+            raise ValueError("select_evidence requires at least one non-empty symbol")
+        placeholders = ",".join("?" for _ in pool)
+        available = "datetime(json_extract(payload, '$.available_at'))"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT payload FROM evidence_cards WHERE json_extract(payload, '$.symbol') IN ({placeholders}) "
+                f"AND {available} >= datetime(?) AND {available} <= datetime(?) "
+                f"ORDER BY {available}, object_id",
+                (*pool, available_from.isoformat(), available_to.isoformat()),
+            ).fetchall()
+        return [EvidenceCard.model_validate_json(row["payload"]) for row in rows]
 
     def record_query(self, *, trace_id: str, snapshot_id: str, symbol: str, query_kind: str, result_count: int, requested_at: datetime) -> None:
         with self._connect() as conn:

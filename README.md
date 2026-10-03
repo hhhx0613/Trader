@@ -32,7 +32,7 @@ conda activate trader
 pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env`，按数据源和模型需要配置 `DEEPSEEK_API_KEY`、`ALPHA_VANTAGE_API_KEY`、`FINNHUB_API_KEY` 和 `GLM_API_KEY`。不要提交 `.env`、缓存或密钥。
+复制 `.env.example` 为 `.env`，按数据源和模型需要配置 `DEEPSEEK_API_KEY`、`ALPHA_VANTAGE_API_KEY`、`FINNHUB_API_KEY`、`GLM_API_KEY` 和 `SEC_USER_AGENT`。`SEC_USER_AGENT` 必须是含联系邮箱的应用标识，例如 `TraderResearch/0.1 name@example.com`。不要提交 `.env`、缓存或密钥。
 
 ## 测试缓存
 
@@ -41,10 +41,22 @@ pytest 的跨会话缓存已禁用，避免当前 Windows 环境遗留 `.pytest_
 阶段一研究数据层的离线回归测试：
 
 ```bash
-python -m pytest tests/research/test_stage1_snapshot.py -q
+python -m pytest tests/research -q
 ```
 
-它验证 PIT 拒绝、转载去重、冻结 Snapshot 的离线读取、内容哈希定位与 DataGateway 查询审计。该路径不导入 LangGraph、cvxpy 或 PPO 依赖。
+它验证阶段 0 冻结契约的账本往返与确定拒绝（引用约束、路由分支、原因码、权重字段禁区），以及 PIT 拒绝、转载去重、建卡/冻结双入口与 `select_evidence` 池选卡、内容哈希定位、DataGateway 查询审计与新闻采集的段粒度（历史整段网格省配额，未走完的段拆为已收口的单日段）。该路径不导入 LangGraph、cvxpy 或 PPO 依赖。
+
+## 研究数据采集（阶段 1 主线）
+
+```bash
+python scripts/capture_research_snapshot.py --pool NVDA   # 单票完整轮：采集 -> 建卡 -> 冻结
+python scripts/capture_research_snapshot.py --no-snapshot # 每日节奏：只建卡入池，不冻结
+python scripts/capture_research_snapshot.py --as-of 2026-10-01T18:00:00+00:00  # 历史时点回放
+```
+
+- 实盘模式（不传 `--as-of`）在全部采集完成后才定决策时点，本轮到达的数据本轮即可用；回放模式时点钉死，本轮新拉数据被 PIT 闸门拒绝。
+- 产出全部落 `data/research/`：正文分库（news/market/filings.db，内容寻址 append-only）与账本 ledger.db（卡片/快照/trace）；`data/cache/` 下另有可弃的网络备忘层（如 SEC 应答 JSON），不是事实存储。
+- 配额与节奏：Alpha Vantage 免费档 25 次/天、段间 15s 节流；coverage 台账记住“问过哪段”不重烧。Windows 下建议直调环境内 `python.exe`（`conda run` 会吞输出）。
 
 ## 运行回测
 
@@ -83,8 +95,9 @@ python scripts/run_backtest.py \
 agents/                         LLM、VADER 与当前 Top-K 决策
 core/                           数据、指标、回测、风控与 PPO
 core/research/                  PIT Snapshot、原始载荷、审计账本与只读 DataGateway
-tests/research/                 阶段一离线数据与审计回归测试
+tests/research/                 阶段 0/1 契约、离线数据与审计回归测试
 scripts/run_backtest.py         统一回测入口
+scripts/capture_research_snapshot.py  研究数据采集/建卡/冻结入口
 scripts/train_ppo.py            PPO 训练入口
 models/                         PPO 模型归档
 docs/Plan.md                    唯一权威开发计划
@@ -92,6 +105,7 @@ docs/agent_application_proposal.md  毕设研究提案
 docs/experiment_index.csv       实验结构化登记册
 output/                         单次回测原始证据
 data/cache/                     本地缓存（不提交 Git）
+data/research/                  三类研究数据的原始载荷和审计账本（不提交 Git）
 ```
 
 后续工作顺序以 [docs/development_plan.md](docs/development_plan.md) 的阶段任务为准。

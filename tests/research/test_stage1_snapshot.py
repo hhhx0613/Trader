@@ -25,7 +25,8 @@ AS_OF = datetime(2026, 10, 3, 20, tzinfo=timezone.utc)
 def build(tmp_path, records):
     ledger = ResearchLedger(tmp_path / "research_ledger.db")
     builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
-    snapshot = builder.build(trace_id="trace-1", as_of=AS_OF, symbols=["aapl"], source_versions={"news": "fixture-v1"}, account_state={"cash": 1000}, records=records)
+    cards = builder.ingest_records(trace_id="trace-1-ingest", as_of=AS_OF, records=records)
+    snapshot = builder.freeze_snapshot(trace_id="trace-1", as_of=AS_OF, symbols=["aapl"], source_versions={"news": "fixture-v1"}, account_state={"cash": 1000}, evidence_ids=tuple(card.evidence_id for card in cards))
     return ledger, snapshot
 
 
@@ -41,7 +42,10 @@ def test_snapshot_is_offline_replayable_and_gateway_is_audited(tmp_path):
     cards = DataGateway(ledger).evidence_for_symbol(snapshot_id=snapshot.snapshot_id, symbol="AAPL", as_of=AS_OF)
     assert restored.model_dump(mode="json") == snapshot.model_dump(mode="json")
     assert len(cards) == 1
-    assert (tmp_path / cards[0].raw.relative_path).is_file()
+    # 指针形态：news://<sha256>，正文在分库中可完整取回并验哈希
+    assert cards[0].raw.relative_path == f"news://{cards[0].raw.sha256}"
+    payload = RawPayloadStore(tmp_path / "raw").get(cards[0].raw)
+    assert payload["title"] == "Earnings beat"
 
 
 @pytest.mark.parametrize("record, code", [(news(available_at=AS_OF + timedelta(seconds=1)), "future_data"), (news(available_at=None), "missing_available_at")])
@@ -69,3 +73,27 @@ def test_completed_trace_is_append_only(tmp_path):
     ledger, snapshot = build(tmp_path, [news()])
     with pytest.raises(ValueError, match="not writable"):
         ledger.append_snapshot(snapshot)
+
+
+def test_freeze_selects_cards_from_pool_by_window(tmp_path):
+    """建卡与冻结分离：每日 ingest 积累的卡片池，决策日按可得窗口选卡冻结。"""
+    ledger = ResearchLedger(tmp_path / "research_ledger.db")
+    builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
+    old = news(title="stale story", url="https://example.test/old", published_at=AS_OF - timedelta(days=30), available_at=AS_OF - timedelta(days=30))
+    builder.ingest_records(trace_id="ingest-1", as_of=AS_OF - timedelta(days=3), records=[old])
+    fresh = news(title="fresh story", url="https://example.test/new", published_at=AS_OF - timedelta(hours=2), available_at=AS_OF - timedelta(hours=1))
+    builder.ingest_records(trace_id="ingest-2", as_of=AS_OF, records=[fresh])
+
+    snapshot = builder.freeze_snapshot(trace_id="decide-1", as_of=AS_OF, symbols=["AAPL"], source_versions={"news": "fixture-v1"}, account_state={}, available_from=AS_OF - timedelta(days=7))
+    assert len(snapshot.evidence_ids) == 1  # 窗口外的旧卡不入选
+    assert ledger.get_evidence(snapshot.evidence_ids[0]).canonical_url == "https://example.test/new"
+    # 同一窗口重放选出同一清单（确定性排序）
+    again = builder.freeze_snapshot(trace_id="decide-2", as_of=AS_OF, symbols=["AAPL"], source_versions={"news": "fixture-v1"}, account_state={}, available_from=AS_OF - timedelta(days=7))
+    assert again.evidence_ids == snapshot.evidence_ids
+
+
+def test_freeze_without_selection_source_is_rejected(tmp_path):
+    ledger = ResearchLedger(tmp_path / "research_ledger.db")
+    builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
+    with pytest.raises(ValueError, match="evidence_ids or available_from"):
+        builder.freeze_snapshot(trace_id="bad-freeze", as_of=AS_OF, symbols=["AAPL"], source_versions={}, account_state={})

@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .reasons import ReasonCode
 
 
 SCHEMA_VERSION = "1.0"
@@ -27,9 +29,14 @@ def utc_now() -> datetime:
 
 
 class Contract(BaseModel):
-    """阶段一持久化对象的基础字段 / Common fields for persisted Stage-1 objects."""
+    """阶段一持久化对象的基础字段 / Common fields for persisted Stage-1 objects.
 
-    model_config = ConfigDict(frozen=True)
+    ``extra="forbid"`` 是契约边界的一部分：Committee 对象试图携带权重或订单
+    字段时，必须在写入账本前被确定拒绝，而不是靠约定。
+
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: str = SCHEMA_VERSION
     trace_id: str
@@ -41,14 +48,13 @@ class RawReference(BaseModel):
 
     SQLite 只保存路径、哈希和来源，避免把大文本复制进账本；读取方可据此验证
     文件未被篡改。
-
-    SQLite stores only path, hash, and source rather than duplicating large text;
-    readers use the reference to verify that the file has not been altered.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # 字段名为历史包留（旧账本行已序列化为文件路径）；新语义是指针 <kind>://<sha256>，
+    # 正文存在按源分库的 payload 库（news/market/filings.db），多 trace 共享一份字节。
     relative_path: str
     source: str
     received_at: datetime
@@ -94,3 +100,129 @@ class ResearchSnapshot(Contract):
         if len(set(normalized)) != len(normalized):
             raise ValueError("snapshot symbols must be unique")
         return normalized
+
+
+IntentAction = Literal["long", "hold", "reduce", "exit", "abstain"]
+NodeRoute = Literal["proceed", "abstain", "data_request", "human_review", "no_trade", "failed"]
+
+
+class ValueObject(BaseModel):
+    """嵌入持久化契约的冻结值对象 / Frozen embedded value objects, never persisted alone."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class RouteDecision(ValueObject):
+    """图节点的显式路由 / Explicit graph-node routing.
+
+    除 ``proceed`` 外的每条路由必须携带原因码，保证失败分支可审计。
+    """
+
+    node: str = Field(min_length=1)
+    route: NodeRoute
+    reason_code: ReasonCode | None = None
+    detail: str = ""
+
+    @model_validator(mode="after")
+    def require_reason_for_non_proceed(self) -> "RouteDecision":
+        if self.route != "proceed" and self.reason_code is None:
+            raise ValueError("non-proceed route requires a reason_code")
+        return self
+
+
+class CriticVerdict(ValueObject):
+    """Risk Critic 的研究软否决结论 / Soft research veto from the Risk Critic."""
+
+    verdict: Literal["allow", "caution", "abstain", "human_review"]
+    reasons: tuple[str, ...] = ()
+    card_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def require_reasons(self) -> "CriticVerdict":
+        if not self.reasons:
+            raise ValueError("critic verdict requires reasons")
+        return self
+
+
+class ClaimCard(Contract):
+    """Agent 的可审计研究结论 / Cited research claim from one agent.
+
+    引用约束在契约层强制：任何非观望的 Card 至少引用一条支持性 EvidenceCard，
+    否则不允许进入下游对象。
+    """
+
+    claim_id: str = Field(default_factory=lambda: f"cl_{uuid4().hex}")
+    agent: Literal["event", "fundamental", "market"]
+    symbol: str = Field(min_length=1)
+    statement: str = Field(min_length=1)
+    stance: Literal["bullish", "bearish", "neutral"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    supporting_evidence_ids: tuple[str, ...] = ()
+    contradicting_evidence_ids: tuple[str, ...] = ()
+    upstream_card_ids: tuple[str, ...] = ()
+    unknowns: tuple[str, ...] = ()
+    valid_until: datetime | None = None
+
+    @model_validator(mode="after")
+    def require_citation(self) -> "ClaimCard":
+        if not self.supporting_evidence_ids:
+            raise ValueError("claim requires at least one supporting EvidenceCard")
+        return self
+
+
+class ResearchPacket(Contract):
+    """单标的研究汇总 / Per-symbol research bundle for the Committee."""
+
+    packet_id: str = Field(default_factory=lambda: f"rp_{uuid4().hex}")
+    symbol: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    claim_card_ids: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    citation_coverage: float = Field(ge=0.0, le=1.0)
+    critic: CriticVerdict
+    position_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ThesisBook(Contract):
+    """全池 Packet 摘要与调仓差异 / Pool-wide packet digests plus rebalancing deltas.
+
+    Committee 只看这里的内容；原始全文与 Agent 对话不进入该对象。
+    """
+
+    thesis_book_id: str = Field(default_factory=lambda: f"tb_{uuid4().hex}")
+    snapshot_id: str = Field(min_length=1)
+    packet_ids: tuple[str, ...] = Field(min_length=1)
+    portfolio_state: dict[str, Any]
+    regime: str | None = None
+    deltas: dict[str, Any] = Field(default_factory=dict)
+    memory_case_ids: tuple[str, ...] = ()
+
+
+class IntentItem(ValueObject):
+    symbol: str = Field(min_length=1)
+    action: IntentAction
+    strength: int = Field(ge=1, le=3)
+    priority: int = Field(ge=1)
+    horizon_days: int | None = Field(default=None, ge=1)
+    supporting_card_ids: tuple[str, ...] = ()
+    opposing_card_ids: tuple[str, ...] = ()
+    rationale: str = Field(min_length=1)
+    no_trade_reason: str | None = None
+
+
+class PortfolioIntent(Contract):
+    """LLM 研究到组合层的唯一边界 / The only LLM-to-portfolio boundary.
+
+    构造上不存在权重、预期收益或订单字段；任何此类键都会被 extra="forbid" 拒绝。
+    """
+
+    intent_id: str = Field(default_factory=lambda: f"pi_{uuid4().hex}")
+    snapshot_id: str = Field(min_length=1)
+    items: tuple[IntentItem, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_symbols(self) -> "PortfolioIntent":
+        symbols = [item.symbol for item in self.items]
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("intent items must use unique symbols")
+        return self

@@ -9,9 +9,22 @@ audited reads only. Future agents must read snapshots through DataGateway; this
 package neither calls models nor produces intents or orders.
 """
 
-from .contracts import EvidenceCard, ResearchSnapshot
+from .contracts import (
+    ClaimCard,
+    EvidenceCard,
+    PortfolioIntent,
+    ResearchPacket,
+    ResearchSnapshot,
+    RouteDecision,
+    ThesisBook,
+)
 from .gateway import DataGateway
+from .reasons import ReasonCode
 from .snapshot import SnapshotBuilder
 from .store import ResearchLedger
 
-__all__ = ["DataGateway", "EvidenceCard", "ResearchLedger", "ResearchSnapshot", "SnapshotBuilder"]
+__all__ = [
+    "ClaimCard", "DataGateway", "EvidenceCard", "PortfolioIntent",
+    "ReasonCode", "ResearchLedger", "ResearchPacket", "ResearchSnapshot",
+    "RouteDecision", "SnapshotBuilder", "ThesisBook",
+]

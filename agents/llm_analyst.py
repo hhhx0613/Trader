@@ -33,7 +33,7 @@ if _PROJECT_ROOT not in sys.path:
 import utils.logger as log_utils
 logger = log_utils.get_logger(__name__)
 
-from core.data.news_data import get_news_at_date
+from core.legacy.news_data import get_news_at_date
 from core.data.llm_cache_db import get_cache_db
 from utils.llm_client import LLMClient
 

@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from agents.llm_analyst import LLMAnalystAgent
-from core.data.news_data import get_news_at_date
+from core.legacy.news_data import get_news_at_date
 from core import config
 
 # 全局开关：禁用 L1 记忆（消融实验时临时设为 True，需同步清空 LLM 缓存）

@@ -11,6 +11,7 @@ openai>=1.0.0
 python-dotenv>=1.0.0
 vaderSentiment>=3.3.2
 pydantic>=2.10,<3
+pytest>=8,<10
 # 图编排与凸优化在后续阶段启用；阶段一数据路径只声明它们，绝不导入。
 # Graph orchestration and convex allocation arrive in later stages; Stage 1 declares but never imports them.
 langgraph>=0.2,<1

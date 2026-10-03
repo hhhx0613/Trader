@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from core import config
-from core.data.market_data import fetch_ohlcv
+from core.legacy.market_data import fetch_ohlcv
 from core.indicators import compute_all_indicators
 from core.ppo.features import compute_llm_features
 

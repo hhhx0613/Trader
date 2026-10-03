@@ -69,6 +69,8 @@ graph TD
 
 行情风险告警不会直接下单。它只启动临时 DecisionGraph；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate。
 
+建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（DecisionGraph 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死，本轮新拉数据因 available_at 晚于时点被 PIT 闸门拒绝。
+
 #### 3.1.2 一次 DecisionGraph 的执行顺序
 
 ```mermaid
