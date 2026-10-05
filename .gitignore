@@ -19,6 +19,8 @@ build/
 .env
 .env.local
 .env.*.local
+# 决策入口（--mode decide）读取的账户状态：真实现金与持仓，属于本地隐私数据。
+data/account*.json
 
 # ==================== IDE ====================
 .vscode/

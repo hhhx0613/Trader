@@ -22,7 +22,7 @@ nor trade intents.
       │   ├─ validate_available_at      providers.py；缺时间/无时区/晚于 as_of
       │   │                             → 拒绝，错码来自 reasons.ReasonCode
       │   └─ canonical_content_hash     providers.py；转载 URL 不同也算同一事实
-      ├─ seen 集合轮内去重              snapshot.py 自身
+      ├─ seen 集合轮内去重（哈希+标的）    snapshot.py 自身
       ├─ find_evidence_by_content       store.py；命中 -> 复用旧卡，本条结束（不碰正文库）
       ├─ raw_store.put                  raw.py；正文按 kind 入 news/market/filings.db，
       │                                 sha256 主键 INSERT OR IGNORE，返回 RawReference 指针
@@ -67,20 +67,25 @@ class SnapshotBuilder:
     def ingest_records(self, *, trace_id: str, as_of: datetime, records: Iterable[dict[str, Any]]) -> list[EvidenceCard]:
         """阶段一：新记录校验、去重、建卡，独立开/关 trace；不冻结 Snapshot。
 
-        全局卡复用："一条事实一张卡"；PIT 校验在 normalize 完成（复用卡同样
-        受本轮 available_at <= as_of 约束），旧卡直接进本轮结果不重复建行。
+        全局卡复用：一条事实在每个标的下各一张卡（卡片身份 = 正文哈希 + 标的）；
+        PIT 校验在 normalize 完成（复用卡同样受本轮 available_at <= as_of 约束），
+        旧卡直接进本轮结果不重复建行。
         """
         self.ledger.start_trace(trace_id, as_of)
         evidence: list[EvidenceCard] = []
-        seen: set[str] = set()
+        # 轮内去重必须与 find_evidence_by_content 同键（正文哈希 + 标的）：只按哈希去重时，
+        # 同一轮里被多个标的引用的同稿只会给第一个标的建卡，其余静默丢弃；下一轮却会
+        # 按 (哈希, 标的) 给它们补建——同一事实的建卡数量取决于它恰好和谁排在同一轮。
+        seen: set[tuple[str, str]] = set()
         for record in records:
             kind = record.get("kind")
             if kind not in {"news", "filing", "market"}:
                 raise PITValidationError(ReasonCode.INVALID_KIND, "record kind must be news, filing, or market")
             normalized = normalize_record(record, kind=kind, as_of=as_of)
-            if normalized["content_hash"] in seen:
+            identity = (normalized["content_hash"], normalized["symbol"])
+            if identity in seen:
                 continue
-            seen.add(normalized["content_hash"])
+            seen.add(identity)
             existing = self.ledger.find_evidence_by_content(normalized["content_hash"], normalized["symbol"])
             if existing is not None:
                 evidence.append(existing)

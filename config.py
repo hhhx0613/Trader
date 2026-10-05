@@ -227,4 +227,4 @@ SIGNAL_HOLD = 0     # 持仓不动
 DEFAULT_LLM_PROVIDER = "deepseek"
 
 # 默认 LLM 模型名称（为空时使用提供商的默认模型）
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+DEFAULT_LLM_MODEL = "deepseek-flash"

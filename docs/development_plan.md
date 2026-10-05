@@ -31,17 +31,22 @@
 | `agents/decision_func.py` | `_stock_daily_vol`、`_position_sizing`（逆波动率计算） | 【改造】迁入 `core/portfolio/` 作 `RiskBudgetAllocator` 参考分配，原公式入口保留作对照 |
 | `core/risk_manager.py` | 止损、回撤、成本与原因信息 | 【改造】拆为硬约束输入 + `RiskProjection` 确定性规则 |
 | `core/base_engine.py`、`core/multi_stock_engine.py` | 账户、持仓、费用记账、T-1 决策/T 日开盘模拟成交 | 【改造】输入边界改为 `OrderPlan` + `trace_id`，账本逻辑不动 |
+| `agents/research/graph.py` | `PerAssetResearchGraph.run`：**单标的**、只读已冻结 Snapshot 的研究图（Event → Fundamental ‖ Market → Critic → Packet） | 【复用】只覆盖链路第四段，多标的循环由上层编排负责 |
+| `agents/research/flow.py` | `run_research_round`：采集→建卡→冻结→逐标的研究→Committee 的阶段门控编排，`daily`/`collect`/`decide` 三种节奏 | 【复用】CLI、外部定时调度与 `viz/` 共用唯一入口 |
 | `scripts/run_backtest.py` | `--purpose`/`--experiment-id`、manifest、`docs/experiment_index.csv` 登记 | 【复用】；【改造】加新主线入口，旧策略保留独立标识 |
 | `core/ppo/` | 总暴露实验路径 | 【复用】仅作对照，不进主线仓位决策 |
 | `core/data/filings.py` | EDGAR Provider 已交付：ticker→CIK 映射、submissions/XBRL facts 筛选、acceptance 时刻即 `available_at`；网络备忘缓存写 `data/cache/filings/`（非账本） | 【复用】主线披露入口 |
 
 ## 3. 当前状态
 
-- 阶段 1 主线已交付（2026-10-03）：三采集器（`core/data/news.py`/`market.py`/`filings.py`）+ 建卡/冻结双入口 + `select_evidence` 池选卡 + `scripts/capture_research_snapshot.py` 薄入口；离线回归 30 项（`tests/research/`）全绿；NVDA 真实轮已冻结验收（news 1045 条、去重后 891 卡，`snap_223d227a…`）。
-- 实盘决策时点后置：capture 脚本未传 `--as-of` 时采集完才定 `as_of`，本轮到达数据本轮可用；传 `--as-of` 时点钉死，本轮新拉数据被 PIT 正确拒绝。
+- 阶段 1 主线已交付（2026-10-03）：三采集器（`core/data/news.py`/`market.py`/`filings.py`）+ 建卡/冻结双入口 + `select_evidence` 池选卡 + 入口薄壳；离线回归 30 项（`tests/research/`）全绿；NVDA 真实轮已冻结验收（news 1045 条、去重后 891 卡，`snap_223d227a…`）。
+- 编排收敛（2026-10-05）：采集/建卡/冻结/研究图/委员会的阶段门控上移为 `agents/research/flow.py` 的 `run_research_round`，原 `scripts/capture_research_snapshot.py`（只到冻结）与 `scripts/trace_research_flow.py`（通到 Committee 的逐节点打印）已删除并合并为 `scripts/research_run.py`；`research_run.py` 只保留「跑全程」一个入口（默认 `collect` + 注入模型），`daily`/`decide` 交给外部定时调度器直接调用 `run_research_round`，不再各自养命令行。`viz/` 也已删掉自带的 `pipeline.py`：观测层（事件总线/SSE/取消/TracingModel）合并进 `viz/server.py`，「跑全程」直接复用 `flow.run_research_round`，与 CLI、定时调度器同一函数；仅保留 flow 没有的「复用已冻结 Snapshot 单阶段调试」节奏直接调用生产原语 `PerAssetResearchGraph`/`Committee`。
+- 测试收敛（2026-10-05）：删除 PPO/回测线的 `tests/test_ppo_env.py`、`tests/test_ppo_stage2.py`、`tests/test_risk_manager.py`，`tests/` 下只保留研究链回归（`tests/research/`，当前 52 项）。被删测试覆盖的 `core/ppo/`、`core/risk_manager.py` 实现本身保留，但自此无测试覆盖——它们属于旧回测基线，随该线退役时一并删除，不再单独补测。
+- 实盘决策时点后置：入口脚本未传 `--as-of` 时采集完才定 `as_of`，本轮到达数据本轮可用；传 `--as-of` 时点钉死，本轮新拉数据被 PIT 正确拒绝。
+- 账户口径的已知敞口：`account_state`（含 `regime`、持仓、限额）由调用方手填 JSON 提供，`freeze_snapshot` 对其不做 PIT 校验，因此 `--as-of` 历史回放会把当下的账户与行情判断带入历史时点。当前用法只在实盘时点决策，暂不加校验；`regime` 也不由系统推断，`DataGateway.get_regime()` 仅回读冻结值。
 - 尚未开始：最低数据要求检查与 `rejection_code` 落盘、Gateway 查询扩展（阶段 2 依赖）、事件驱动复核入口。
 - 历史欠账（用户决定延后）：`data/research/raw/` 下 957 个文件系统时代正文目录是 9 月旧卡的唯一副本，须先按哈希迁入分库再删；`data/cache/news/` 旧 CSV 网格未入账本，如需历史回放按 `available_at = published_at` 假设口径另行处理并明牌标注。
-- 研究 Agent、Committee、组合主线、订单主线、执行改造和 OutcomeGraph 均未开始。
+- 权重与订单主线、执行改造和 OutcomeGraph 尚未开始；研究 Agent、单标的图与 Committee 已交付（见阶段 2/3 条目与 `tests/research/`）。
 
 ## 4. 阶段 0：补齐契约与冻结图接口
 
@@ -76,7 +81,7 @@
 - 【新增】SEC EDGAR Provider（唯一新增数据源）：公司索引、10-K/10-Q/8-K 正文、XBRL facts、分页与节流；`available_at` 用 acceptance/publication time；记录尝试顺序、成功/失败和空结果。
 - 【改造】`SnapshotBuilder`：在现有 build 流程上增加每标的最低可用集检查、被拒记录的 `rejection_code` 落盘；数据不足产出可审计的前置 `abstain` 对象。
 - 【改造】`DataGateway`：按 Plan.md 4.2 的查询表扩展 `get_filing_section`、`get_xbrl_facts`、`get_market_slice`、`get_regime`、`get_current_portfolio`、`estimate_turnover_cost` 等只读方法，全部复用现有边界校验 + `record_query` 审计；不向 Agent 暴露 Provider、路径或连接。
-- 【新增】采集入口脚本：周度调仓与临时触发两种入口，只调用上述既有函数。（已落 `scripts/capture_research_snapshot.py`：实盘/回放两种时点模式 + `--no-snapshot` 每日节奏）
+- 【新增】采集与决策入口脚本：周度调仓与临时触发两种入口，只调用上述既有函数。（已收敛为 `agents/research/flow.py` + `scripts/research_run.py`：`daily` 每日只建卡入池、`collect` 本轮卡集冻结、`decide` 池选卡冻结并跑研究与委员会；实盘/回放两种时点模式由 `--as-of` 控制）
 - 【改造】`llm_cache_db`：为阶段 2 准备可关联 trace 的缓存 key；账本与缓存保持物理分离。
 
 **验收门槛**
@@ -89,13 +94,18 @@
 
 **业务位置：** 将已审计事实转为带引用、可反驳、可观望的 `ResearchPacket`；Event triage 同时决定本周队列与临时触发。
 
+**状态：进行中（2026-10-04）。** 本轮交付扩展受审计的 `DataGateway`，并在 `agents/research/` 下引入隔离的单标的图；验收为离线 Gateway/图分支覆盖加 `tests/research` 回归，止步于 `ResearchPacket`，不采集数据、不跑回测。拓扑后续校准为 `(Event → Fundamental) ‖ Market → Critic → Packet`：Event 立论后扇出，Market 不再被 Event 弃权连坐，Fundamental 仅在存在事件论点时核验。
+
 **工作项**
 
 - 【新增】`agents/research/` 目录：节点仅使用 `DataGateway`、上游 Card 和程序组装状态；禁止文件、数据库、HTTP、旧聊天记录。
+- 【改造】受控 tool-calling harness：模型通过 `LLMClient` 只调用角色白名单中的**只读**查询。harness 固定标的、窗口、参数/次数/字符预算，并持久化工具参数、来源、失败码和返回的 EvidenceCard ID；模型不能取得 Provider 或连接。
+- 【删除】Gateway 的联网补齐能力（`ensure_news`/`ensure_filings`/`ensure_market` 与 `ResearchRun` 生命周期）：`DataGateway` 从此只读账本与原始正文库，不发起网络请求、不建卡。理由：拉数据与拉多少共享 AV 账户级日配额，而配额计数是单次调用的局部变量，闸门拦不住自己；模型拿到的空结果区分不了“没新闻”“被情绪分过滤”“被限流”三种情况，证据集因此不可复现。实盘与历史回放现在走同一条只读路径。缺证据的出路是 `data_request` 弃权，缺口由下一轮采集脚本补齐后重新冻结。
+- 【改造】节点输入：行情复用 `core/indicators.py` 的程序计算结果并冻结；财报/XBRL 由程序结构化后经 Gateway 提供；新闻保持 PIT 合格的 EvidenceCard 摘录，按需工具检索，不增加新闻摘要管线。
 - 【复用】`LLMClient` 作唯一模型调用；复用 `load_prompts` 的目录约定与版本 hash 机制管理各 Agent prompt；每节点记录模型/prompt 版本、输入对象 ID、缓存命中、token、延迟、schema 校验结果和失败码。
 - 【新增】Event Agent triage：读取每日新增去重新闻的标题/摘要/来源，分流 `irrelevant`/`weekly`/`immediate`，理由落账本；周度 Event Agent 基于本周队列产出 ClaimCard。
-- 【改造】Fundamental Agent：程序先算同比/环比、指引变化和口径差异再喂给 Agent；披露证据只能来自 EDGAR 原始载荷，新闻不得替代。
-- 【改造】Market Agent：数值全部由程序计算（复用 `core/indicators.py` 现有指标），Agent 只解释与引用字段 ID；与 Fundamental 并行。
+- 【改造】Fundamental Agent：程序先算同比/环比、指引变化和口径差异再喂给 Agent；披露证据只能来自 EDGAR 原始载荷，新闻不得替代；仅在存在事件论点时核验，无则自行跳过不另起论点。
+- 【改造】Market Agent：数值全部由程序计算（复用 `core/indicators.py` 现有指标），Agent 只解释与引用本标的 market 字段 ID；不读取 Event、peer 或 regime，作为独立分支在无新闻/无事件论点时仍产出行情判断，不被 Event 弃权连坐。
 - 【改造】Risk Critic：基于三张上游 Card + 账户/成本摘要输出 `allow/caution/abstain/human_review`；明确是研究软否决。
 - 【改造】ResearchPacket Builder：汇集 Cards、引用覆盖率、时效、冲突、持仓与 Critic 结论；不合格 Packet 不得进入 Committee。非 `abstain` 的 ClaimCard 强制至少一条当前快照内支持 EvidenceCard，并记录反证、未知项和时效。
 
@@ -104,6 +114,8 @@
 - 同一冻结快照重放得到相同节点输入和可校验输出链。
 - 任一非观望结论可回溯 `ResearchPacket -> ClaimCard -> EvidenceCard -> RawPayload`；删除关键证据后下游失效。
 - 先离线图测试，再真实小样本 smoke 与人工审查。
+- 真实模型 prompt 必须点明各自允许引用的 EvidenceCard ID 与角色专属的判断边界；schema 非法的响应仍由 Pydantic 拒绝，并转成显式 `abstain`，不得退化为兜底交易动作。
+- tool calling 的离线验收覆盖：越权工具、超调用预算、工具返回之外的引用、PIT 拒绝、窗口无卡时不得静默去拉新数据，以及 Critic 对持仓/成本/regime/同业信息的只读查询；不运行真实模型、采集或回测。Packet 一律归属启动时冻结的那份 Snapshot，全池 Packet 共享同一 Snapshot ID 与 `as_of`。
 
 ## 7. 阶段 3：跨标的 Committee 与 PortfolioIntent
 
@@ -111,8 +123,8 @@
 
 **工作项**
 
-- 【复用】`analyze_candidate_pool` 的并发编排模式实现 `PerAssetResearch` 批量执行（Event 先行，Fundamental 与 Market 并行，Critic 收口）。
-- 【新增】`ValidateSnapshot` 图入口校验与 `BuildThesisBook`：只给摘要、组合状态、regime、调仓差异和已失效结论，不给原始全文或 Agent 对话。
+- 【复用】`analyze_candidate_pool` 的并发编排模式实现 `PerAssetResearch` 批量执行（Event 先行立论；随后 Fundamental（有事件论点才核验）与 Market（独立）并行；Critic 收口）。
+- 【新增】`ValidateSnapshot` 图入口校验与 `BuildThesisBook`：只给摘要、组合状态、regime、调仓差异和已失效结论，不给原始全文或 Agent 对话；构建带类型的 `ThesisBook` 时须校验传入的每个 Packet 属于同一冻结 Snapshot，再持久化一份覆盖全标的的 `PortfolioIntent`。
 - 【新增】Committee：逐标的输出 `long/hold/reduce/exit/abstain`、强度、优先级、持有期、支持/反对 Card ID 和不交易理由，写入 `PortfolioIntent`。
 - 【改造】intent 持久化与失败恢复，复用 `store.py` 追加写与 trace 状态机。
 

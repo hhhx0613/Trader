@@ -18,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -72,20 +74,41 @@ class RawPayloadStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self._conns: dict[str, sqlite3.Connection] = {}
+        # LangGraph 的并行节点在不同 worker 线程访问同一 store：单条 sqlite3.Connection
+        # 不能并发执行语句，故每个分库配一把可重入锁串行化读写；_registry 只守护连接/锁的懒创建。
+        self._locks: dict[str, threading.RLock] = {}
+        self._registry = threading.Lock()
 
     def _conn(self, db_name: str) -> sqlite3.Connection:
         conn = self._conns.get(db_name)
-        if conn is None:
-            self.root.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(self.root / db_name)
-            conn.executescript(_SCHEMA + _COVERAGE_GUARD)
-            self._conns[db_name] = conn
+        if conn is not None:
+            return conn
+        with self._registry:
+            conn = self._conns.get(db_name)
+            if conn is None:
+                self.root.mkdir(parents=True, exist_ok=True)
+                # 正文由本对象跨线程持有，故允许连接跨线程读取，而不是把数据库句柄暴露给 Agent；
+                # 真正的并发安全由 _access 的每库锁保证，check_same_thread=False 只是前提。
+                conn = sqlite3.connect(self.root / db_name, check_same_thread=False)
+                conn.executescript(_SCHEMA + _COVERAGE_GUARD)
+                self._conns[db_name] = conn
+                self._locks[db_name] = threading.RLock()
         return conn
 
+    @contextmanager
+    def _access(self, db_name: str):
+        """在同一分库锁内开启事务：串行化跨线程语句，保持 append-only 与哈希校验语义。"""
+        conn = self._conn(db_name)
+        with self._locks[db_name], conn:
+            yield conn
+
     def close(self) -> None:
-        for conn in self._conns.values():
-            conn.close()
-        self._conns.clear()
+        with self._registry:
+            for db_name, conn in self._conns.items():
+                with self._locks[db_name]:
+                    conn.close()
+            self._conns.clear()
+            self._locks.clear()
 
     def __enter__(self) -> "RawPayloadStore":
         return self
@@ -110,7 +133,7 @@ class RawPayloadStore:
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         received_at = received_at or datetime.now(timezone.utc)
         symbol, window_start, window_end = _window_of(payload)
-        with self._conn(db_name) as conn:
+        with self._access(db_name) as conn:
             # 内容寻址：同哈希即同一事实，重复写入静默跳过（append-only 允许）。
             conn.execute(
                 "INSERT OR IGNORE INTO payloads (sha256, source, received_at, symbol, window_start, window_end, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -136,7 +159,7 @@ class RawPayloadStore:
             db_name = _SCOPES.get(kind)
             if db_name is None:
                 raise ValueError(f"unknown raw pointer scope: {pointer}")
-            with self._conn(db_name) as conn:
+            with self._access(db_name) as conn:
                 row = conn.execute("SELECT payload FROM payloads WHERE sha256 = ?", (digest,)).fetchone()
             if row is None:
                 raise FileNotFoundError(f"raw payload not found: {pointer}")
@@ -149,7 +172,7 @@ class RawPayloadStore:
         for kind, db_name in _SCOPES.items():
             if not (self.root / db_name).exists():
                 continue
-            with self._conn(db_name) as conn:
+            with self._access(db_name) as conn:
                 row = conn.execute("SELECT payload FROM payloads WHERE sha256 = ?", (reference.sha256,)).fetchone()
             if row is not None:
                 return row[0].encode("utf-8")
@@ -160,7 +183,7 @@ class RawPayloadStore:
     def mark_coverage(self, kind: str, *, symbol: str, window_start: str, window_end: str, source: str, fetched_at: datetime, row_count: int) -> None:
         """记录一次向数据源的询问（含空窗口），防止重复烧配额。"""
         db_name = _require_scope(kind)
-        with self._conn(db_name) as conn:
+        with self._access(db_name) as conn:
             conn.execute(
                 "INSERT INTO coverage (symbol, window_start, window_end, source, fetched_at, row_count) VALUES (?, ?, ?, ?, ?, ?)",
                 (symbol.upper(), window_start, window_end, source, fetched_at.isoformat(), row_count),
@@ -169,7 +192,7 @@ class RawPayloadStore:
     def covered(self, kind: str, symbol: str) -> list[tuple[str, str]]:
         """返回该标的已询问过的窗口列表（供采集器算差集）。"""
         db_name = _require_scope(kind)
-        with self._conn(db_name) as conn:
+        with self._access(db_name) as conn:
             rows = conn.execute(
                 "SELECT window_start, window_end FROM coverage WHERE symbol = ?",
                 (symbol.upper(),),
@@ -179,7 +202,7 @@ class RawPayloadStore:
     def payloads_in_range(self, kind: str, symbol: str, window_start: str, window_end: str) -> list[dict[str, Any]]:
         """重放：取回窗口重叠过的正文（逐条验哈希，静默漂移当场报错）。"""
         db_name = _require_scope(kind)
-        with self._conn(db_name) as conn:
+        with self._access(db_name) as conn:
             rows = conn.execute(
                 "SELECT sha256, payload FROM payloads WHERE symbol = ? AND window_start <= ? AND window_end >= ?",
                 (symbol.upper(), window_end, window_start),

@@ -1,7 +1,7 @@
 # Plan：可审计量化 Agent 开发计划
 
 > 权威状态：当前唯一架构与开发计划
-> 更新：2026-10-02
+> 更新：2026-10-05
 > 研究提案见 [`agent_application_proposal.md`](agent_application_proposal.md)；实验登记册见 [`experiment_index.csv`](experiment_index.csv)。
 
 ## 1. 目标、范围与当前基线
@@ -69,7 +69,17 @@ graph TD
 
 行情风险告警不会直接下单。它只启动临时 DecisionGraph；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate。
 
-建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（DecisionGraph 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死，本轮新拉数据因 available_at 晚于时点被 PIT 闸门拒绝。
+建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、按「正文哈希 + 标的」去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（DecisionGraph 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死，本轮新拉数据因 available_at 晚于时点被 PIT 闸门拒绝。
+
+##### 编排入口收敛于 `agents/research/flow.py`
+
+「采集 -> 建卡 -> 冻结 -> 逐标的研究图 -> Committee」的阶段门控与 trace_id 生成只有一个实现处：`run_research_round(options, *, model=None)`，三种节奏为 `daily`（只采集建卡入池，不冻结）、`collect`（采集并用本轮卡集点名冻结）、`decide`（按 `available_from` 池选卡冻结，再跑研究图与 Committee 产出 `PortfolioIntent`）。
+
+`scripts/research_run.py` 不映射这三种节奏，只保留**一个跑全程的人类入口**：默认 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→委员会并逐节点打印。`daily` 与 `decide` 由外部定时调度器直接调用 `run_research_round`，不再各自养一份命令行参数装配。四条边界：
+
+1. **不跑研究就不碰模型。** `daily` 不构造 `LLMClient`，定时采集因此不依赖 API key，也不会误烧付费调用。
+2. **要决策就必须给真实账户。** `decide` 要求调用方传入 `account_state`（cash/positions/limits/regime/成本估计），缺账户直接失败而不退回占位值：Risk Critic 的 prompt 明确「缺 limits 或持仓状态不得当作放行」，占位账户只会跑出一轮全 `abstain` 的无效意图，白烧模型还留下一条看起来成功的 trace。
+3. **观测不属于编排。** 逐节点打印是调用方对模型客户端的包装（`research_run.py` 的终端 `TracingModel`、`viz/` 的事件版包装各一份，只解读调用内容），`flow` 内不含 `print`、事件总线或前端耦合，同一函数可被 CLI、外部调度器和 `viz/` 复用。采集能力始终在 `flow` 这一侧，研究 Agent 侧拿不到任何采集入口（见 4.2）。
 
 #### 3.1.2 一次 DecisionGraph 的执行顺序
 
@@ -81,13 +91,14 @@ graph TD
     A["Abort：记录 PIT 拒绝原因"]
 
     subgraph R["PerAssetResearch：每个候选标的并发"]
-        E["1. Event Agent"]
-        F["2. Fundamental Agent"]
-        M["并行：Market Agent"]
+        E["1. Event Agent（新闻+公告立论/闸门）"]
+        F["2. Fundamental Agent（用披露独立核验事件论点）"]
+        M["Market Agent（独立并行，不被 Event 连坐）"]
         C["3. Risk Critic"]
         RP["ResearchPacket"]
-        E --> F --> C --> RP
-        M --> C
+        E --> F --> C
+        E --> M --> C
+        C --> RP
     end
 
     T["BuildThesisBook：汇总全股票池 ResearchPacket"]
@@ -124,9 +135,15 @@ graph TD
     class IC,RA,VT,TP,EX execution
 ```
 
+`PerAssetResearch` 的单标的图为 `(Event → Fundamental) ‖ Market → Risk Critic → ResearchPacket`：Event 先读新闻与公告立论或弃权，随后 Fundamental（仅在存在事件论点时用独立披露核验）与 Market（以 Event 论点为只读语境解读价量确认/背离，补查与引用锁在行情类，不被 Event 弃权连坐）并行，Critic 扇入三张卡。缺证据、引用或输出 schema 非法、模型调用失败等情况，节点必须走显式的非 `proceed` 路由并带原因码，而不是静默产出半成品 Packet。当前研究阶段只打通到 `ResearchPacket`；Committee、仓位分配、订单、执行与回测属于其后阶段。
+
 #### 3.1.3 Agent 节点：输入、输出与边界
 
-所有 Agent 的调用输入由 Snapshot Builder 在该节点即时组装，并保存输入 Card ID、Gateway 查询 ID、模型/提示词版本和输出 schema 校验结果。数据包超出 token 预算时，Builder 减少选择范围并保留可回查 ID；研究事实始终以 Snapshot、EvidenceCard、ClaimCard 和 Gateway 回查结果为准。
+研究节点采用「注入 hook + 单工具补查」：每个 Agent 在调用模型**之前**先执行一个数据注入 hook（由各 Agent 自行声明读哪些冻结批次），把该标的本周证据（Event 读 news、Fundamental 读 filing/XBRL、Market 只读本标的 market）**无条件组装进初始 prompt**——类别取数由代码直接调 Gateway 完成，不再作为模型工具暴露，因此模型默认单轮即可产出 ClaimCard，不再需要花一轮工具调用去「要」它本就该看到的证据。模型唯一可自主发起的只读工具是 `search_evidence`（补查），仅当它判断注入批次不足时才调用；若仍不足则走一次性 `data_request` 弃权而不是无限补查。`tools.py`（`ResearchTools`）是工具目录与受控执行循环的**唯一实现处**（预算/参数校验/正文截断/trace 记账），Agent 文件只负责声明挂载哪几个工具与注入 hook；模型不能取得 API key、Provider、文件路径或数据库连接，也不能触发任何网络请求。Risk Critic 是例外：它的四项上下文（当前仓位、换手/成本估计、regime、peer）本就是每轮必读的固定输入，因而全部走注入 hook 直接拼装、**不挂载任何工具**，以单轮 `chat_json` 输出 verdict。Gateway 全程只读账本与原始正文库；缺证据不在研究过程中补——补齐数据是采集脚本在冻结之前的职责。补查工具名、参数、来源、返回 EvidenceCard ID、失败码与结果数均写入研究 trace（默认注入的批次则由 Gateway 的 `gateway_queries` 审计）。
+
+研究图的输入是采集脚本在 DecisionGraph 启动前冻结好的决策 Snapshot：`as_of`、股票池与卡集此后不再改变。Gateway 不联网，因此研究过程中不存在“补到新卡”，也不再需要 `ResearchRun` 生命周期；实盘与历史回放走完全相同的只读路径，同一份 Snapshot 重放得到同一批输入。证据不足时模型走显式的 `data_request` 路由并弃权，原因写入 trace；缺口由下一轮采集脚本补齐后重新冻结再研究，未补齐的数据不会进入本次决策。所有 Claim 只能引用本节点可见的 EvidenceCard ID——即初始 prompt 注入的冻结批次，加上 `search_evidence` 补查实际返回的卡片；补查被 `ResearchTools` 锁在本节点证据维度内（Event 只能搜 news、Fundamental 只能搜 filing、Market 只能搜 market），维度分工不给补查开后门；二者均严格落在本 Snapshot 冻结卡集内。行情继续复用 `core/indicators.py` 预处理为 market EvidenceCard（由采集脚本计算），财报/XBRL 由 SEC 采集器结构化，新闻保持 EvidenceCard 摘录；模型不做数值计算，也不存在静默 fallback 或人工重跑。
+
+所有 Agent 的调用输入由 Snapshot Builder 在该节点即时组装，并保存输入 Card ID、Gateway 查询 ID、模型/提示词版本和输出 schema 校验结果。数据包超出 token 预算时，Builder 减少选择范围并保留可回查 ID；研究事实始终以 Snapshot、EvidenceCard、ClaimCard 和 Gateway 回查结果为准。每个研究节点的提示词必须显式声明证据范围、允许的推断边界、引用/反证/未知项处理规则、弃权条件与精确的输出 schema；细化提示词只为提高 schema 合规率，绝不因此赋予 Agent 读取非冻结数据或绕过确定性控制的能力。
 
 ##### 1. Event Agent
 
@@ -142,12 +159,12 @@ graph TD
 - **输出：** Fundamental ClaimCard，记录收入、利润、现金流、指引和风险因素的支持/反证，以及无法验证的项目。
 - **边界：** 独立核验披露，新闻摘要不能替代披露证据。
 
-##### 3. Market Agent（与 Fundamental Agent 并行）
+##### 3. Market Agent（独立并行分支，不依赖 Event）
 
-- **输入：** 程序计算的 1/5/20 日收益、实现波动率、成交量异常、流动性、回撤、趋势、行业相对表现和市场 regime。
-- **实现：** 解释市场是否已反映研究论点，以及当前交易环境是否适合承担风险；价格、指标和阈值均由程序计算。
+- **输入：** 本标的程序计算的 1/5/20 日收益、实现波动率、成交量异常、流动性、回撤和趋势。
+- **实现：** 独立解释本标的行情状态；不读取 Event、peer 或 regime。价格、指标和阈值均由程序计算。
 - **输出：** 带数据字段 ID 的 Market ClaimCard。
-- **边界：** 不编造价格或技术指标。
+- **边界：** 不编造价格或技术指标；与事件链并行独立运行，本轮无新闻/无事件论点时仍产出行情判断。
 
 ##### 4. Risk Critic
 
@@ -169,7 +186,11 @@ graph TD
 
 - **实现：** 在全股票池比较 ResearchPacket，结合当前组合和调仓差异决定每只标的的研究动作、候选准入优先级和持有期。
 - **输出：** PortfolioIntent；每只标的包含 `long/hold/reduce/exit/abstain`、动作强度、持有期、优先级、支持/反对 Card ID 和不交易理由。
-- **边界：** 不读原始全文或 Agent 聊天，不输出百分比权重、预期收益数值、连续强弱分数或订单。
+- **边界：** 不读原始全文或 Agent 聊天，不输出百分比权重、预期收益数值、连续强弱分数或订单。Committee 先由冻结的 `ResearchPacket` 摘要构建 `ThesisBook`，再只产出带引用的 `PortfolioIntent`；被 Critic 判为 `abstain`/`human_review` 的标的，在 Intent 中必须保持 `abstain`。
+- **违规治理（分级）：** `_validate_items` 的拦截按违规粒度分流，不再一律全池弃权：
+  1. **标的局部违规**（单只 bypass Critic 否决、引用 ID 越出本标的 Packet、非 abstain 缺支持 Card）——仅该标的的 item 强制替换为 `abstain`，`no_trade_reason` 写明原始违规；其余合规 item 保留。
+  2. **全局结构违规**（symbol 集合缺失/重复/越池、响应无法解析、越界字段）——说明整份响应的生成基础失效，维持全池弃权，不部分采信。
+  3. **反静默篡改**：发生任何矫正时，模型原始响应以 `tool_calls` 记录入账（node=`committee`，tool_name=`raw_response`，arguments=原始 response、result_count=违规数、evidence_ids=违规标的），保证“模型实际想说什么”与“系统最终采纳了什么”均可重放；矫正后的 Intent 仍是合法 `PortfolioIntent`，下游无需兼容处理。
 
 #### 3.1.4 组合、硬风控与执行
 
@@ -309,22 +330,43 @@ graph TD
 
 ### 4.2 DataGateway：Agent 的唯一数据入口
 
-程序负责每日批量拉取、缓存、PIT 过滤和 Snapshot 构建。Agent 不拥有任意 HTTP、网页、文件或数据库权限；它们只能通过 `DataGateway` 作受控补查。
+程序负责批量拉取、缓存、PIT 过滤和 Snapshot 构建。Agent 不拥有任意 HTTP、网页、文件或数据库权限；它们只能通过 `DataGateway` 做只读查询，Gateway 本身不发起网络请求——拉数据是采集脚本的职责，发生在冻结之前。
 
-| Agent | 受控查询 |
-| --- | --- |
-| Event Agent | `search_evidence`、`get_news_batch` |
-| Fundamental Agent | `get_filing_section`、`get_xbrl_facts` |
-| Market Agent | `get_market_slice`、`get_peer_comparison`、`get_regime` |
-| Risk Critic / Committee | `get_current_portfolio`、`estimate_turnover_cost`、关键证据回查 |
+默认证据由各 Agent 的注入 hook 在节点启动时直接读取并拼进初始 prompt（见 3.1.3）；下表区分两类：**注入**由代码直读、不作为模型工具；**模型可自主补查**是唯一暴露给模型的 function-calling 入口。
 
-Gateway 必须校验 `symbol`、`snapshot_id` 与 `as_of`；拒绝未来数据，保存原始响应并返回带 ID 的短结构化摘录。若 Snapshot 与补查仍不足，Agent 输出 `insufficient_evidence`/`data_request`，由程序在相同 PIT 截止点补齐并版本化 Snapshot 后重跑，不能让 Agent 绕过边界。
+| Agent | 注入 hook 直读（默认，非模型工具） | 模型可自主补查工具（锁本节点维度） |
+| --- | --- | --- |
+| Event Agent | `get_news_batch` | `search_evidence`（仅 news） |
+| Fundamental Agent | `get_filing_section`（含 XBRL 源卡片） | `search_evidence`（仅 filing） |
+| Market Agent | `get_market_slice` | `search_evidence`（仅 market） |
+| Risk Critic | `get_current_portfolio` + `estimate_turnover_cost` + `get_regime` + `get_peer_comparison` | （无，不挂载任何工具） |
+
+Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot 的 `as_of`）；拒绝一切未来数据，在边界内解析原始正文并返回带 ID 的短结构化摘录。无论注入还是补查，可见集严格等于该 Snapshot 的冻结卡集：`search_evidence` 只在已冻结卡片正文内检索，不会拉入新卡，也就不存在需要额外归属的证据增量。采集脚本向同一个账本写卡则走 `SnapshotBuilder`，那是冻结之前的另一个入口，与 Gateway 的读职责不重叠。不能让 Agent 绕过 Gateway 直接联网。
+
+读取侧的批量取数（`ResearchLedger.list_evidence`）必须在一次查询内完成「限定本 Snapshot 卡集 + 按标的过滤」，只反序列化真正命中的卡片；Snapshot 引用的卡 ID 缺失属于账本损坏，必须抛错而不是静默少返。
+
+`DataGateway` 的 `_records` 由 `title`、`summary`、`body` 重组正文摘录：真实采集器把程序计算的行情特征与 SEC XBRL 事实序列化进 `body`（JSON 串），新闻保留在 `title`/`summary`，使冻结的 market/filing 读取携带其数值事实而不丢失。若日后采集器把数值移出 `body`，需要扩展的是 `_records`，而不是各 Agent。
+
+`RawPayloadStore` 被 Fundamental 与 Market 节点在各自工作线程共享；单个 `sqlite3.Connection` 不足以安全并发，故每个分库连接在注册表锁下懒创建，并由每连接的可重入锁串行化读写，在保持读取正确的同时不把数据库句柄交给 Agent。
 
 ### 4.3 审计记录与恢复
 
 每次图运行共享 `trace_id`。审计账本以追加式版本保存输入 Snapshot、EvidenceCard、ClaimCard、ResearchPacket、PortfolioIntent、TargetPortfolio、OrderPlan、成交、OutcomeCard，以及模型/提示词/配置版本、失败原因和耗时。LLM 缓存与审计账本分离：缓存用于复用调用，不能充当长期记忆。
 
 给定任一 `trace_id`，系统应能在不访问实时数据的前提下重建当时的输入与决策链；缺失任一关键对象即标记回放失败。
+
+### 4.4 研究链路可视化调试台（`viz/`）
+
+`viz/` 是本地单人使用的观测工具，后端只有 `server.py`（HTTP + SSE + 运行观测）与 `readmodel.py`（账本只读视图）两个文件。它**自己不编排任何阶段**：跑全程就是调 `run_research_round`（与命令行同一个函数），模型客户端套一层事件包装器，把每个节点的注入输入、工具调用与 JSON 输出发到前端，不改变其行为。唯一的例外是 flow 没有的节奏「复用已冻结 Snapshot 只重跑研究图/委员会」——它直接调用生产原语 `PerAssetResearchGraph` 与 `Committee`，用途是不重烧采集配额地反复调试研究节点。从 prompt 结构识别节点的规则与 `scripts/research_run.py` 的终端包装同构，两边各留一份，改动时一起看。
+
+边界四条：
+
+1. **不复制编排**：采集、建卡、冻结、研究图、委员会的阶段门控与 trace_id 生成一律由 `flow` 持有，`viz/` 里不留第二份。
+2. **只读生产存储**：前端 API 只读 `data/research/` 的账本与正文库，不写账本、不改契约、不给 Agent 开新的数据入口。
+3. **零新依赖**：HTTP 服务与 SSE 用标准库实现，前端为无构建的原生 HTML/CSS/JS，只监听 `127.0.0.1`。
+4. **观测产物不入权威存储**：每次运行的事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略），仅供刷新后回看；权威审计仍是 `ResearchLedger` 与 `logs/llm_calls.jsonl`。
+
+它服务的正是 4.3 的目标：给定一次运行或一个 `trace_id`，能在界面上逐阶段看清「数据进来了什么、模型看到了什么、要了什么工具、产出了哪些 Card、被谁引用」。
 
 ## 5. 稳定数据契约与职责边界
 
@@ -367,3 +409,4 @@ Gateway 必须校验 `symbol`、`snapshot_id` 与 `as_of`；拒绝未来数据�
 - `experiment_index.csv`：结构化实验登记册。
 
 单次回测原始证据和摘要保存在不可覆盖的 `output/backtest_<run_id>/`；不在 `docs/` 保留重复专项报告、自动生成总报告、平行计划或待办清单。
+

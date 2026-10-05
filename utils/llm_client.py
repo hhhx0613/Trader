@@ -4,7 +4,7 @@
 支持通过 OpenAI 兼容接口灵活切换：
 - OpenAI (GPT-4, GPT-3.5-turbo)
 - GLM (智谱 AI: GLM-4, GLM-3-turbo)
-- DeepSeek (DeepSeek-V4-Pro, DeepSeek-V4-Flash)
+- DeepSeek (deepseek-flash)
 
 使用方法：
   client = LLMClient(provider="glm")  # 或 "openai", "deepseek"
@@ -16,9 +16,11 @@
   - 统一使用 openai 库调用
 """
 
+import json
 import os
+import re
 import sys
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径
@@ -60,8 +62,8 @@ class LLMClient:
         "deepseek": {
             "base_url": "https://api.deepseek.com/v1",
             "api_key_env": "DEEPSEEK_API_KEY",
-            "default_model": "deepseek-v4-pro",
-            "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+            "default_model": "deepseek-flash",
+            "models": ["deepseek-flash"],
         },
     }
     
@@ -248,6 +250,93 @@ class LLMClient:
                 "model": self.model,
             }
     
+    def chat_with_tools(
+        self,
+        message: str,
+        *,
+        system_prompt: Optional[str],
+        tools: List[Dict[str, Any]],
+        tool_executor: Callable[[str, Dict[str, Any]], str],
+        max_tool_calls: int,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """运行 OpenAI-compatible 原生 function calling，并由调用方执行受控工具。
+
+        客户端从不持有研究数据入口；每个 tool call 都回调到 research harness，
+        因此模型看不到也无法修改其 Snapshot 边界。
+        """
+        messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
+        used_calls = 0
+        while True:
+            kwargs: Dict[str, Any] = {"model": self.model, "messages": messages,
+                                      "temperature": temperature, "tools": tools}
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            response = self.client.chat.completions.create(**kwargs)
+            assistant = response.choices[0].message
+            calls = assistant.tool_calls or []
+            if not calls:
+                content = assistant.content or ""
+                parsed = self._parse_json(content)
+                # 无论文本能否解析为 JSON 都落盘，失败样本正是排查模型输出格式的关键证据。
+                log_llm_call(
+                    provider=self.provider,
+                    model=self.model,
+                    system_prompt=system_prompt or "",
+                    user_message=message,
+                    response=content,
+                    result=parsed or {},
+                    error=None if parsed is not None else "tool-calling model did not return a JSON object",
+                )
+                if parsed is None:
+                    raise ValueError("tool-calling model did not return a JSON object")
+                return parsed
+            # 记录模型本轮请求的工具及参数，便于审计多轮 function calling 轨迹。
+            log_llm_call(
+                provider=self.provider,
+                model=self.model,
+                system_prompt=system_prompt or "",
+                user_message=message,
+                response=json.dumps(
+                    [{"name": c.function.name, "arguments": c.function.arguments} for c in calls],
+                    ensure_ascii=False,
+                ),
+                result={"tool_calls": len(calls), "round": used_calls + 1},
+                error=None,
+            )
+            if used_calls + len(calls) > max_tool_calls:
+                raise ValueError("model exceeded research tool-call budget")
+            # SDK 对象转为 OpenAI 消息字典，保留 tool_call_id 以使兼容端能关联返回值。
+            messages.append(assistant.model_dump(exclude_none=True))
+            for call in calls:
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+                    result = tool_executor(call.function.name, arguments)
+                except Exception as exc:
+                    # 工具拒绝也回传给模型；随后它可以改为引用已有证据或显式弃权，
+                    # 但不能借异常绕过 Gateway。
+                    result = json.dumps({"error": type(exc).__name__, "detail": str(exc)}, ensure_ascii=False)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+                used_calls += 1
+
+    @staticmethod
+    def _parse_json(response_text: str) -> Dict[str, Any] | None:
+        try:
+            value = json.loads(response_text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            if not match:
+                return None
+            try:
+                value = json.loads(match.group())
+            except json.JSONDecodeError:
+                return None
+        return value if isinstance(value, dict) else None
+
     def get_info(self) -> Dict:
         """
         获取当前客户端信息。

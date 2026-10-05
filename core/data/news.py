@@ -39,6 +39,18 @@ def _default_store() -> RawPayloadStore:
     return RawPayloadStore(config.RESEARCH_RAW_DIR)
 
 
+def _segment_covered_by_days(seg_start: str, seg_end: str, covered: set) -> bool:
+    """整段是否已被逐日覆盖（避免网格收尾时重复烧配额）。"""
+    day = pd.Timestamp(seg_start)
+    end = pd.Timestamp(seg_end)
+    while day <= end:
+        d = day.strftime("%Y-%m-%d")
+        if (d, d) not in covered:
+            return False
+        day += pd.Timedelta(days=1)
+    return True
+
+
 def _segments_for(start_date: str, end_date: str, *,
                   today: Optional[str] = None) -> List[Tuple[str, str]]:
     """把请求区间映射到段列表（同一段无论被哪个区间请求都同名）。
@@ -102,9 +114,16 @@ def _news_record(symbol: str, *, source: str, title: str, summary: str, url: str
     return record
 
 
+# 采集时过滤低价值新闻：情绪强度不足且无实质话题的条目不建卡，避免拉 1600 条只看 20 条的浪费。
+_MIN_SENTIMENT = 0.15
+_SUBSTANTIVE_TOPICS = {"earnings", "company", "product", "regulation", "merger",
+                        "dividend", "lawsuit", "cpi", "feds", "treasury", "ipo",
+                        "supply", "demand", "management", "forecast", "guidance"}
+
+
 def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
                                  fetched_at: datetime) -> Optional[List[Dict[str, Any]]]:
-    """AV News & Sentiment；返回该段的规范化记录，失败返回 None（不标记 coverage）。"""
+    """AV News & Sentiment；过滤低价值新闻后返回规范化记录，失败返回 None（不标记 coverage）。"""
     api_key = config.ALPHA_VANTAGE_API_KEY
     if not api_key:
         return None
@@ -129,11 +148,18 @@ def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
         print(f"[News] Alpha Vantage 响应异常 {seg_start}~{seg_end}")
         return None
     records = []
+    kept = 0
     for item in feed:
         try:
             published = pd.to_datetime(item["time_published"], format="%Y%m%dT%H%M%S")
         except (KeyError, ValueError):
             continue
+        score = float(item.get("overall_sentiment_score", 0.0) or 0.0)
+        topics = set(str(t.get("topic", "")).strip().lower() for t in (item.get("topics") or []) if isinstance(t, dict))
+        # 过滤门槛：情绪强度不足且无实质话题的不建卡，减少模型无效信息量
+        if abs(score) < _MIN_SENTIMENT and not (topics & _SUBSTANTIVE_TOPICS):
+            continue
+        kept += 1
         records.append(_news_record(
             symbol,
             source=str(item.get("source", "Alpha Vantage")),
@@ -142,8 +168,11 @@ def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
             url=item.get("url", ""),
             published_at=_to_utc(published),
             fetched_at=fetched_at,
-            extra={"sentiment_score": float(item.get("overall_sentiment_score", 0.0) or 0.0)},
+            extra={"sentiment_score": score, "topics": list(topics & _SUBSTANTIVE_TOPICS)},
         ))
+    dropped = len(feed) - kept
+    if dropped:
+        print(f"[News] {symbol} {seg_start}~{seg_end}: 保留 {kept} 条，过滤 {dropped} 条低价值")
     return records
 
 
@@ -192,7 +221,7 @@ def fetch_news_records(symbol: str, start_date: str, end_date: str, *,
     api_calls = 0
 
     for seg_start, seg_end in _segments_for(start_date, end_date):
-        if (seg_start, seg_end) in covered:
+        if (seg_start, seg_end) in covered or _segment_covered_by_days(seg_start, seg_end, covered):
             # 重放：正文库读回的 payload 回转成记录（哈希稳定，builder 天然去重）
             records.extend(
                 record_from_payload(p)
@@ -224,5 +253,11 @@ def fetch_news_records(symbol: str, start_date: str, end_date: str, *,
         print(f"[News] {symbol} 段 {seg_start}~{seg_end}：新拉 {len(segment_records)} 条（{source}）")
         if api_calls < config.NEWS_DAILY_QUOTA:
             time.sleep(15)  # AV 免费版约 5 次/分钟
+
+    # 网格段可能拉回超出请求窗口的数据（如 7 天请求落在 28 天网格段内）；
+    # 全部存储以保证后续覆盖，但只返回调用方实际请求的时间范围。
+    start_ts = pd.Timestamp(start_date).tz_localize("UTC")
+    end_ts = pd.Timestamp(end_date).tz_localize("UTC") + pd.Timedelta(days=1)
+    records = [r for r in records if start_ts <= r["published_at"] < end_ts]
 
     return records

@@ -190,6 +190,7 @@ def log_llm_call(
         "user_message": user_message,
         "system_prompt_length": len(system_prompt),
         "user_message_length": len(user_message),
+        "response": response,
         "response_length": len(response) if response else 0,
         "result": result,
         "error": error,

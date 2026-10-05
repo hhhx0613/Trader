@@ -44,6 +44,9 @@ def _fetch_bars_yfinance(symbol: str, start_date: str, end_date: str) -> Optiona
     try:
         import yfinance as yf
 
+        # yfinance 会在首次 Ticker 请求前创建时区和 cookie SQLite 缓存；默认用户目录在受限环境中可能不可写。
+        # 缓存只服务第三方客户端会话，不是研究原始证据，固定到项目研究目录以避免影响 PIT 原始数据存储边界。
+        yf.set_tz_cache_location(str(config.RESEARCH_DIR / "yfinance_cache"))
         df = yf.Ticker(symbol).history(start=start_date, end=end_date, auto_adjust=True)
         if df is None or df.empty:
             return None

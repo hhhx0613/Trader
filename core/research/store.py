@@ -88,6 +88,12 @@ class ResearchLedger:
                 # 可比较/排序；symbol 随小表扫描过滤，不另建索引。
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_available_at ON evidence_cards(datetime(json_extract(payload, '$.available_at')))")
                 conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))")
+            if 5 not in applied:
+                # 原 gateway_queries 记录程序读；tool_calls 额外保留模型请求的参数与返回卡片，
+                # 使重放可区分“模型要求什么”和“Gateway 实际允许它看到什么”。
+                conn.execute("CREATE TABLE tool_calls (call_id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL REFERENCES traces(trace_id), snapshot_id TEXT NOT NULL, symbol TEXT NOT NULL, node TEXT NOT NULL, tool_name TEXT NOT NULL, arguments TEXT NOT NULL, requested_at TEXT NOT NULL, result_count INTEGER NOT NULL, evidence_ids TEXT NOT NULL)")
+                conn.execute("CREATE INDEX idx_tool_calls_trace_id ON tool_calls(trace_id)")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))")
 
     @staticmethod
     def _dump(value: Any) -> str:
@@ -164,7 +170,35 @@ class ResearchLedger:
         return EvidenceCard.model_validate_json(row["payload"]) if row else None
 
     def list_evidence(self, snapshot: ResearchSnapshot, symbol: str) -> list[EvidenceCard]:
-        return [self.get_evidence(item) for item in snapshot.evidence_ids if self.get_evidence(item).symbol == symbol]
+        """一次查询取回本 Snapshot 下该标的的全部卡。
+
+        旧写法逐 ID 往返整池两遍（过滤一次、取值一次）再丢弃九成，Gateway 每个
+        读工具都走这条路，周度全池规模下会直接跑不动；改为在 SQL 里同时完成
+        「限定本 Snapshot 卡集」与「按标的过滤」，只反序列化真正命中的卡。缺失
+        的卡 ID 意味着账本损坏，单独数一次后抛错，不能静默少返证据。
+
+        排序固定为可得时间倒序：harness 的字符预算按列表顺序逐张截断，升序会让
+        旧闻先吃掉预算、最新事件被截在窗口外；get_news_batch 的“最新优先”口径
+        在这里统一，而不是各自排一次。
+        """
+        if not snapshot.evidence_ids:
+            return []
+        ids = json.dumps(list(snapshot.evidence_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.payload FROM evidence_cards e, json_each(?) AS ids "
+                "WHERE e.object_id = ids.value AND json_extract(e.payload, '$.symbol') = ? "
+                "ORDER BY datetime(json_extract(e.payload, '$.available_at')) DESC, e.object_id DESC",
+                (ids, symbol.strip().upper()),
+            ).fetchall()
+            missing = conn.execute(
+                "SELECT count(*) FROM json_each(?) AS ids "
+                "LEFT JOIN evidence_cards e ON e.object_id = ids.value WHERE e.object_id IS NULL",
+                (ids,),
+            ).fetchone()[0]
+        if missing:
+            raise KeyError(f"snapshot references {missing} missing evidence card(s)")
+        return [EvidenceCard.model_validate_json(row["payload"]) for row in rows]
 
     def select_evidence(self, *, symbols: Iterable[str], available_from: datetime, available_to: datetime) -> list[EvidenceCard]:
         """卡片池选卡：按标的与可得时间闭窗口 [from, to] 筛选，供 freeze_snapshot 使用。
@@ -189,6 +223,26 @@ class ResearchLedger:
     def record_query(self, *, trace_id: str, snapshot_id: str, symbol: str, query_kind: str, result_count: int, requested_at: datetime) -> None:
         with self._connect() as conn:
             conn.execute("INSERT INTO gateway_queries(trace_id, snapshot_id, symbol, query_kind, requested_at, result_count) VALUES (?, ?, ?, ?, ?, ?)", (trace_id, snapshot_id, symbol, query_kind, requested_at.isoformat(), result_count))
+
+    def record_tool_call(self, *, trace_id: str, snapshot_id: str, symbol: str, node: str,
+                         tool_name: str, arguments: dict[str, Any], result_count: int,
+                         evidence_ids: list[str], requested_at: datetime) -> None:
+        """追加模型经 harness 发起的受控补查；trace 完成后同样不可修改。"""
+        with self._connect() as conn:
+            trace = conn.execute("SELECT status FROM traces WHERE trace_id=?", (trace_id,)).fetchone()
+            if trace is None or trace["status"] != "running":
+                raise ValueError(f"trace is not writable: {trace_id}")
+            conn.execute("INSERT INTO tool_calls(trace_id, snapshot_id, symbol, node, tool_name, arguments, requested_at, result_count, evidence_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (trace_id, snapshot_id, symbol, node, tool_name, self._dump(arguments),
+                          requested_at.isoformat(), result_count, self._dump(evidence_ids)))
+
+    def list_tool_calls(self, trace_id: str) -> list[dict[str, Any]]:
+        """重放审计：返回该 trace 的全部模型工具请求记录，arguments/evidence_ids 已解 JSON。"""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM tool_calls WHERE trace_id=? ORDER BY call_id", (trace_id,)).fetchall()
+        return [{"node": row["node"], "tool_name": row["tool_name"], "symbol": row["symbol"],
+                 "arguments": json.loads(row["arguments"]), "result_count": row["result_count"],
+                 "evidence_ids": json.loads(row["evidence_ids"])} for row in rows]
 
     def _get(self, table: str, object_id: str) -> sqlite3.Row:
         with self._connect() as conn:

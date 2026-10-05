@@ -97,3 +97,42 @@ def test_freeze_without_selection_source_is_rejected(tmp_path):
     builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
     with pytest.raises(ValueError, match="evidence_ids or available_from"):
         builder.freeze_snapshot(trace_id="bad-freeze", as_of=AS_OF, symbols=["AAPL"], source_versions={}, account_state={})
+
+
+def test_list_evidence_batches_by_symbol_and_flags_missing_cards(tmp_path):
+    """读取侧一次查询完成「限定本 Snapshot 卡集 + 按标的过滤」，引用缺卡必须抛错。
+
+    旧实现逐 ID 往返整池两遍再丢弃非本标的的卡，Gateway 每个读工具都走这条路；
+    而缺卡意味着账本损坏，静默少返证据比报错更危险。
+    """
+    ledger, snapshot = build(tmp_path, [news(), news(title="Peer story", symbol="MSFT", url="https://example.test/b")])
+    assert [card.symbol for card in ledger.list_evidence(snapshot, "AAPL")] == ["AAPL"]
+
+    builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
+    ghost = builder.freeze_snapshot(trace_id="ghost-freeze", as_of=AS_OF, symbols=["AAPL"],
+                                    source_versions={"news": "fixture-v1"}, account_state={},
+                                    evidence_ids=("ev_missing_card_id",))
+    with pytest.raises(KeyError, match="missing evidence"):
+        ledger.list_evidence(ghost, "AAPL")
+
+
+def test_same_story_about_several_symbols_gets_one_card_per_symbol(tmp_path):
+    """轮内去重与跨轮查找必须同键（正文哈希 + 标的）。
+
+    只按正文哈希去重时，同一轮里被多个标的引用的同稿只会给第一个标的建卡，
+    其余静默丢弃；下一轮却会按 (哈希, 标的) 给它们补建——同一事实的建卡数量
+    取决于它恰好和谁排在同一轮，而建卡数量直接决定 Snapshot 内容。
+    """
+    ledger = ResearchLedger(tmp_path / "research_ledger.db")
+    builder = SnapshotBuilder(ledger, RawPayloadStore(tmp_path / "raw"))
+    copies = [news(), news(symbol="MSFT", url="https://mirror.example.test/a")]
+    cards = builder.ingest_records(trace_id="wire-both", as_of=AS_OF, records=copies)
+
+    assert [card.symbol for card in cards] == ["AAPL", "MSFT"]
+    # URL 不同的转载仍是同一事实：两张卡片共用一个正文哈希，只是归属不同标的
+    assert cards[0].content_hash == cards[1].content_hash
+    assert cards[0].evidence_id != cards[1].evidence_id
+
+    # 同内容再入一轮：去重复用旧卡，不新增行
+    again = builder.ingest_records(trace_id="wire-repeat", as_of=AS_OF, records=copies)
+    assert [card.evidence_id for card in again] == [card.evidence_id for card in cards]

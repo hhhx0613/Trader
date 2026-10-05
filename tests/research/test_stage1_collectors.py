@@ -8,11 +8,15 @@
   5. 新闻段粒度：历史整段网格省配额；未走完的段拆单日、不得提前封口
 """
 
+import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+from core import config
+from core.data import market
 from core.data.market import _bars_batch_record, build_feature_card, load_price_frame
 from core.data.news import _segments_for
 from core.research.raw import RawPayloadStore
@@ -123,6 +127,27 @@ def test_feature_card_needs_minimum_warmup(tmp_path, warmup):
     batch = _bars_batch_record("AAPL", "yfinance", bars, AS_OF - timedelta(hours=1))
     store.put(batch, source="yfinance", received_at=batch["available_at"])
     assert build_feature_card("AAPL", AS_OF, lookback_days=220, store=store) is None
+
+
+def test_yfinance_uses_project_writable_cache_before_ticker(monkeypatch):
+    """第三方会话缓存不能落到不可控的用户目录，否则数据请求尚未发出就会失败。"""
+    seen = {}
+
+    def set_tz_cache_location(path):
+        seen["cache_path"] = path
+
+    class Ticker:
+        def __init__(self, _symbol):
+            assert "cache_path" in seen
+
+        def history(self, **_kwargs):
+            return pd.DataFrame()
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(
+        set_tz_cache_location=set_tz_cache_location, Ticker=Ticker))
+
+    assert market._fetch_bars_yfinance("AAPL", "2026-01-01", "2026-01-31") is None
+    assert seen["cache_path"] == str(config.RESEARCH_DIR / "yfinance_cache")
 
 
 # ---------- 5: 新闻段粒度（实盘单日段 vs 历史网格段） ----------
