@@ -77,6 +77,18 @@ python scripts/research_run.py --as-of 2026-10-03T18:00:00+00:00  # 历史时点
 - 产出全部落 `data/research/`：正文分库（news/market/filings.db，内容寻址 append-only）与账本 ledger.db（卡片/快照/trace）；`data/cache/` 下另有可弃的网络备忘层（如 SEC 应答 JSON），不是事实存储。
 - 配额与节奏：Alpha Vantage 免费档 25 次/天、段间 15s 节流；coverage 台账记住“问过哪段”不重烧。Windows 下建议直调环境内 `python.exe`（`conda run` 会吞输出）。
 
+## 可视化调试台（`viz/`）
+
+本地单人用的观测页：标准库 HTTP + SSE，只监听 `127.0.0.1`，前端为无构建的原生页面（`viz/server.py` + `viz/readmodel.py` + `viz/static/`）。它**自己不编排**：“跑全程”就是调 `run_research_round`，与命令行、定时调度器同一个函数；只是把模型客户端套一层事件包装，将每个阶段的流转、逐节点的注入输入/工具调用/JSON 输出实时推到前端便于溯源。唯一多出的节奏是“复用已冻结 Snapshot 只重跑研究图/委员会”，用于不重烧采集配额地反复调试。
+
+```bash
+python viz/server.py                            # 默认 http://127.0.0.1:8765
+python viz/server.py --port 9000                # 换端口
+python viz/server.py --runs-dir tmp/viz_runs    # 换观测产物目录
+```
+
+页面选中标的池/账户/阶段开关后点运行即可看逐阶段实时流转；历史运行事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略）仅供刷新后回看，权威审计仍是账本与 `logs/llm_calls.jsonl`。
+
 ## 运行回测
 
 每次回测必须记录研究语境：

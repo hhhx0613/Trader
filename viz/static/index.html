@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>研究链路可视化调试台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>研究链路可视化调试台</h1>
+      <p class="sub">采集 → 建卡 → 冻结 → 逐标的研究图 → 委员会 ｜ 只读本机账本，不改动研究逻辑</p>
+    </div>
+  </div>
+  <div class="runbar">
+    <span id="statusDot" class="dot idle"></span>
+    <span id="statusText">待命</span>
+    <span id="runId" class="mono muted"></span>
+    <button id="btnCancel" class="ghost" disabled>停止</button>
+    <button id="btnClear" class="ghost">清空视图</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ============ 配置面板 ============ -->
+  <aside class="panel config">
+    <section>
+      <h2>1 · 标的池</h2>
+      <div id="poolGrid" class="chip-grid"></div>
+      <div class="row inline">
+        <input id="customSymbol" type="text" placeholder="追加标的，如 TSLA" maxlength="8">
+        <button id="btnAddSymbol" class="ghost">添加</button>
+      </div>
+      <p class="hint">已选 <span id="poolCount" class="mono">0</span> 只；快照内的标的才可跑研究图</p>
+    </section>
+
+    <section>
+      <h2>2 · 数据来源</h2>
+      <div id="sourceRadios" class="stack"></div>
+      <div id="snapshotPick" class="row hidden">
+        <select id="snapshotSelect"></select>
+        <button id="btnRefreshSnapshots" class="ghost tiny" title="重新读取账本">↻</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>3 · 采集窗口与时点</h2>
+      <div class="row">
+        <label>新闻回看天数<input id="days" type="number" min="1" max="365" value="7"></label>
+        <label>行情回看天数<input id="marketLookback" type="number" min="30" max="1000" value="220"></label>
+      </div>
+      <label>决策时点 as_of（ISO-8601）
+        <input id="asOf" type="text" placeholder="留空 = 实盘当前 UTC；如 2026-10-03T18:00:00+00:00">
+      </label>
+      <p class="hint">“新闻回看天数”：跑全程=采集窗口，决策=从池选卡的 available_from 窗口；“行情回看天数”仅跑全程采集时生效；as_of 留空=实盘（采完定时点），填历史时点则新拉数据被 PIT 闸门拒绝</p>
+    </section>
+
+    <section>
+      <h2>4 · 模型</h2>
+      <div class="row">
+        <label>提供商<select id="providerSelect"></select></label>
+        <label>模型<input id="modelInput" list="modelList" placeholder="留空 = 提供商默认">
+          <datalist id="modelList"></datalist></label>
+      </div>
+    </section>
+
+    <section>
+      <h2>5 · 阶段开关</h2>
+      <label class="check"><input id="filings" type="checkbox" checked><span>采集 SEC 披露（关掉可演示 Fundamental 干净弃权；仅跑全程生效）</span></label>
+      <label class="check"><input id="runResearch" type="checkbox" checked><span>逐标的研究图（Event → Fundamental‖Market → Critic → Packet）；跑全程可关掉只做「采集→建卡→冻结」的数据验收轮，决策节奏必须开着（否则 flow 拒绝）</span></label>
+      <label class="check"><input id="runCommittee" type="checkbox" checked><span>委员会（ThesisBook → PortfolioIntent）；跑全程时随研究图由 flow 一并触发，仅「复用 Snapshot」节奏可单独关掉只看研究图</span></label>
+    </section>
+
+    <section>
+      <h2>6 · 账户状态（冻结进 Snapshot）</h2>
+      <textarea id="accountState" rows="9" spellcheck="false"></textarea>
+      <p class="hint" id="accountHint">Critic 与委员会按这份持仓判敞口/集中度；改这里可观察否决与减仓结论的变化</p>
+    </section>
+
+    <div class="actions">
+      <button id="btnRun" class="primary">▶ 运行</button>
+      <span id="runError" class="error"></span>
+    </div>
+
+    <section class="meta">
+      <h2>口径</h2>
+      <div id="metaInfo" class="kv tiny"></div>
+    </section>
+  </aside>
+
+  <!-- ============ 主视图 ============ -->
+  <section class="workspace">
+    <div id="pipeline" class="pipeline"></div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="stream">事件流</button>
+      <button class="tab" data-tab="nodes">Agent 节点</button>
+      <button class="tab" data-tab="objects">产出对象</button>
+      <button class="tab" data-tab="replay">账本回放</button>
+      <div class="tab-tools">
+        <input id="searchBox" type="search" placeholder="过滤事件/对象…">
+        <span id="counter" class="muted tiny"></span>
+      </div>
+    </nav>
+
+    <div class="tab-body">
+      <div id="tab-stream" class="tab-pane active"></div>
+      <div id="tab-nodes" class="tab-pane"></div>
+      <div id="tab-objects" class="tab-pane"></div>
+      <div id="tab-replay" class="tab-pane">
+        <div class="row inline">
+          <button id="btnTraces" class="ghost">载入最近 trace</button>
+          <select id="traceSelect"></select>
+          <span class="muted tiny">回放读账本：对象 + 工具调用 + Gateway 查询审计（不含模型原始输入输出）</span>
+        </div>
+        <div id="replayBody"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ 详情抽屉 ============ -->
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <div>
+      <span id="drawerKind" class="badge"></span>
+      <h3 id="drawerTitle"></h3>
+    </div>
+    <button id="drawerClose" class="ghost">✕</button>
+  </div>
+  <div id="drawerBody" class="drawer-body"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
