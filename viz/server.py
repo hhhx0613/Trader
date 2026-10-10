@@ -58,17 +58,19 @@ DEFAULT_RUNS_DIR = config.PROJECT_ROOT / "output" / "viz_runs"
 DEFAULT_POOL = ["AAPL", "AMZN", "GOOGL", "JNJ", "JPM", "MSFT", "NVDA", "UNH", "V", "WMT"]
 
 STAGE_LABELS = {
-    "collect": "阶段 0 · 采集原始数据",
+    # 编号对齐 docs/development_plan.md：阶段 1 采集/建卡/冻结，2 逐标的研究，3 委员会，4 组合政策
+    "collect": "阶段 1 · 采集原始数据",
     "ingest": "阶段 1 · 建卡",
-    "freeze": "阶段 2 · 冻结 Snapshot",
-    "research": "阶段 3 · 逐标的研究图",
-    "committee": "阶段 5 · 委员会",
+    "freeze": "阶段 1 · 冻结 Snapshot",
+    "research": "阶段 2 · 逐标的研究图",
+    "committee": "阶段 3 · 委员会",
+    "portfolio": "阶段 4 · 组合政策",
 }
 
 # 数据来源三节奏，与 flow 对齐：collect/decide 走 run_research_round，snapshot 走生产原语
 RUN_MODES = {
-    "collect": "跑全程：联网采集 → 建卡 → 用本轮卡集点名冻结 → 研究图 → 委员会",
-    "decide": "决策：不联网，从已入池卡片按 available_from 窗口选卡冻结 → 研究图 → 委员会（需真实账户）",
+    "collect": "跑全程：联网采集 → 建卡 → 用本轮卡集点名冻结 → 研究图 → 委员会 → 组合政策",
+    "decide": "决策：不联网，从已入池卡片按 available_from 窗口选卡冻结 → 研究图 → 委员会 → 组合政策（需真实账户）",
     "snapshot": "调试：复用已冻结 Snapshot，只重跑研究图/委员会（不采集不冻结，不烧采集配额）",
 }
 
@@ -488,7 +490,7 @@ class RunObserver:
         run.stage_start("collect", via_flow=True, handled_by="agents/research/flow.py",
                         as_of=opts.as_of or ("实盘：采集完成后由 flow 定时点" if collecting
                                              else "决策：不联网，as_of 默认取当前 UTC"))
-        for stage in ("ingest", "freeze", "research", "committee"):
+        for stage in ("ingest", "freeze", "research", "committee", "portfolio"):
             run.stage_start(stage, via_flow=True)  # 先点亮，产出与耗时在 flow 返回后按真实时刻回填
         started = utc_now()
         model = TracingModel(run, client) if opts.run_research else None
@@ -517,7 +519,7 @@ class RunObserver:
                            duration_ms=None)
         self.snapshot = result.snapshot
         if result.snapshot is None:
-            for stage in ("freeze", "research", "committee"):
+            for stage in ("freeze", "research", "committee", "portfolio"):
                 run.stage_skip(stage, "本轮未冻结 Snapshot")
             return
         run.object("snapshot", result.snapshot.snapshot_id, result.snapshot.model_dump(mode="json"))
@@ -528,9 +530,10 @@ class RunObserver:
                                   "evidence": len(result.snapshot.evidence_ids)},
                        duration_ms=None)  # 与采集同属 flow 的一次调用，拆不开就不假分段
         if not result.packets:
-            reason = "数据验收轮：只跑采集→建卡→冻结，未注入模型（研究图与委员会都跳过）"
+            reason = "数据验收轮：只跑采集→建卡→冻结，未注入模型（研究图、委员会与组合政策都跳过）"
             run.stage_skip("research", reason)
             run.stage_skip("committee", reason)
+            run.stage_skip("portfolio", reason)
             return
         claims_total = 0
         for packet in result.packets:
@@ -546,6 +549,7 @@ class RunObserver:
                        duration_ms=_ms_between(first_model, committee or ended))
         if result.intent is None:
             run.stage_skip("committee", "flow 本轮未跑委员会")
+            run.stage_skip("portfolio", "没有 PortfolioIntent，组合政策无从执行")
             return
         book = self.reader.thesis_book_for_trace(result.intent.trace_id)
         if book is not None:
@@ -558,6 +562,27 @@ class RunObserver:
                                                 "priority": i.priority} for i in result.intent.items],
                                      "trace_id": result.intent.trace_id},
                        duration_ms=_ms_between(committee, ended))
+        if result.portfolio is None:
+            run.stage_skip("portfolio", "flow 本轮未跑组合政策")
+            return
+        # 组合政策是确定性纯计算，与委员会同属 flow 的一次调用，拆不开就不假分段
+        run.stage_start("portfolio", intent_id=result.intent.intent_id)
+        p = result.portfolio
+        run.object("intent_constraints", p.constraints.intent_id,
+                   p.constraints.model_dump(mode="json"), trace_id=p.constraints.trace_id)
+        run.object("target_portfolio", p.target.target_portfolio_id,
+                   p.target.model_dump(mode="json"), trace_id=p.target.trace_id)
+        run.object("risk_projected_portfolio", p.projected.projected_portfolio_id,
+                   p.projected.model_dump(mode="json"), trace_id=p.projected.trace_id)
+        run.object("order_plan", p.order_plan.order_plan_id,
+                   p.order_plan.model_dump(mode="json"), trace_id=p.order_plan.trace_id)
+        run.stage_done("portfolio", {"via_flow": True, "order_plan_id": p.order_plan.order_plan_id,
+                                     "orders": len(p.order_plan.orders),
+                                     "deferred": len(p.order_plan.deferred_trades),
+                                     "exposure": round(p.projected.total_exposure, 4),
+                                     "adjustments": len(p.projected.adjustments),
+                                     "trace_id": p.order_plan.trace_id},
+                       duration_ms=None)
 
     def _publish_evidence(self, snapshot) -> None:
         """外发本轮冻结卡集的抽样：契约对象原样发出，全文另有正文库接口。"""
@@ -587,6 +612,7 @@ class RunObserver:
         run, opts = self.run, self.options
         for stage in ("collect", "ingest", "freeze"):
             run.stage_skip(stage, "复用已冻结 Snapshot（flow 无此节奏，观测层直接调用研究原语）")
+        run.stage_skip("portfolio", "单阶段调试不经过 flow：组合政策需要本轮账户行情与意图输入，不在此节奏重建")
         self.snapshot = self.ledger.get_snapshot(str(opts.snapshot_id))
         run.object("snapshot", self.snapshot.snapshot_id, self.snapshot.model_dump(mode="json"))
         run.log(f"复用 Snapshot {self.snapshot.snapshot_id}｜标的 {', '.join(self.snapshot.symbols)}"

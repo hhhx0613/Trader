@@ -66,7 +66,14 @@ class LLMClient:
             "models": ["deepseek-flash"],
         },
     }
-    
+
+    # 瞬时网络异常（代理 TLS 握手/连接超时）的重试口径，交由 OpenAI SDK 原生退避处理。
+    # 走系统代理时 DeepSeek 偶发握手超时会击穿单次请求；不重试会让研究节点直接 fail-closed
+    # （委员会全观望）并把偶发抖动放大成整轮失败。SDK 对连接/超时/429/5xx 做指数退避，
+    # 重试耗尽后仍上抛，绝不吞错伪造成功。
+    network_timeout = config.LLM_TIMEOUT_SECONDS
+    network_max_retries = config.LLM_NETWORK_RETRIES
+
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         """
         参数：
@@ -102,12 +109,23 @@ class LLMClient:
         # 初始化 OpenAI 客户端
         try:
             import openai
-            self.client = openai.OpenAI(
-                api_key=self.api_key,
-                base_url=self.provider_config["base_url"],
-            )
         except ImportError:
             raise ImportError("未安装 openai 库，请运行：pip install openai")
+        # 网络重试直接交给 SDK：max_retries 对瞬时异常做指数退避，无需自己写循环。
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.provider_config["base_url"],
+            timeout=self.network_timeout,
+            max_retries=self.network_max_retries,
+        )
+
+    def _create_chat(self, **kwargs):
+        """发起一次 chat completion，网络瞬时异常的重试交由 OpenAI SDK 的 max_retries 处理。
+
+        SDK 对连接/超时/429/5xx 做指数退避；重试耗尽后仍上抛最后一次异常，
+        让上层（如委员会 fail-closed）按既有语义处理，绝不吞错伪造成功。
+        """
+        return self.client.chat.completions.create(**kwargs)
     
     def chat(
         self,
@@ -145,7 +163,7 @@ class LLMClient:
             kwargs["max_tokens"] = max_tokens
         
         try:
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._create_chat(**kwargs)
             result = response.choices[0].message.content
             logger.debug(f"LLM chat completed, response length: {len(result) if result else 0}")
             return result
@@ -276,7 +294,7 @@ class LLMClient:
                                       "temperature": temperature, "tools": tools}
             if max_tokens is not None:
                 kwargs["max_tokens"] = max_tokens
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._create_chat(**kwargs)
             assistant = response.choices[0].message
             calls = assistant.tool_calls or []
             if not calls:

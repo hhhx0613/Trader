@@ -41,12 +41,14 @@
 
 - 阶段 1 主线已交付（2026-10-03）：三采集器（`core/data/news.py`/`market.py`/`filings.py`）+ 建卡/冻结双入口 + `select_evidence` 池选卡 + 入口薄壳；离线回归 30 项（`tests/research/`）全绿；NVDA 真实轮已冻结验收（news 1045 条、去重后 891 卡，`snap_223d227a…`）。
 - 编排收敛（2026-10-05）：采集/建卡/冻结/研究图/委员会的阶段门控上移为 `agents/research/flow.py` 的 `run_research_round`，原 `scripts/capture_research_snapshot.py`（只到冻结）与 `scripts/trace_research_flow.py`（通到 Committee 的逐节点打印）已删除并合并为 `scripts/research_run.py`；`research_run.py` 只保留「跑全程」一个入口（默认 `collect` + 注入模型），`daily`/`decide` 交给外部定时调度器直接调用 `run_research_round`，不再各自养命令行。`viz/` 也已删掉自带的 `pipeline.py`：观测层（事件总线/SSE/取消/TracingModel）合并进 `viz/server.py`，「跑全程」直接复用 `flow.run_research_round`，与 CLI、定时调度器同一函数；仅保留 flow 没有的「复用已冻结 Snapshot 单阶段调试」节奏直接调用生产原语 `PerAssetResearchGraph`/`Committee`。
+- 风险状态收敛（2026-10-10）：`core/portfolio/runtime.py:update_risk_state` 是 ATR 止损、`peak_equity`、回撤和 `risk_locked` 的纯状态转换；主线 daily 在行情入库后读取 PIT 日线、把返回值回写至调用方账户的 `risk_state`。若止损或首次锁仓，daily 必须要求调用方已注入模型，并在同一个 `run_research_round` 内复用本轮卡池自动进入既有 `decide` 流程，最终只产出 `OrderPlan`；无风险时不触碰模型。`untradable` 不入库，只由本轮 `TradingInputs` 现推。`risk_locked` 只会自动置位，人工解除须由调用方显式把账户字段复位。旧 `MultiStockBacktestEngine` 不在此接线范围内。
 - 测试收敛（2026-10-05）：删除 PPO/回测线的 `tests/test_ppo_env.py`、`tests/test_ppo_stage2.py`、`tests/test_risk_manager.py`，`tests/` 下只保留研究链回归（`tests/research/`，当前 52 项）。被删测试覆盖的 `core/ppo/`、`core/risk_manager.py` 实现本身保留，但自此无测试覆盖——它们属于旧回测基线，随该线退役时一并删除，不再单独补测。
 - 实盘决策时点后置：入口脚本未传 `--as-of` 时采集完才定 `as_of`，本轮到达数据本轮可用；传 `--as-of` 时点钉死，本轮新拉数据被 PIT 正确拒绝。
 - 账户口径的已知敞口：`account_state`（含 `regime`、持仓、限额）由调用方手填 JSON 提供，`freeze_snapshot` 对其不做 PIT 校验，因此 `--as-of` 历史回放会把当下的账户与行情判断带入历史时点。当前用法只在实盘时点决策，暂不加校验；`regime` 也不由系统推断，`DataGateway.get_regime()` 仅回读冻结值。
 - 尚未开始：最低数据要求检查与 `rejection_code` 落盘、Gateway 查询扩展（阶段 2 依赖）、事件驱动复核入口。
 - 历史欠账（用户决定延后）：`data/research/raw/` 下 957 个文件系统时代正文目录是 9 月旧卡的唯一副本，须先按哈希迁入分库再删；`data/cache/news/` 旧 CSV 网格未入账本，如需历史回放按 `available_at = published_at` 假设口径另行处理并明牌标注。
-- 权重与订单主线、执行改造和 OutcomeGraph 尚未开始；研究 Agent、单标的图与 Committee 已交付（见阶段 2/3 条目与 `tests/research/`）。
+- 阶段 4 重构中（2026-10-09）：此前仅有参考分配/简化门控，不满足 Plan。现改为显式配置的协方差/换手凸优化、完整硬风险投影与订单级成本门控，并把结果接入研究全流程终端输出；任何市场、账户、限额或成本输入缺失均显式拒绝。不接入旧回测引擎，也不运行回测。执行改造和 OutcomeGraph 尚未开始；研究 Agent、单标的图与 Committee 已交付（见阶段 2/3 条目与 `tests/research/`）。
+- 行情窗口重构（2026-10-10）：删除以 coverage 台账判断完整性的 `ensure_market_coverage`。采集阶段每轮以 `load_price_frame` 合并截至 `as_of` 向前 400 个自然日的 PIT 批次为唯一事实，仅补窗口缺失的前段或尾段并返回新旧合并帧；coverage 只保留请求审计。Portfolio 只读此窗口，并仍以全池至少 253 个对齐收盘价作为协方差前置条件。
 
 ## 4. 阶段 0：补齐契约与冻结图接口
 
@@ -138,6 +140,8 @@
 
 **业务位置：** 动作约束 -> 风险预算参考分配 -> 波动率目标 -> 风险投影 -> 成本门控，全程确定性程序。
 
+**实施顺序（2026-10-05 确认）：** 先在既有 `core/research/contracts.py` 定义组合层对象，再在 `core/portfolio/` 实现 `IntentConstraintBuilder`、风险预算参考分配、`VolatilityTarget`、`RiskProjection` 与 `CostGate`。第一版不新增数值优化依赖：用截止 `as_of` 的波动率生成可复算参考权重，并顺序应用硬边界；协方差优化须另行固定求解器与可复现验证后才可接入。旧 `RiskManager`、`BaseBacktestEngine` 与 `MultiStockBacktestEngine` 只作为阶段 5 的规则/成本/撮合复用来源，阶段 4 不改变其决策入口。
+
 **工作项**
 
 - 【改造】迁移 `_stock_daily_vol`/`_position_sizing` 到 `core/portfolio/`，作 `RiskBudgetAllocator` 的逆波动率参考分配；`decision_func` 旧公式入口原样保留作对照。
@@ -156,6 +160,8 @@
 ## 9. 阶段 5：T-1/T 日模拟执行与离线回放
 
 **业务位置：** 已批准的 `OrderPlan` 交由既有撮合与账本记账；执行引擎不重新解释研究或组合。
+
+**实施顺序（2026-10-06 确认）：** 先在既有契约/账本中补 `Fill` 及 typed append/get，再新增只接收冻结 `OrderPlan` 的 `SimulatedExecution`。首版严格执行 T-1 决策、T 日开盘价、现金/持仓/成交量参与率、滑点和固定佣金；不改 `MultiStockBacktestEngine` 的 `decide_func` 入口，也不让旧 Top-K/PPO 与新主线共用订单决定权。离线 replay 与 `run_backtest.py` 新入口等待执行对象和数据读取边界稳定后再接入。
 
 **工作项**
 

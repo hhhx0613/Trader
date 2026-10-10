@@ -9,6 +9,7 @@ import json
 
 from agents.research import PerAssetResearchGraph
 from agents.research.event_agent import EventAgent
+from agents.research.market_agent import MarketAgent
 from core.research import DataGateway, ResearchLedger, SnapshotBuilder
 from core.research.raw import RawPayloadStore
 from agents.research.tools import ResearchTools
@@ -297,3 +298,15 @@ def test_reads_never_touch_the_network_even_for_uncovered_windows(tmp_path, monk
     assert gateway.get_news_batch(snapshot_id=snapshot.snapshot_id, symbol="AAPL", as_of=AS_OF) == []
     assert gateway.search_evidence(snapshot_id=snapshot.snapshot_id, symbol="AAPL", as_of=AS_OF, query="anything") == []
     assert called == []
+
+
+def test_market_agent_rejects_uninjected_technical_threshold_language():
+    agent = object.__new__(MarketAgent)
+    assert not agent._accept_claim_item({
+        "statement": "ADX is below the conventional trend-strength threshold.",
+        "unknowns": [],
+    })
+    assert agent._accept_claim_item({
+        "statement": "ADX is 16.2; no program-defined threshold was supplied.",
+        "unknowns": ["No program-defined threshold is supplied."],
+    })

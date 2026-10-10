@@ -29,6 +29,10 @@ class ClaimAgent:
         self.model = model
         self.prompt, self.prompt_version = load_prompt(self.prompt_name)
 
+    def _accept_claim_item(self, item: dict[str, Any]) -> bool:
+        """子类可拒绝违反其证据解释边界的单条模型输出。"""
+        return True
+
     def _claim(self, state: ResearchState, *, instruction: str, evidence: list[dict[str, Any]],
                upstream: tuple[str, ...] = (),
                context: dict[str, Any] | None = None,
@@ -84,6 +88,8 @@ class ClaimAgent:
                                           detail="model returned no claims array")
             cards: list[ClaimCard] = []
             for item in raw_claims[:_MAX_CLAIMS_PER_AGENT]:
+                if not isinstance(item, dict) or not self._accept_claim_item(item):
+                    continue
                 cited = tuple(item.get("supporting_evidence_ids", ()))
                 opposing = tuple(item.get("contradicting_evidence_ids", ()))
                 if not set(cited) <= ids or not set(opposing) <= ids:

@@ -29,7 +29,10 @@ from core.research import (
     RouteDecision,
     ThesisBook,
 )
-from core.research.contracts import Contract, CriticVerdict, IntentItem
+from core.research.contracts import (
+    Contract, CriticVerdict, Fill, IntentConstraints, IntentItem, OrderPlan,
+    RiskProjectedPortfolio, TargetPortfolio,
+)
 from core.research.providers import PITValidationError, validate_available_at
 from core.research.store import OBJECT_TABLES
 
@@ -71,10 +74,13 @@ def test_persisted_objects_roundtrip_via_ledger(tmp_path, table, suffix, id_fiel
     assert restored.model_dump(mode="json") == contract.model_dump(mode="json")
 
 
-def test_only_research_to_committee_contracts_are_frozen():
-    """禁止提前或同义异名的并行契约 / no orphan or prematurely added Contract subclasses."""
+def test_only_documented_contracts_are_frozen():
+    """禁止未在 Plan 中声明的并行契约 / no orphan contract subclasses."""
     found = {value for value in vars(contracts_module).values() if isinstance(value, type) and issubclass(value, Contract) and value is not Contract}
-    assert found == {EvidenceCard, ResearchSnapshot, ClaimCard, ResearchPacket, ThesisBook, PortfolioIntent}
+    assert found == {
+        EvidenceCard, ResearchSnapshot, ClaimCard, ResearchPacket, ThesisBook, PortfolioIntent,
+        IntentConstraints, TargetPortfolio, RiskProjectedPortfolio, OrderPlan, Fill,
+    }
 
 
 def test_claim_requires_supporting_citation():

@@ -22,6 +22,16 @@ PIT 数据 → EvidenceCard → 个股研究 Agent → ClaimCard
 
 原始证据、LLM 论点和交易动作将严格分层。最终系统不固定 Top-K：委员会可在全股票池和当前持仓上下文中选择买入、持有、减仓、卖出或观望；确定性组合政策、成本模型和风险引擎将意图转换为可执行的股票加现金权重。
 
+### 阶段 4 组合政策（离线）
+
+`core/portfolio/` 已提供确定性的 `PortfolioPolicy`：`PortfolioIntent -> IntentConstraints -> TargetPortfolio -> RiskProjectedPortfolio -> OrderPlan`。它使用动作边界、逆波动率参考分配、协方差波动率目标、只减风险的硬约束投影和成本门控；所有中间对象均可写入 `ResearchLedger`。**组合政策参数（单仓上限、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`**（无 `PORTFOLIO_` 前缀的模块级常量），`data/account*.json` 只承载账户状态；`risk_state`（峰值/回撤/止损/锁仓）由 daily 节奏从 PIT 日线重算并回写账户。研究链入口（flow）在 Committee 后自动调用组合政策，旧回测引擎不调用它。
+
+### 阶段 5 模拟执行（离线）
+
+`core/execution/` 的 `SimulatedExecution` 只接收冻结的 `OrderPlan`：T-1 形成订单，T 日按开盘价、成交量参与率、滑点、佣金、现金与持仓撮合，并输出显式 `Fill`（完整、部分或延后）。它不重选标的、不重算权重，旧 Top-K/PPO 回测路径也不调用它。只读 replay 与新回测命令入口仍未接入。
+
+研究全流程在 Committee 后会继续运行组合链：`agents/research/flow.py` 从 `config.py` 政策参数与 PIT 行情、账户状态构造输入，产出 `IntentConstraints`/`TargetPortfolio`/`RiskProjectedPortfolio`/`OrderPlan` 四个对象并写入账本；viz 调试台的「组合政策」阶段与账本回放可直接展示。任何一个行情、账户或限额输入缺失均会拒绝本轮组合决策，绝不填充默认值。
+
 ### 阶段 2 研究图谱
 
 `agents/research/` 提供按标的隔离的 LangGraph，拓扑为 `(Event -> Fundamental) || Market -> Risk Critic -> ResearchPacket`：Event 先确立或弃权论点，再分叉两路——Fundamental 用独立财报证据验证 Event 已确立的论点；Market 是独立分支，Event 弃权时不会被硬风控闸掉（例如硬风险或纯价格触发场景）。`event_agent.py`、`fundamental_agent.py`、`market_agent.py`、`risk_critic.py` 各自承担对应研究职责；`claim_agent.py` 只是它们共用的带引用 ClaimCard 校验边界。
@@ -71,7 +81,7 @@ python scripts/research_run.py --account data/account.json        # 换账户文
 python scripts/research_run.py --as-of 2026-10-03T18:00:00+00:00  # 历史时点回放（本轮新拉数据被 PIT 拒绝）
 ```
 
-- **全链需要真实账户。** `data/account.json` 至少含 `cash`/`positions`/`limits`（可带 `regime`、`turnover_cost_estimate`）。缺真实账户时 flow 直接失败而不是退回占位值：Risk Critic 的规定是「缺 limits 或持仓状态不得当作放行」，占位账户只会烧出一轮全 `abstain` 的意图。`data/account*.json` 已进 `.gitignore`，仓库不代存持仓。
+- **全链需要真实账户。** `data/account.json` 至少含 `cash`/`positions`/`limits`（可带 `regime`、`turnover_cost_estimate`；`risk_state` 由 daily 从 PIT 日线重算并回写，不要求手填）；组合政策参数不在账户文件里，统一读自 `config.py`。缺真实账户时 flow 直接失败而不是退回占位值：Risk Critic 的规定是「缺 limits 或持仓状态不得当作放行」，占位账户只会烧出一轮全 `abstain` 的意图。`data/account*.json` 已进 `.gitignore`，仓库不代存持仓。
 - **同时点重跑会被拒。** trace_id 取自 `as_of` 的秒级戳，账本用主键拒绝覆盖历史；调度器应把这条 `ValueError` 当幂等信号（退出码 2），而不是崩溃。
 - 实盘模式（不传 `--as-of`）在全部采集完成后才定决策时点，本轮到达的数据本轮即可用；回放模式时点钉死，本轮新拉数据被 PIT 闸门拒绝。
 - 产出全部落 `data/research/`：正文分库（news/market/filings.db，内容寻址 append-only）与账本 ledger.db（卡片/快照/trace）；`data/cache/` 下另有可弃的网络备忘层（如 SEC 应答 JSON），不是事实存储。
@@ -126,7 +136,9 @@ python scripts/run_backtest.py \
 agents/                         LLM、VADER 与当前 Top-K 决策
 core/                           数据、指标、回测、风控与 PPO
 core/research/                  PIT Snapshot、原始载荷、审计账本与只读 DataGateway
-tests/research/                 阶段 0-3 契约、离线数据、审计与编排入口回归测试
+core/portfolio/                 阶段 4 确定性组合约束、配置、硬风控投影与成本门控
+core/execution/                 阶段 5 冻结订单的 T-1/T 日模拟撮合
+tests/research/                 阶段 0-5 契约、离线数据、审计、组合与执行回归测试
 scripts/research_run.py         研究链唯一人类入口（一条命令跑全程；daily/decide 由调度器直接调 flow）
 scripts/run_backtest.py         统一回测入口
 scripts/train_ppo.py            PPO 训练入口

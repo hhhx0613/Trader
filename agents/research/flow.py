@@ -23,18 +23,20 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from core import config
 from core.data import filings as filings_collector
 from core.data import news as news_collector
-from core.data.market import INDICATORS_VERSION, build_feature_card, ensure_market_coverage
+from core.data.market import INDICATORS_VERSION, build_feature_card, prepare_market_history
 from core.research import DataGateway, ResearchLedger
 from core.research.contracts import EvidenceCard, PortfolioIntent, ResearchPacket, ResearchSnapshot
 from core.research.raw import RawPayloadStore
 from core.research.snapshot import SnapshotBuilder
+from core.portfolio.runtime import build_policy_and_inputs, load_risk_state
+from core.portfolio.portfolio_policy import PortfolioPolicyResult
 
 from .committee import Committee
 from .graph import PerAssetResearchGraph
@@ -81,7 +83,10 @@ class RoundResult:
     snapshot: ResearchSnapshot | None = None
     packets: tuple[ResearchPacket, ...] = ()
     intent: PortfolioIntent | None = None
+    portfolio: PortfolioPolicyResult | None = None
     evidence: int = 0
+    risk_state: dict[str, Any] | None = None
+    risk_triggered: bool = False
 
 
 def run_research_round(options: FlowOptions, *, model: JsonModel | None = None,
@@ -131,7 +136,26 @@ def _round(options: FlowOptions, *, model: JsonModel | None, book: ResearchLedge
                                                  as_of=as_of, records=records))
 
         if options.mode == "daily":
-            return RoundResult(mode="daily", as_of=as_of, ingested=len(cards))
+            if options.account_state is None:
+                return RoundResult(mode="daily", as_of=as_of, ingested=len(cards))
+            previous = dict(options.account_state.get("risk_state") or {})
+            risk_state = load_risk_state(options.account_state, options.pool, as_of, store)
+            # 纯函数只返回状态；入口负责把它交还给真实账户/回测账户以持久化 peak_equity。
+            options.account_state["risk_state"] = risk_state
+            risk_triggered = bool(risk_state["stop_loss"]) or (
+                bool(risk_state["risk_locked"]) and not bool(previous.get("risk_locked", False)))
+            if not risk_triggered:
+                return RoundResult(mode="daily", as_of=as_of, ingested=len(cards), risk_state=risk_state)
+            # 正常 daily 不碰模型；硬风险是唯一允许升级到既有 decide 全流程的条件。
+            _require_decision_inputs(model, options.account_state)
+            decision = _round(
+                FlowOptions(pool=options.pool, mode="decide", as_of=as_of, news_days=options.news_days,
+                            market_lookback=options.market_lookback, filings=options.filings,
+                            account_state=options.account_state, trace_prefix=options.trace_prefix),
+                model=model, book=book, store=store,
+            )
+            return replace(decision, mode="daily", ingested=len(cards), risk_state=risk_state,
+                           risk_triggered=True)
 
         source_versions = {"news": news_collector.NEWS_VERSION, "market": INDICATORS_VERSION,
                            "filings": filings_collector.FILINGS_VERSION}
@@ -164,21 +188,37 @@ def _round(options: FlowOptions, *, model: JsonModel | None, book: ResearchLedge
         intent = Committee(ledger=book, gateway=gateway, model=model).run(
             snapshot_id=snapshot.snapshot_id, packet_ids=tuple(packet.packet_id for packet in packets),
             as_of=snapshot.as_of, trace_id=f"{options.trace_prefix}-committee-{stamp}")
+        policy, current, volatilities, covariance, trading, risk_state = build_policy_and_inputs(
+            dict(options.account_state), options.pool, snapshot.as_of, store)
+        portfolio_trace = f"{options.trace_prefix}-portfolio-{stamp}"
+        book.start_trace(portfolio_trace, snapshot.as_of)
+        portfolio = policy.build(intent, trace_id=portfolio_trace, current_weights=current,
+                                 volatilities=volatilities, covariance=covariance, trading=trading,
+                                 drawdown=float(risk_state["drawdown"]),
+                                 untradable=set(trading.untradable_symbols), stop_loss=set(risk_state["stop_loss"]),
+                                 risk_locked=bool(risk_state["risk_locked"]))
+        book.append_constraints(portfolio.constraints)
+        book.append_target_portfolio(portfolio.target)
+        book.append_risk_projected_portfolio(portfolio.projected)
+        book.append_order_plan(portfolio.order_plan)
+        book.complete_trace(portfolio_trace, snapshot.as_of)
     return RoundResult(mode=options.mode, as_of=as_of, ingested=len(cards), snapshot=snapshot,
-                       packets=packets, intent=intent, evidence=len(snapshot.evidence_ids))
+                       packets=packets, intent=intent, portfolio=portfolio, evidence=len(snapshot.evidence_ids))
 
 
 def _collect(store: RawPayloadStore, options: FlowOptions, window: datetime) -> list[dict[str, Any]]:
     """采集新闻与披露记录 + 保证行情素材批次已入库；K 线批次是素材不是事实，不进 Snapshot。"""
     end = window.strftime("%Y-%m-%d")
     news_start = (window - timedelta(days=options.news_days)).strftime("%Y-%m-%d")
-    market_start = (window - timedelta(days=options.market_lookback)).strftime("%Y-%m-%d")
     records: list[dict[str, Any]] = []
     for symbol in options.pool:
         records.extend(news_collector.fetch_news_records(symbol, news_start, end, store=store))
         if options.filings:
             records.extend(filings_collector.fetch_filings_records(symbol, news_start, end))
-        ensure_market_coverage(symbol, market_start, end, store=store)
+    # 持仓不一定仍在研究池中；daily 仍须先补齐其行情，才能对它做止损和回撤检查。
+    held = tuple(str(position["symbol"]).upper() for position in (options.account_state or {}).get("positions", ()))
+    for symbol in tuple(dict.fromkeys((*options.pool, *held))):
+        prepare_market_history(symbol, window, store=store, include_fresh=options.as_of is None)
     return records
 
 

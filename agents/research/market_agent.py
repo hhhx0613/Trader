@@ -1,5 +1,7 @@
 """行情 Agent / Interpretation of program-computed frozen market facts."""
 
+import re
+
 from .claim_agent import ClaimAgent
 from .types import ResearchState
 
@@ -9,6 +11,16 @@ class MarketAgent(ClaimAgent):
 
     name = "market"
     prompt_name = "market"
+
+    # Prompt 是第一道边界；这里拒绝典型的「引用教科书阈值」措辞，防止模型在没有
+    # 程序给出阈值字段时把外部技术分析规则伪装成冻结市场事实。
+    _UNINJECTED_THRESHOLD = re.compile(
+        r"\b(?:common|conventional|typical|textbook|standard|meaningful)\s+"
+        r"(?:technical(?:[- ]analysis)?\s+|trend(?:[- ]strength)?\s+)?threshold\b", re.IGNORECASE)
+
+    def _accept_claim_item(self, item: dict) -> bool:
+        text = " ".join(str(item.get(key, "")) for key in ("statement", "unknowns"))
+        return not bool(self._UNINJECTED_THRESHOLD.search(text))
 
     def __call__(self, state: ResearchState) -> dict:
         # Market 仅解释本标的行情卡；跨维度比较留给 Critic/Committee，避免先验叙事锚定独立行情判断。

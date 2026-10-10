@@ -21,9 +21,14 @@ from typing import Any, Iterable
 from .contracts import (
     ClaimCard,
     EvidenceCard,
+    Fill,
+    IntentConstraints,
+    OrderPlan,
     PortfolioIntent,
+    RiskProjectedPortfolio,
     ResearchPacket,
     ResearchSnapshot,
+    TargetPortfolio,
     ThesisBook,
 )
 
@@ -141,7 +146,40 @@ class ResearchLedger:
     def get_intent(self, intent_id: str) -> PortfolioIntent:
         return PortfolioIntent.model_validate_json(self._get("portfolio_intents", intent_id)["payload"])
 
-    # 组合/订单/复盘契约的 append/get 在阶段 4-6 定义对应契约类时一并补，不提前留空方法。
+    def append_constraints(self, constraints: IntentConstraints) -> None:
+        self._append("intent_constraints", constraints.intent_id, constraints.trace_id,
+                     constraints.model_dump(mode="json"), constraints.created_at)
+
+    def get_constraints(self, intent_id: str) -> IntentConstraints:
+        return IntentConstraints.model_validate_json(self._get("intent_constraints", intent_id)["payload"])
+
+    def append_target_portfolio(self, target: TargetPortfolio) -> None:
+        self._append("target_portfolios", target.target_portfolio_id, target.trace_id,
+                     target.model_dump(mode="json"), target.created_at)
+
+    def get_target_portfolio(self, target_portfolio_id: str) -> TargetPortfolio:
+        return TargetPortfolio.model_validate_json(self._get("target_portfolios", target_portfolio_id)["payload"])
+
+    def append_risk_projected_portfolio(self, projected: RiskProjectedPortfolio) -> None:
+        self._append("risk_projected_portfolios", projected.projected_portfolio_id, projected.trace_id,
+                     projected.model_dump(mode="json"), projected.created_at)
+
+    def get_risk_projected_portfolio(self, projected_portfolio_id: str) -> RiskProjectedPortfolio:
+        return RiskProjectedPortfolio.model_validate_json(
+            self._get("risk_projected_portfolios", projected_portfolio_id)["payload"])
+
+    def append_order_plan(self, plan: OrderPlan) -> None:
+        self._append("order_plans", plan.order_plan_id, plan.trace_id,
+                     plan.model_dump(mode="json"), plan.created_at)
+
+    def get_order_plan(self, order_plan_id: str) -> OrderPlan:
+        return OrderPlan.model_validate_json(self._get("order_plans", order_plan_id)["payload"])
+
+    def append_fill(self, fill: Fill) -> None:
+        self._append("fills", fill.fill_id, fill.trace_id, fill.model_dump(mode="json"), fill.created_at)
+
+    def get_fill(self, fill_id: str) -> Fill:
+        return Fill.model_validate_json(self._get("fills", fill_id)["payload"])
 
     def _append(self, table: str, object_id: str, trace_id: str, payload: dict[str, Any], created_at: datetime) -> None:
         if table not in OBJECT_TABLES[1:]:

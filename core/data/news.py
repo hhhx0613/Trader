@@ -223,10 +223,10 @@ def fetch_news_records(symbol: str, start_date: str, end_date: str, *,
     for seg_start, seg_end in _segments_for(start_date, end_date):
         if (seg_start, seg_end) in covered or _segment_covered_by_days(seg_start, seg_end, covered):
             # 重放：正文库读回的 payload 回转成记录（哈希稳定，builder 天然去重）
-            records.extend(
-                record_from_payload(p)
-                for p in store.payloads_in_range("news", symbol, seg_start, seg_end)
-            )
+            replayed = [record_from_payload(p)
+                        for p in store.payloads_in_range("news", symbol, seg_start, seg_end)]
+            records.extend(replayed)
+            print(f"[News] {symbol} 段 {seg_start}~{seg_end}：缓存命中 {len(replayed)} 条（库内重放，未烧配额）")
             continue
 
         if api_calls >= config.NEWS_DAILY_QUOTA:

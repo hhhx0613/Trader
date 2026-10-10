@@ -228,3 +228,88 @@ DEFAULT_LLM_PROVIDER = "deepseek"
 
 # 默认 LLM 模型名称（为空时使用提供商的默认模型）
 DEFAULT_LLM_MODEL = "deepseek-flash"
+
+# 单次请求超时秒数（瞬时网络异常的重试交由 OpenAI SDK 原生指数退避处理）
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+
+# 超时/连接类异常的最大重试次数（作为 openai.OpenAI(max_retries=...) 的入参）
+LLM_NETWORK_RETRIES = int(os.getenv("LLM_NETWORK_RETRIES", "2"))
+
+
+# ==================== 组合政策（PortfolioPolicy，core/portfolio/ 使用） ====================
+# 本块是新确定性组合层的政策默认值，与上方旧基线常量（TARGET_VOLATILITY /
+# COMMISSION_PER_TRADE / MAX_POSITION_RATIO 等）并存：旧常量服务于 strategy/run_backtest
+# 基线，新常量服务于 core/portfolio/PortfolioPolicy，两者口径不同，勿混用。
+# config_version 会写入审计对象，回放时据此识别当时所用规则版本。
+
+POLICY_VERSION = "portfolio-policy-v1-provisional"  # 含 provisional：多数阈值未经真实成交校准
+
+# 持仓约束：单券上限 / 保持带 / 最小开仓 / 最多持仓数
+MAX_POSITION_WEIGHT = 0.35
+HOLD_BAND = 0.02
+SEED_WEIGHT = 0.05
+MAX_HOLDINGS = 5
+
+# 行业映射：供行业集中度约束使用
+SECTORS = {
+    "AAPL": "information_technology",
+    "AMZN": "consumer_discretionary",
+    "GOOGL": "communication_services",
+    "JNJ": "health_care",
+    "JPM": "financials",
+    "MSFT": "information_technology",
+    "NVDA": "information_technology",
+    "UNH": "health_care",
+    "V": "financials",
+    "WMT": "consumer_staples",
+}
+
+# 逐票独立权重上限，与单券上限经 min() 组合作为分配器上界。
+# 注：当前 $100k 模拟账户 × mega-cap 美股，任何基于 ADV 的校准结果都会被截到 1.0，
+# 此字段实际不 binding（真正生效的是 MAX_POSITION_WEIGHT）；保留是为规模敏感性
+# 实验（账户 >> $50M 或标的下沉至小盘股）预留执法点，届时按 ADV 校准数值。
+LIQUIDITY_CAPS = {s: 0.35 for s in SECTORS}
+
+# 分配器目标函数参数（RiskBudgetAllocator / AllocationConfig）
+ALLOCATION = {
+    "alpha": 1.0,
+    "beta": 1.0,
+    "gamma": 0.05,
+    "max_turnover": 0.3,
+    "max_sector_weight": 0.5,
+}
+
+# 波动率目标（VolatilityTarget）；与旧标量 TARGET_VOLATILITY 不同，此为整块字典输入
+VOLATILITY_TARGET = {
+    "target_volatility": 0.15,
+    "min_exposure": 0.0,
+    "max_exposure": 1.0,
+    "max_exposure_increase": 0.2,
+}
+
+# 硬风险投影（RiskLimits）：只向下砍风险的硬约束
+RISK_LIMITS = {
+    "max_exposure": 1.0,
+    "cash_floor": 0.05,
+    "max_position_weight": 0.35,
+    "max_sector_weight": 0.5,
+    "max_turnover": 0.3,
+    "max_portfolio_volatility": 0.25,
+    "drawdown_lock": 0.05,
+}
+
+# 成本门控阈值（CostGate / CostLimits）：判定单笔要不要做
+COST_LIMITS = {
+    "min_order_weight": 0.01,
+    "no_trade_band": 0.005,
+    "max_turnover": 0.3,
+    "max_participation_rate": 0.1,
+    "max_cost_rate": 0.01,
+}
+
+# 交易成本模型（CostModel）；当前规模下 impact_coefficient 贡献 < $1，主要为链路完整性保留
+COST_MODEL = {
+    "commission_per_order": 1.0,
+    "half_spread_bps": 10.0,
+    "impact_coefficient": 0.1,
+}

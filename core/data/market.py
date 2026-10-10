@@ -24,6 +24,10 @@ from ..research.raw import RawPayloadStore
 
 # 特征计算的最小热身长度（ADX/EMA21 等指标的最长窗口约 42 根，取整 60）
 _MIN_WARMUP_BARS = 60
+# 每轮都检查该固定自然日窗口；它不是每轮都重拉的数据量。
+MARKET_HISTORY_LOOKBACK_DAYS = 400
+# 252 个收益率需要 253 个按 PIT 可得的收盘价。
+PORTFOLIO_MIN_CLOSES = 253
 INDICATORS_VERSION = "indicators-v1"
 
 
@@ -92,25 +96,15 @@ def _fetch_bars_alpha_vantage(symbol: str, start_date: str, end_date: str) -> Op
     return rows or None
 
 
-def ensure_market_coverage(symbol: str, start_date: str, end_date: str, *,
-                           store: Optional[RawPayloadStore] = None) -> None:
-    """保证 [start,end] 的 K 线已在 market.db：未问过的区间走网络拉批次。
-
-    批次记录不进 Snapshot（它是素材不是事实），所以这里自己落库并记台账；
-    先 put 后 mark，崩溃只多烧一次请求（哈希去重兜底），不谎报。
-    """
-    store = store or _default_store()
-    covered = any(ws <= start_date and we >= end_date for ws, we in store.covered("market", symbol))
-    if covered:
-        return
-
+def _fetch_and_store_bars(symbol: str, start_date: str, end_date: str, *, store: RawPayloadStore) -> None:
+    """请求一个已判定缺失的日期段；coverage 仅记录本次请求，不裁定数据是否完整。"""
     fetched_at = datetime.now(timezone.utc)
     bars = _fetch_bars_yfinance(symbol, start_date, end_date)
     source = "yfinance"
-    if bars is None:
+    if not bars:
         bars = _fetch_bars_alpha_vantage(symbol, start_date, end_date)
         source = "alpha_vantage"
-    if bars is None:
+    if not bars:
         print(f"[Market] {symbol} {start_date}~{end_date} 两源均失败，不记 coverage")
         return
 
@@ -119,6 +113,60 @@ def ensure_market_coverage(symbol: str, start_date: str, end_date: str, *,
     store.mark_coverage("market", symbol=symbol, window_start=bars[0]["date"], window_end=bars[-1]["date"],
                         source=source, fetched_at=fetched_at, row_count=len(bars))
     print(f"[Market] {symbol}：新拉 {len(bars)} 根 bar（{source}，{start_date}~{end_date}）")
+
+
+def prepare_market_history(symbol: str, as_of: datetime, *, min_bars: int = PORTFOLIO_MIN_CLOSES,
+                           store: Optional[RawPayloadStore] = None,
+                           include_fresh: bool = False) -> pd.DataFrame:
+    """以固定 400 个自然日窗口的合并 PIT 价格帧为事实，增量补齐行情素材。
+
+    每轮先读库内新旧 batch：缺前段只补窗口起点到最早已有 bar 前一天，缺尾段只补
+    最后一根之后。``coverage`` 台账是请求审计，不能替代这里对实际 bar 的验证。
+    返回的是完整合并窗口，而非仅够风险计算的末尾 ``min_bars`` 根。
+
+    PIT 闸门默认钉死在 ``as_of``：晚于它的 batch 不得混入帧，回放历史轮次因此不会
+    偷看未来。代价是实盘首拉（空库）时本轮刚到达的 bar 其 ``available_at`` 恰比
+    ``as_of``（取于 fetch 之前）晚几毫秒，会被自己的闸门清空——冷启动直接抛 insufficient。
+    ``include_fresh`` 供实盘节奏显式放行：闸门改取 fetch 之后的当前时刻，兑现"本轮拉到的
+    本轮即可用"；回放（钉死 as_of）必须保持 False，否则晚到的数据会污染历史帧。
+    """
+    if as_of.tzinfo is None:
+        raise ValueError("market history as_of must be timezone-aware")
+    if min_bars < 1:
+        raise ValueError("market history min_bars must be positive")
+
+    store = store or _default_store()
+    end_date = as_of.strftime("%Y-%m-%d")
+    window_start = (as_of - timedelta(days=MARKET_HISTORY_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
+    def current() -> pd.DataFrame:
+        frame = load_price_frame(symbol, window_start, end_date, store=store)
+        if frame.empty:
+            return frame
+        gate = datetime.now(timezone.utc) if include_fresh else as_of
+        return frame[frame["available_at"] <= gate]
+
+    frame = current()
+    if frame.empty:
+        _fetch_and_store_bars(symbol, window_start, end_date, store=store)
+        frame = current()
+    else:
+        first_date = frame.index[0].strftime("%Y-%m-%d")
+        if window_start < first_date:
+            _fetch_and_store_bars(symbol, window_start,
+                                  (frame.index[0] - timedelta(days=1)).strftime("%Y-%m-%d"), store=store)
+            frame = current()
+
+    if not frame.empty and frame.index[-1].strftime("%Y-%m-%d") < end_date:
+        # 日历日包含休市日并不构成缺口；Provider 返回空时不伪造完整性，下轮仍会显式重试。
+        next_date = (frame.index[-1] + timedelta(days=1)).strftime("%Y-%m-%d")
+        _fetch_and_store_bars(symbol, next_date, end_date, store=store)
+        frame = current()
+
+    if frame.empty or len(frame) < min_bars:
+        found = len(frame)
+        raise ValueError(f"insufficient PIT price history for {symbol}: {found} < {min_bars} bars")
+    return frame
 
 
 def _bars_batch_record(symbol: str, source: str, bars: List[Dict[str, float]],

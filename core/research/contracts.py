@@ -226,3 +226,149 @@ class PortfolioIntent(Contract):
         if len(set(symbols)) != len(symbols):
             raise ValueError("intent items must use unique symbols")
         return self
+
+
+# 阶段 4 的对象仍放在同一契约模块：它们是研究、组合、执行之间的审计边界，
+# 不能由某个具体算法模块私自定义成不受版本和 extra 校验保护的 dict。
+class WeightConstraint(ValueObject):
+    symbol: str = Field(min_length=1)
+    min_weight: float = Field(ge=0.0, le=1.0)
+    max_weight: float = Field(ge=0.0, le=1.0)
+    trading_allowed: bool
+    force_exit: bool = False
+    reason_codes: tuple[ReasonCode, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "WeightConstraint":
+        if self.min_weight > self.max_weight:
+            raise ValueError("min_weight must not exceed max_weight")
+        if self.force_exit and (self.min_weight != 0.0 or self.max_weight != 0.0):
+            raise ValueError("force_exit requires a zero weight bound")
+        return self
+
+
+class IntentConstraints(Contract):
+    intent_id: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    items: tuple[WeightConstraint, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_symbols(self) -> "IntentConstraints":
+        if len({item.symbol for item in self.items}) != len(self.items):
+            raise ValueError("constraint items must use unique symbols")
+        return self
+
+
+class PortfolioWeight(ValueObject):
+    symbol: str = Field(min_length=1)
+    weight: float = Field(ge=0.0, le=1.0)
+
+
+class TargetPortfolio(Contract):
+    target_portfolio_id: str = Field(default_factory=lambda: f"tp_{uuid4().hex}")
+    intent_id: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    policy_version: str = Field(min_length=1)
+    weights: tuple[PortfolioWeight, ...] = ()
+    cash_weight: float = Field(ge=0.0, le=1.0)
+    total_exposure: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> "TargetPortfolio":
+        if len({item.symbol for item in self.weights}) != len(self.weights):
+            raise ValueError("target weights must use unique symbols")
+        if abs(sum(item.weight for item in self.weights) - self.total_exposure) > 1e-8:
+            raise ValueError("target weights must sum to total_exposure")
+        if abs(self.cash_weight + self.total_exposure - 1.0) > 1e-8:
+            raise ValueError("cash_weight and total_exposure must sum to one")
+        return self
+
+
+class RiskAdjustment(ValueObject):
+    symbol: str = Field(min_length=1)
+    reason_code: ReasonCode
+    from_weight: float = Field(ge=0.0, le=1.0)
+    to_weight: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def only_shrinks_risk(self) -> "RiskAdjustment":
+        if self.to_weight > self.from_weight:
+            raise ValueError("risk adjustment must not increase a weight")
+        return self
+
+
+class RiskProjectedPortfolio(Contract):
+    projected_portfolio_id: str = Field(default_factory=lambda: f"rpp_{uuid4().hex}")
+    target_portfolio_id: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    weights: tuple[PortfolioWeight, ...] = ()
+    cash_weight: float = Field(ge=0.0, le=1.0)
+    total_exposure: float = Field(ge=0.0, le=1.0)
+    adjustments: tuple[RiskAdjustment, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> "RiskProjectedPortfolio":
+        if abs(sum(item.weight for item in self.weights) - self.total_exposure) > 1e-8:
+            raise ValueError("projected weights must sum to total_exposure")
+        if abs(self.cash_weight + self.total_exposure - 1.0) > 1e-8:
+            raise ValueError("cash_weight and total_exposure must sum to one")
+        return self
+
+
+class PlannedOrder(ValueObject):
+    symbol: str = Field(min_length=1)
+    side: Literal["buy", "sell"]
+    target_weight: float = Field(ge=0.0, le=1.0)
+    forced: bool = False
+    reason_codes: tuple[ReasonCode, ...] = ()
+
+
+class DeferredTrade(ValueObject):
+    symbol: str = Field(min_length=1)
+    target_weight: float = Field(ge=0.0, le=1.0)
+    reason_code: ReasonCode
+
+
+class OrderPlan(Contract):
+    order_plan_id: str = Field(default_factory=lambda: f"op_{uuid4().hex}")
+    projected_portfolio_id: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+    orders: tuple[PlannedOrder, ...] = ()
+    deferred_trades: tuple[DeferredTrade, ...] = ()
+
+    @model_validator(mode="after")
+    def unique_order_symbols(self) -> "OrderPlan":
+        if len({item.symbol for item in self.orders}) != len(self.orders):
+            raise ValueError("orders must use unique symbols")
+        return self
+
+
+class Fill(Contract):
+    """一次计划订单在 T 日开盘的实际成交，不把未成交伪装成零成本成交。"""
+
+    fill_id: str = Field(default_factory=lambda: f"fill_{uuid4().hex}")
+    order_plan_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    side: Literal["buy", "sell"]
+    decision_at: datetime
+    executed_at: datetime
+    requested_shares: int = Field(ge=0)
+    filled_shares: int = Field(ge=0)
+    executed_price: float | None = Field(default=None, gt=0.0)
+    commission: float = Field(ge=0.0)
+    status: Literal["filled", "partial", "deferred"]
+    reason_codes: tuple[ReasonCode, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_execution(self) -> "Fill":
+        if self.executed_at <= self.decision_at:
+            raise ValueError("execution must occur after the decision")
+        if self.status == "filled" and (self.filled_shares != self.requested_shares or self.filled_shares == 0):
+            raise ValueError("filled status requires all requested shares")
+        if self.status == "partial" and not (0 < self.filled_shares < self.requested_shares):
+            raise ValueError("partial status requires a strict partial fill")
+        if self.status == "deferred" and (self.filled_shares != 0 or self.executed_price is not None):
+            raise ValueError("deferred status must not carry an execution")
+        if self.status != "filled" and not self.reason_codes:
+            raise ValueError("non-filled status requires a reason code")
+        return self

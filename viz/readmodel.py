@@ -29,6 +29,10 @@ _TABLES = (
     ("research_packets", "research_packet"),
     ("thesis_books", "thesis_book"),
     ("portfolio_intents", "portfolio_intent"),
+    ("intent_constraints", "intent_constraints"),
+    ("target_portfolios", "target_portfolio"),
+    ("risk_projected_portfolios", "risk_projected_portfolio"),
+    ("order_plans", "order_plan"),
 )
 
 _OBJECT_KEY = {
@@ -38,6 +42,10 @@ _OBJECT_KEY = {
     "research_packets": "packet_id",
     "thesis_books": "thesis_book_id",
     "portfolio_intents": "intent_id",
+    "intent_constraints": "intent_id",
+    "target_portfolios": "target_portfolio_id",
+    "risk_projected_portfolios": "projected_portfolio_id",
+    "order_plans": "order_plan_id",
 }
 
 

@@ -190,8 +190,12 @@ class DataGateway:
         for card in cards:
             payload = self._raw_store.get(card.raw)
             text = "\n".join(str(payload.get(key, "")) for key in ("title", "summary", "body"))
+            # published_at/available_at 统一序列化为 ISO 字符串：调用方（risk_critic 的 peer/portfolio 上下文、
+            # 各工具 json.dumps）不得拿到裸 datetime——否则 str(prompt) 会混进 datetime.datetime(...) 这类
+            # 函数调用表达式，破坏「一律 JSON 模式」口径并让观测层的 ast.literal_eval 回解失败。
+            # 同一 UTC 偏移下 ISO 串按字典序即时序，下方按 available_at 排序的语义保持不变。
             rec = {"evidence_id": card.evidence_id, "kind": card.kind, "source": card.source,
-                   "published_at": card.published_at, "available_at": card.available_at,
+                   "published_at": card.published_at.isoformat(), "available_at": card.available_at.isoformat(),
                    "canonical_url": card.canonical_url, "title": payload.get("title", ""),
                    "summary": payload.get("summary", ""), "text": text}
             if "sentiment_score" in payload:

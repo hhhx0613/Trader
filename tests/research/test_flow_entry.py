@@ -21,6 +21,7 @@ from agents.research.flow import FlowOptions, run_research_round
 from core.research import ResearchLedger
 from core.research.raw import RawPayloadStore
 from core.research.snapshot import SnapshotBuilder
+from core.portfolio import AllocationConfig, CostLimits, CostModel, IntentConstraintBuilder, PortfolioPolicy, RiskLimits, TradingInputs, VolatilityTarget
 
 AS_OF = datetime(2026, 10, 5, 20, tzinfo=timezone.utc)
 
@@ -98,10 +99,22 @@ def _stub_collectors(monkeypatch, records):
     monkeypatch.setattr(flow, "filings_collector", SimpleNamespace(
         FILINGS_VERSION="filings-v1", fetch_filings_records=lambda symbol, start, end:
         [item for item in records if item["kind"] == "filing" and item["symbol"] == symbol]))
-    monkeypatch.setattr(flow, "ensure_market_coverage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(flow, "prepare_market_history", lambda *args, **kwargs: None)
     monkeypatch.setattr(flow, "build_feature_card", lambda symbol, as_of, *, lookback_days=220, store=None:
                         next((item for item in records if item["kind"] == "market" and item["symbol"] == symbol), None))
     monkeypatch.setattr(flow, "INDICATORS_VERSION", "market-v1")
+
+
+def _stub_portfolio(monkeypatch):
+    policy = PortfolioPolicy(
+        constraint_builder=IntentConstraintBuilder(max_position_weight=.9, hold_band=.05, seed_weight=.05, max_holdings=2),
+        allocation=AllocationConfig(alpha=1,beta=.1,gamma=.1,max_turnover=1,max_sector_weight=1,sectors={"AAPL":"tech"},liquidity_caps={"AAPL":.9}),
+        volatility_target=VolatilityTarget(target_volatility=.2,min_exposure=.1,max_exposure=.9,max_exposure_increase=.9),
+        risk_limits=RiskLimits(max_exposure=.9,cash_floor=.1,max_position_weight=.9,max_sector_weight=1,max_turnover=1,max_portfolio_volatility=.5,drawdown_lock=.2,sectors={"AAPL":"tech"}),
+        cost_limits=CostLimits(min_order_weight=0,no_trade_band=0,max_turnover=1,max_participation_rate=1,max_cost_rate=1),
+        cost_model=CostModel(0,0,0),policy_version="test-policy-v1")
+    covariance={"AAPL":{"AAPL":.04}}
+    monkeypatch.setattr(flow, "build_policy_and_inputs", lambda *_args: (policy,{"AAPL":.4},{"AAPL":.2},covariance,TradingInputs(100000,50000,{"AAPL":100},{"AAPL":1e6},{"AAPL":1e8}),{"drawdown":0.0,"untradable":[],"stop_loss":[],"risk_locked":False}))
 
 
 def test_daily_ingests_pool_without_model_or_snapshot(monkeypatch, stores):
@@ -114,6 +127,23 @@ def test_daily_ingests_pool_without_model_or_snapshot(monkeypatch, stores):
     with ledger._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM evidence_cards").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
+
+
+def test_daily_risk_trigger_reuses_card_pool_and_runs_decide(monkeypatch, stores):
+    ledger, raw = stores
+    _stub_collectors(monkeypatch, [news_record(), market_record()])
+    _stub_portfolio(monkeypatch)
+    account = dict(ACCOUNT)
+    monkeypatch.setattr(flow, "load_risk_state", lambda *_args, **_kwargs: {
+        "peak_equity": 50_000.0, "drawdown": 0.0, "stop_loss": ["AAPL"], "risk_locked": False,
+    })
+
+    result = run_research_round(FlowOptions(pool=("AAPL",), mode="daily", as_of=AS_OF, account_state=account),
+                                model=FlowModel(), ledger=ledger, raw_store=raw)
+
+    assert result.mode == "daily" and result.risk_triggered
+    assert result.intent is not None and result.portfolio is not None
+    assert account["risk_state"]["stop_loss"] == ["AAPL"]
 
 
 def test_collect_freezes_this_round_cards_and_needs_no_model(monkeypatch, stores):
@@ -139,7 +169,7 @@ def test_decide_requires_model_and_real_account(stores):
                            model=FlowModel(), ledger=ledger, raw_store=raw)
 
 
-def test_decide_selects_cards_from_pool_and_reaches_intent(stores):
+def test_decide_selects_cards_from_pool_and_reaches_intent(stores, monkeypatch):
     ledger, raw = stores
     SnapshotBuilder(ledger, raw).ingest_records(
         trace_id="daily-ingest", as_of=AS_OF,
@@ -148,6 +178,7 @@ def test_decide_selects_cards_from_pool_and_reaches_intent(stores):
                  news_record(title="Stale story", url="https://example.test/old",
                              published_at=AS_OF - timedelta(days=30), available_at=AS_OF - timedelta(days=30))])
 
+    _stub_portfolio(monkeypatch)
     result = run_research_round(FlowOptions(pool=("AAPL",), mode="decide", as_of=AS_OF, account_state=ACCOUNT),
                                 model=FlowModel(), ledger=ledger, raw_store=raw)
 
@@ -158,6 +189,7 @@ def test_decide_selects_cards_from_pool_and_reaches_intent(stores):
     # 意图与 Packet 都已入账：定时任务只需回传 ID 就能事后审计
     assert ledger.get_intent(result.intent.intent_id).snapshot_id == result.snapshot.snapshot_id
     assert ledger.get_packet(result.packets[0].packet_id).snapshot_id == result.snapshot.snapshot_id
+    assert result.portfolio is not None and ledger.get_order_plan(result.portfolio.order_plan.order_plan_id)
 
 
 def test_same_as_of_rerun_reports_a_readable_rejection(monkeypatch, stores):

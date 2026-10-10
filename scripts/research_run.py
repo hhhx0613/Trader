@@ -249,6 +249,21 @@ def _report(result, *, ledger_path: Path) -> None:
         print(f"    {item.symbol:6s} action={item.action:8s} strength={item.strength} "
               f"priority={item.priority} no_trade={_clip(item.no_trade_reason, 40)}")
         print(f"           rationale: {_clip(item.rationale, 100)}")
+    if result.portfolio is None:
+        return
+    p = result.portfolio
+    print(f"  IntentConstraints: {len(p.constraints.items)}")
+    for item in p.constraints.items:
+        print(f"    {item.symbol:6s} [{item.min_weight:.2%}, {item.max_weight:.2%}] trade={item.trading_allowed} exit={item.force_exit}")
+    print(f"  TargetPortfolio: exposure={p.target.total_exposure:.2%} cash={p.target.cash_weight:.2%}")
+    print(f"  RiskProjectedPortfolio: exposure={p.projected.total_exposure:.2%} adjustments={len(p.projected.adjustments)}")
+    for item in p.projected.adjustments:
+        print(f"    {item.symbol:6s} {item.from_weight:.2%}->{item.to_weight:.2%} {item.reason_code}")
+    print(f"  OrderPlan {p.order_plan.order_plan_id}: orders={len(p.order_plan.orders)} deferred={len(p.order_plan.deferred_trades)}")
+    for order in p.order_plan.orders:
+        print(f"    {order.side:4s} {order.symbol:6s} target={order.target_weight:.2%} forced={order.forced}")
+    for item in p.order_plan.deferred_trades:
+        print(f"    defer {item.symbol:6s} target={item.target_weight:.2%} reason={item.reason_code}")
 
 
 def main() -> int:

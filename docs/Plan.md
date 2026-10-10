@@ -31,7 +31,7 @@
 
 #### 3.1.1 每日数据更新、新闻分流与触发
 
-程序每天拉取新闻、行情、披露和账户状态；这些步骤不由 LLM 执行。
+程序每天拉取新闻、行情、披露和账户状态；这些步骤不由 LLM 执行。行情采集每轮先用 `load_price_frame` 合并截至 `as_of` 向前 400 个自然日的已有 PIT 批次，仅补该窗口缺失的前段或尾段，并返回新旧合并帧；coverage 台账只审计请求，不能证明数据完整。组合风险要求全池至少 253 个对齐收盘价。
 
 | 数据 | 每日程序处理 | 对决策图的作用 |
 | --- | --- | --- |
@@ -67,7 +67,7 @@ graph TD
     class F,I decision
 ```
 
-行情风险告警不会直接下单。它只启动临时 DecisionGraph；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate。
+行情风险告警不会直接下单。daily 在行情入库后用 `runtime.update_risk_state` 从 PIT 日线重放 ATR 止损、`peak_equity` 与回撤；它把新 `risk_state` 回交账户。若止损或首次锁仓，daily 必须已获注入模型，并在同一个 `run_research_round` 内复用本轮卡池自动启动既有临时 DecisionGraph；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate 后才产出 `OrderPlan`。没有风险事件时 daily 不调用模型。`untradable` 是当轮 `TradingInputs` 的现算交易能力，不写入 `risk_state`；`risk_locked` 自动置位、只能由人工显式复位。
 
 建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、按「正文哈希 + 标的」去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（DecisionGraph 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死，本轮新拉数据因 available_at 晚于时点被 PIT 闸门拒绝。
 
@@ -196,11 +196,11 @@ graph TD
 
 Committee 输出研究意图而非百分比权重。组合层采用“**动作约束 → 风险预算参考分配 → 波动率目标 → 成本敏感执行调整**”的确定性程序链路：
 
-1. **IntentConstraintBuilder** 将 `long/hold/reduce/exit/abstain` 与动作强度转为候选准入、最低/最高权重和交易许可；它不生成收益预测或连续选股分数。
-2. **RiskBudgetAllocator** 仅在获准持有的股票之间，以逆波动率为参考分配，并结合协方差、行业、流动性、旧仓位与换手约束求相对权重。
+1. **IntentConstraintBuilder** 将 `long/hold/reduce/exit/abstain` 与动作强度转为候选准入、最低/最高权重和交易许可；`long` 受持仓名额、种子仓位与优先级的确定性准入约束。它不生成收益预测或连续选股分数。
+2. **RiskBudgetAllocator** 仅在获准持有的股票之间，以逆波动率为参考分配，并结合协方差、行业、流动性、旧仓位与换手约束求相对权重；求解器、目标系数与输入窗口均为版本化配置，缺任一数值输入即显式失败。
 3. **VolatilityTarget** 以组合预估波动率缩放相对权重，决定总股票暴露与现金。
 4. **RiskProjection** 对目标组合施加单股、行业、总暴露、现金下限、流动性、换手、回撤和止损等硬限制；它只能收缩风险、增加现金或否决。
-5. **CostGate** 检查订单最小规模、流动性参与率、最大换手、佣金、滑点与冲击；它延后或缩小不必要、不可执行的小额交易，不基于未验证的预期收益放行订单。
+5. **CostGate** 检查订单最小规模、流动性参与率、最大换手、佣金、半价差滑点、市场冲击和可用现金；它必须以逐订单 notional 估算成本并记录延后数量/成本，延后或缩小不必要、不可执行的小额交易，不基于未验证的预期收益放行订单。
 
 ##### IntentConstraintBuilder：五个动作如何进入仓位计算
 
@@ -281,6 +281,10 @@ CostGate 是确定性执行检查，输入为 `RiskProjectedPortfolio`、实际�
 
 CostGate 的目标是避免小额、频繁或不可成交的调仓，RiskProjection 的目标是禁止超限风险；两者都只能收缩或延后交易，不能增加风险。
 
+阶段 4 的实现必须使用上述受约束目标函数；求解器版本、目标系数、行情窗口和全部约束均写入版本化配置与审计对象。不得以启发式截断、默认成本或缺失行情替代任何一个约束。
+
+政策参数（单仓上限、保持带、行业映射、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`，以无 `PORTFOLIO_` 前缀的模块级常量追加，与旧基线同名语义参数并存但口径分注；`data/account*.json` 只承载账户状态（`cash`/`positions`/`limits`/`regime`/`risk_state`/成本估计），不再内嵌政策配置。`core/portfolio/runtime.py` 从 `config` 读取政策、从账户读取 `risk_state`，任一缺失即拒绝而不退回占位值。
+
 `PortfolioPolicy` 的稳定接口为：
 
 ```python
@@ -292,6 +296,10 @@ TargetPortfolio = portfolio_policy(
     risk_limits,
 )
 ```
+
+##### SimulatedExecution：冻结订单的 T-1/T 日撮合
+
+`SimulatedExecution` 只接收已经写入 `OrderPlan` 的目标权重和执行限制：决策日不得晚于订单生成时点，成交日必须严格晚于决策日，且仅使用成交日开盘价、当日可成交量、账户现金与已有持仓。它按强制卖出、普通卖出、普通买入的顺序执行，先扣除滑点和佣金；停牌、缺开盘价、参与率不足、现金不足产生 `Fill` 的部分成交或未成交记录，而不是重新解释 Committee 或调整目标权重。旧 Top-K/PPO 回测路径不调用该接口。
 
 该设计采用风险预算与波动率目标，而非用 Agent 观点预测个股预期收益。交易成本、风险和暴露约束可通过优化程序纳入组合构建；权重约束也能缓解大组合协方差估计误差造成的极端配置。[Lobo、Fazel 与 Boyd（2007）](https://stanford.edu/~boyd/papers/portfolio.html)；[Jagannathan 与 Ma（2002）](https://www.nber.org/system/files/working_papers/w8922/w8922.pdf)。逆波动率、等权和 PPO 保留为统一接口下的对照策略；PPO 不属于主线仓位决策。
 

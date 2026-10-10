@@ -17,7 +17,7 @@ import pytest
 
 from core import config
 from core.data import market
-from core.data.market import _bars_batch_record, build_feature_card, load_price_frame
+from core.data.market import _bars_batch_record, build_feature_card, load_price_frame, prepare_market_history
 from core.data.news import _segments_for
 from core.research.raw import RawPayloadStore
 from core.research.snapshot import SnapshotBuilder
@@ -107,6 +107,74 @@ def test_feature_card_built_from_batch_series(tmp_path):
     assert feature["available_at"] <= AS_OF
     body = feature["body"]
     assert "ema_short" in body and "rsi" in body
+
+
+def test_market_history_uses_merged_frame_then_fetches_only_missing_prefix(monkeypatch, tmp_path):
+    """固定 400 天窗口缺前段时，只请求前置缺口，不重拉已有 253 根。"""
+    store = RawPayloadStore(tmp_path)
+    first_date = (AS_OF - timedelta(days=252)).date()
+    bars = synthetic_bars("AAPL", first_date, 253)
+    store.put(_bars_batch_record("AAPL", "fixture", bars, AS_OF - timedelta(hours=1)),
+              source="fixture", received_at=AS_OF - timedelta(hours=1))
+    calls = []
+
+    def fetch(symbol, start, end):
+        calls.append((symbol, start, end))
+        return []
+
+    monkeypatch.setattr(market, "_fetch_bars_yfinance", fetch)
+    monkeypatch.setattr(market, "_fetch_bars_alpha_vantage", lambda *_args: None)
+    frame = prepare_market_history("AAPL", AS_OF, store=store)
+
+    assert len(frame) == 253
+    assert calls == [("AAPL", (AS_OF - timedelta(days=400)).date().isoformat(),
+                      (first_date - timedelta(days=1)).isoformat())]
+
+
+def test_market_history_extends_existing_base_from_last_bar_only(monkeypatch, tmp_path):
+    store = RawPayloadStore(tmp_path)
+    first_date = (AS_OF - timedelta(days=258)).date()
+    existing = synthetic_bars("AAPL", first_date, 253)
+    store.put(_bars_batch_record("AAPL", "fixture", existing, AS_OF - timedelta(hours=1)),
+              source="fixture", received_at=AS_OF - timedelta(hours=1))
+    calls = []
+    tail_start = first_date + timedelta(days=253)
+    tail = synthetic_bars("AAPL", tail_start, 7, base=500.0)
+
+    def fetch(symbol, start, end):
+        calls.append((symbol, start, end))
+        return tail
+
+    monkeypatch.setattr(market, "_fetch_bars_yfinance", fetch)
+    frame = prepare_market_history("AAPL", AS_OF, store=store)
+
+    assert len(frame) == 253  # 回放时新请求的 received_at 晚于 AS_OF，不得混入历史帧。
+    assert calls == [
+        ("AAPL", (AS_OF - timedelta(days=400)).date().isoformat(),
+         (first_date - timedelta(days=1)).isoformat()),
+        ("AAPL", tail_start.isoformat(), AS_OF.strftime("%Y-%m-%d")),
+    ]
+
+
+def test_market_history_backfills_before_existing_history_without_overlap(monkeypatch, tmp_path):
+    store = RawPayloadStore(tmp_path)
+    first_date = (AS_OF - timedelta(days=219)).date()
+    existing = synthetic_bars("AAPL", first_date, 220)
+    store.put(_bars_batch_record("AAPL", "fixture", existing, AS_OF - timedelta(hours=1)),
+              source="fixture", received_at=AS_OF - timedelta(hours=1))
+    calls = []
+    older = synthetic_bars("AAPL", first_date - timedelta(days=360), 180)
+
+    def fetch(symbol, start, end):
+        calls.append((symbol, start, end))
+        return older
+
+    monkeypatch.setattr(market, "_fetch_bars_yfinance", fetch)
+    # 回放时新拉 payload 的 received_at 晚于固定 as_of，必须被 PIT 闸门拒绝；
+    # 本断言只验证请求边界不与已有 220 根重叠。
+    with pytest.raises(ValueError, match="insufficient PIT price history"):
+        prepare_market_history("AAPL", AS_OF, store=store)
+    assert calls[0][2] == (first_date - timedelta(days=1)).isoformat()
 
 
 def test_feature_card_respects_point_in_time(tmp_path):

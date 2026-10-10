@@ -23,6 +23,10 @@ const KIND_LABEL = {
   research_packet: "ResearchPacket",
   thesis_book: "ThesisBook",
   portfolio_intent: "PortfolioIntent",
+  intent_constraints: "IntentConstraints",
+  target_portfolio: "TargetPortfolio",
+  risk_projected_portfolio: "RiskProjectedPortfolio",
+  order_plan: "OrderPlan",
   raw_record: "采集记录",
   unknown: "对象",
 };
@@ -407,6 +411,10 @@ function summarizeStage(info) {
     if (s.items) {
       lines.push(h("div", { text: "意图 " + s.items.map((i) => i.symbol + ":" + i.action).join(" ") }));
     }
+    if (s.order_plan_id) {
+      const expo = s.exposure != null ? " · 暴露 " + (s.exposure * 100).toFixed(1) + "%" : "";
+      lines.push(h("div", {}, [h("span", { text: "订单 " + s.orders + " · 延后 " + s.deferred + " · 风控调整 " + s.adjustments + expo }), idChip("order_plan", s.order_plan_id)]));
+    }
   }
   return lines;
 }
@@ -688,7 +696,8 @@ function renderObjects() {
     const kind = o.kind || "unknown";
     groups.set(kind, [...(groups.get(kind) || []), o]);
   });
-  ["snapshot", "evidence_card", "claim_card", "research_packet", "thesis_book", "portfolio_intent", "raw_record"]
+  ["snapshot", "evidence_card", "claim_card", "research_packet", "thesis_book", "portfolio_intent",
+    "intent_constraints", "target_portfolio", "risk_projected_portfolio", "order_plan", "raw_record"]
     .filter((kind) => groups.has(kind))
     .forEach((kind) => pane.append(objectGroup(kind, groups.get(kind))));
   [...groups.keys()].filter((kind) => !KIND_LABEL[kind])
@@ -723,6 +732,10 @@ function objectColumns(kind) {
     research_packet: ["Packet", "标的", "覆盖率", "critic", "claims", "trace"],
     thesis_book: ["ThesisBook", "packets", "regime", "trace"],
     portfolio_intent: ["Intent", "items", "trace"],
+    intent_constraints: ["Constraints", "权重区间/动作", "trace"],
+    target_portfolio: ["Target", "暴露", "现金", "weights", "trace"],
+    risk_projected_portfolio: ["Projected", "暴露", "现金", "调整", "trace"],
+    order_plan: ["OrderPlan", "orders", "延后", "trace"],
     raw_record: ["记录", "kind", "标的", "内容"],
   }[kind] || ["ID", "详情"];
 }
@@ -745,6 +758,25 @@ function objectCells(kind, object) {
       d.regime || "—", [idChip("trace", d.trace_id, shortId(d.trace_id))]];
     case "portfolio_intent": return [idChip("portfolio_intent", object.id, shortId(object.id)),
       (d.items || []).map((i) => i.symbol + ":" + i.action).join(" "),
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "intent_constraints": return [idChip("intent_constraints", object.id, shortId(object.id)),
+      h("span", { cls: "clip", text: (d.items || []).map((i) =>
+        i.symbol + ":[" + (i.min_weight * 100).toFixed(1) + "," + (i.max_weight * 100).toFixed(1) + "]"
+        + (i.force_exit ? "⊗" : i.trading_allowed ? "" : "✋")).join(" ") }),
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "target_portfolio": return [idChip("target_portfolio", object.id, shortId(object.id)),
+      ((d.total_exposure || 0) * 100).toFixed(1) + "%", ((d.cash_weight || 0) * 100).toFixed(1) + "%",
+      h("span", { cls: "clip", text: (d.weights || []).map((w) => w.symbol + ":" + (w.weight * 100).toFixed(1) + "%").join(" ") }),
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "risk_projected_portfolio": return [idChip("risk_projected_portfolio", object.id, shortId(object.id)),
+      ((d.total_exposure || 0) * 100).toFixed(1) + "%", ((d.cash_weight || 0) * 100).toFixed(1) + "%",
+      h("span", { cls: "clip", text: (d.adjustments || []).map((a) =>
+        a.symbol + ":" + (a.from_weight * 100).toFixed(1) + "→" + (a.to_weight * 100).toFixed(1) + "%(" + a.reason_code + ")").join(" ") || "—" }),
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "order_plan": return [idChip("order_plan", object.id, shortId(object.id)),
+      h("span", { cls: "clip", text: (d.orders || []).map((o) =>
+        o.side[0].toUpperCase() + " " + o.symbol + " " + (o.target_weight * 100).toFixed(1) + "%" + (o.forced ? "⚡" : "")).join(" ") || "—" }),
+      (d.deferred_trades || []).length,
       [idChip("trace", d.trace_id, shortId(d.trace_id))]];
     case "raw_record": return [h("span", { cls: "mono", text: object.id }), d.kind || object.kind || "",
       d.symbol || object.symbol || "",
@@ -830,7 +862,9 @@ async function replayTrace(traceId) {
 }
 
 const objectIdKey = (kind) => ({ snapshot: "snapshot_id", evidence_card: "evidence_id", claim_card: "claim_id",
-  research_packet: "packet_id", thesis_book: "thesis_book_id", portfolio_intent: "intent_id" }[kind] || "object_id");
+  research_packet: "packet_id", thesis_book: "thesis_book_id", portfolio_intent: "intent_id",
+  intent_constraints: "intent_id", target_portfolio: "target_portfolio_id",
+  risk_projected_portfolio: "projected_portfolio_id", order_plan: "order_plan_id" }[kind] || "object_id");
 
 /* ---------------- 详情抽屉 ---------------- */
 

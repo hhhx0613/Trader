@@ -34,9 +34,8 @@ class RiskCritic:
             prompt["regime"] = self.gateway.get_regime(**common)
             prompt["peer_comparison"] = self.gateway.get_peer_comparison(**common)
             # deepseek-flash 为混合推理模型：max_tokens 过小会被内部思考 token 吃光、content 返回空。
-            # verdict 本体很短，但预算必须容纳“先想完再答”，故给到 3000，并以一次重试兜底偶发空回复。
             response = self.model.chat_json(str(prompt), system_prompt=schema,
-                                            temperature=0.0, max_tokens=3000, max_retries=1)
+                                            temperature=0.0, max_tokens=8000, max_retries=1)
             verdict = CriticVerdict(verdict=response["verdict"], reasons=tuple(response["reasons"]),
                                     card_ids=tuple(response.get("card_ids", ())))
             if not set(verdict.card_ids) <= {claim.claim_id for claim in claims}:
