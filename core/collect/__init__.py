@@ -1,5 +1,5 @@
 """
-主线数据采集层（core.data）—— fetch -> raw 正文库 -> EvidenceCard -> Agent
+主线数据采集层（core.collect）—— fetch -> raw 正文库 -> EvidenceCard -> Agent
 
 - news.py    : 新闻采集器（网格段 + coverage 台账，逐条正文落 news.db）
 - market.py  : 行情采集器（批次落 market.db；特征卡由程序算指标产出）

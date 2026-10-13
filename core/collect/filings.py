@@ -4,7 +4,7 @@
   1. 从 SEC EDGAR 公开接口获取 filing 索引（10-K/10-Q/8-K）、XBRL 标准化
      财务事实与披露正文，缓存到 data/cache/filings/
   2. 主线记录链路出口 fetch_filings_records() 输出规范化事实记录，交给
-     core/research 的 SnapshotBuilder 落 raw 与账本（raw -> EvidenceCard -> Agent）
+     core/database 的 SnapshotBuilder 落 raw 与账本（raw -> EvidenceCard -> Agent）
 
 与其他采集器的关键区别：
   EDGAR 的 acceptance datetime 是 SEC 官方接收时间，即这条披露"当时就

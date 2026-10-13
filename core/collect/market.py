@@ -19,8 +19,8 @@ import pandas as pd
 
 from .. import config
 from ..indicators import compute_all_indicators
-from ..research.providers import canonical_content_hash, record_from_payload
-from ..research.raw import RawPayloadStore
+from ..database.providers import canonical_content_hash, record_from_payload
+from ..database.raw import RawPayloadStore
 
 # 特征计算的最小热身长度（ADX/EMA21 等指标的最长窗口约 42 根，取整 60）
 _MIN_WARMUP_BARS = 60

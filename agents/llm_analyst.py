@@ -34,7 +34,7 @@ import utils.logger as log_utils
 logger = log_utils.get_logger(__name__)
 
 from core.legacy.news_data import get_news_at_date
-from core.data.llm_cache_db import get_cache_db
+from utils.llm_cache_db import get_cache_db
 from utils.llm_client import LLMClient
 
 # LLM 输出缓存目录

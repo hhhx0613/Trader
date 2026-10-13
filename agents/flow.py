@@ -27,22 +27,25 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
+import pandas as pd
+
 from core import config
-from core.data import filings as filings_collector
-from core.data import news as news_collector
-from core.data.market import INDICATORS_VERSION, build_feature_card, prepare_market_history
-from core.research import DataGateway, ResearchLedger
-from core.research.contracts import EvidenceCard, PortfolioIntent, ResearchPacket, ResearchSnapshot
-from core.research.raw import RawPayloadStore
-from core.research.snapshot import SnapshotBuilder
-from core.portfolio.runtime import build_policy_and_inputs, load_risk_state
-from core.portfolio.portfolio_policy import PortfolioPolicyResult
+from core.collect import filings as filings_collector
+from core.collect import news as news_collector
+from core.collect.market import INDICATORS_VERSION, build_feature_card, load_price_frame, prepare_market_history
+from core.decision import ExecutionAccount, ExecutionLimits, SimulatedExecution
+from core.database import DataGateway, ResearchLedger
+from core.database.contracts import EvidenceCard, Fill, PortfolioIntent, PositionEpisode, ResearchPacket, ResearchSnapshot
+from core.database.raw import RawPayloadStore
+from core.database.snapshot import SnapshotBuilder
+from core.decision.runtime import build_policy_and_inputs, load_risk_state
+from core.decision.planner import PortfolioPolicyResult
 
-from .committee import Committee
-from .graph import PerAssetResearchGraph
-from .types import JsonModel
+from agents.research.committee import Committee
+from agents.research.graph import PerAssetResearchGraph
+from agents.research.types import JsonModel
 
-MODES = ("daily", "collect", "decide")
+MODES = ("daily", "collect", "decide", "execute")
 
 # decide 所需账户字段：与 Risk Critic 的四项注入上下文同源，regime 可缺（只影响措辞、
 # 不影响放行与否），但缺现金/持仓/限额时必须拒绝，否则 Critic 只能在空洞上签字。
@@ -60,6 +63,7 @@ class FlowOptions:
     market_lookback: int = 220
     filings: bool = True
     account_state: dict[str, Any] | None = None
+    order_plan_id: str | None = None
     trace_prefix: str = "flow"
 
     def __post_init__(self) -> None:
@@ -87,6 +91,8 @@ class RoundResult:
     evidence: int = 0
     risk_state: dict[str, Any] | None = None
     risk_triggered: bool = False
+    fills: tuple[Fill, ...] = ()
+    episodes: tuple[PositionEpisode, ...] = ()
 
 
 def run_research_round(options: FlowOptions, *, model: JsonModel | None = None,
@@ -94,12 +100,14 @@ def run_research_round(options: FlowOptions, *, model: JsonModel | None = None,
                        raw_store: RawPayloadStore | None = None) -> RoundResult:
     """按 ``mode`` 执行到对应阶段为止；只做编排，不新增任何研究或采集逻辑。
 
-    网络、落库、PIT 校验、去重全部委派给 ``core/data/*`` 与 ``core/research``。
+    网络、落库、PIT 校验、去重全部委派给 ``core/collect/*`` 与 ``core/database``。
     ``ledger``/``raw_store`` 供调用方（含离线测试与常驻调度器）复用已打开的连接，
     省略时按 ``config`` 的主线存储路径新建，并在返回前关掉自己打开的那个正文库。
     """
     if options.mode == "decide":
         _require_decision_inputs(model, options.account_state)
+    if options.mode == "execute" and (options.account_state is None or not options.order_plan_id):
+        raise ValueError("execute requires account_state and an explicit order_plan_id")
 
     book = ledger or ResearchLedger(config.RESEARCH_LEDGER_PATH)
     store = raw_store or RawPayloadStore(config.RESEARCH_RAW_DIR)
@@ -113,6 +121,8 @@ def run_research_round(options: FlowOptions, *, model: JsonModel | None = None,
 def _round(options: FlowOptions, *, model: JsonModel | None, book: ResearchLedger,
            store: RawPayloadStore) -> RoundResult:
     """阶段门控本体；前置校验与连接生命周期已由 ``run_research_round`` 接手。"""
+    if options.mode == "execute":
+        return _execute_order_plan(options, book, store)
     builder = SnapshotBuilder(book, store)
 
     as_of = options.as_of
@@ -201,9 +211,136 @@ def _round(options: FlowOptions, *, model: JsonModel | None, book: ResearchLedge
         book.append_target_portfolio(portfolio.target)
         book.append_risk_projected_portfolio(portfolio.projected)
         book.append_order_plan(portfolio.order_plan)
+        _record_carry_in_episodes(book, intent, portfolio.order_plan, options.account_state, snapshot.as_of, portfolio_trace)
         book.complete_trace(portfolio_trace, snapshot.as_of)
     return RoundResult(mode=options.mode, as_of=as_of, ingested=len(cards), snapshot=snapshot,
                        packets=packets, intent=intent, portfolio=portfolio, evidence=len(snapshot.evidence_ids))
+
+
+def _execute_order_plan(options: FlowOptions, book: ResearchLedger, store: RawPayloadStore) -> RoundResult:
+    """人工 T 日入口：只执行已冻结订单，绝不在 decide 当日假造下一日成交。"""
+    assert options.order_plan_id is not None and options.account_state is not None and options.as_of is not None
+    plan = book.get_order_plan(options.order_plan_id)
+    frames = _execution_frames(plan, options.as_of, store)
+    # 只在所有标的都有行情的交集日里选，避免半仓可成交
+    days = set.intersection(*(set(frame.index) for frame in frames.values())) if frames else set()
+    # T+1 边界：可成交日必须严格晚于决策日，绝不在 decide 当日假造成交
+    eligible = sorted(day for day in days if day > plan.created_at.replace(tzinfo=None))
+    if not eligible:
+        raise ValueError("no PIT-tradable T-day after OrderPlan decision")
+    execution_day = eligible[0]
+    # 行情索引是无时区的日，成交时点回填 as_of 的 tzinfo 以保持账本时间戳一致
+    executed_at = execution_day.to_pydatetime().replace(tzinfo=options.as_of.tzinfo)
+    holdings = {str(item["symbol"]).upper(): int(item["quantity"])
+                for item in options.account_state["positions"]}
+    result = SimulatedExecution().execute(
+        plan, trace_id=f"{options.trace_prefix}-execution-{options.as_of.strftime('%Y%m%d%H%M%S')}",
+        decision_at=plan.created_at, executed_at=executed_at,
+        account=ExecutionAccount(cash=float(options.account_state["cash"]), holdings=holdings),
+        open_prices={symbol: float(frame.loc[execution_day, "open"]) for symbol, frame in frames.items()},
+        volumes={symbol: float(frame.loc[execution_day, "volume"]) for symbol, frame in frames.items()},
+        limits=ExecutionLimits(max_participation_rate=float(config.COST_LIMITS["max_participation_rate"]),
+                               slippage=float(config.SLIPPAGE),
+                               commission_per_order=float(config.COST_MODEL["commission_per_order"])),
+    )
+    trace_id = result.fills[0].trace_id if result.fills else f"{options.trace_prefix}-execution-empty"
+    book.start_trace(trace_id, executed_at)
+    for fill in result.fills:
+        book.append_fill(fill)
+    episodes = _record_execution_episodes(book, plan, result.fills, executed_at, trace_id)
+    book.complete_trace(trace_id, executed_at)
+    return RoundResult(mode="execute", as_of=options.as_of, ingested=0,
+                       fills=result.fills, episodes=tuple(episodes))
+
+
+def _record_execution_episodes(book: ResearchLedger, plan, fills: tuple[Fill, ...],
+                               executed_at: datetime, trace_id: str) -> list[PositionEpisode]:
+    """把实际 Fill 接到唯一活动 Episode；零成交只保留 Fill，不产生案例。"""
+    projected = book.get_risk_projected_portfolio(plan.projected_portfolio_id)
+    target = book.get_target_portfolio(projected.target_portfolio_id)
+    intent = book.get_intent(target.intent_id)
+    by_symbol = {item.symbol: item for item in intent.items}
+    revisions: list[PositionEpisode] = []
+    for fill in fills:
+        if fill.filled_shares <= 0:
+            # 零成交不建案例：否则 OutcomeReviewFlow 会对着空仓位做无意义复盘
+            continue
+        item = by_symbol.get(fill.symbol)
+        if item is None:
+            continue
+        active = book.find_active_position_episode(fill.symbol)
+        if active is None:
+            # 无活动 episode 时，只有买入且显式 start 才是新论文起点，其余一律不凭空建仓
+            if fill.side != "buy" or item.horizon_action != "start" or item.horizon_days not in {5, 20, 60}:
+                continue
+            due_at = (pd.Timestamp(executed_at) + pd.offsets.BDay(item.horizon_days)).to_pydatetime()
+            episode = PositionEpisode(
+                trace_id=trace_id, symbol=fill.symbol, source_trace_id=plan.trace_id, status="active",
+                anchor_at=executed_at, current_due_at=due_at, original_horizon_days=item.horizon_days,
+                intent_item_ids=(item.intent_item_id,), order_plan_ids=(plan.order_plan_id,), fill_ids=(fill.fill_id,),
+            )
+        else:
+            due_at = active.current_due_at
+            # retain 不动计时器；shorten 只能把到期日提前，防止调仓无限延后复盘。
+            if item.horizon_action == "shorten" and item.horizon_days in {5, 20, 60}:
+                requested_due = (pd.Timestamp(executed_at) + pd.offsets.BDay(item.horizon_days)).to_pydatetime()
+                due_at = min(due_at, requested_due)
+            episode = active.model_copy(update={
+                "trace_id": trace_id,
+                "created_at": executed_at,
+                "revision": active.revision + 1,
+                "current_due_at": due_at,
+                # dict.fromkeys 保序去重：同一 episode 被多次修订时 fill/intent/order id 不重复膨胀
+                "intent_item_ids": tuple(dict.fromkeys((*active.intent_item_ids, item.intent_item_id))),
+                "order_plan_ids": tuple(dict.fromkeys((*active.order_plan_ids, plan.order_plan_id))),
+                "fill_ids": tuple(dict.fromkeys((*active.fill_ids, fill.fill_id))),
+            })
+        book.append_position_episode(episode)
+        revisions.append(episode)
+    return revisions
+
+
+def _record_carry_in_episodes(book: ResearchLedger, intent: PortfolioIntent, plan, account_state: dict[str, Any],
+                              as_of: datetime, trace_id: str) -> list[PositionEpisode]:
+    """已终结但仍持有的仓位，只有在下一轮明确 start 新 thesis 时才开启后继 episode。"""
+    positions = {str(row["symbol"]).upper(): row for row in account_state.get("positions", ())
+                 if int(row.get("quantity", 0)) > 0}
+    created: list[PositionEpisode] = []
+    for item in intent.items:
+        position = positions.get(item.symbol)
+        if position is None or book.find_active_position_episode(item.symbol) is not None:
+            # 已持有但已有活动 episode 的不再 carry-in，防同一标的双开计时器
+            continue
+        if item.action != "long" or item.horizon_action != "start" or item.horizon_days not in {5, 20, 60}:
+            continue
+        price = position.get("last_price")
+        if price is None or float(price) <= 0.0:
+            # carry-in 开盘成本必须取冻结 last_price，缺价直接拒绝而非估算，避免污染后续收益口径
+            raise ValueError(f"carry-in requires a frozen positive last_price for {item.symbol}")
+        due_at = (pd.Timestamp(as_of) + pd.offsets.BDay(item.horizon_days)).to_pydatetime()
+        episode = PositionEpisode(
+            trace_id=trace_id, symbol=item.symbol, source_trace_id=plan.trace_id, status="active",
+            anchor_at=as_of, current_due_at=due_at, original_horizon_days=item.horizon_days,
+            is_carry_in=True, opening_shares=int(position["quantity"]), opening_price=float(price),
+            intent_item_ids=(item.intent_item_id,), order_plan_ids=(plan.order_plan_id,),
+        )
+        book.append_position_episode(episode)
+        created.append(episode)
+    return created
+
+
+def _execution_frames(plan, as_of: datetime, store: RawPayloadStore):
+    start = plan.created_at.strftime("%Y-%m-%d")
+    end = as_of.strftime("%Y-%m-%d")
+    frames = {}
+    for order in plan.orders:
+        frame = load_price_frame(order.symbol, start, end, store=store)
+        # available_at<=as_of 的 PIT 闸门：回放时挡住晚于执行时点的未来行情
+        frame = frame[frame["available_at"] <= as_of] if not frame.empty else frame
+        if frame.empty:
+            raise ValueError(f"missing PIT execution prices for {order.symbol}")
+        frames[order.symbol] = frame
+    return frames
 
 
 def _collect(store: RawPayloadStore, options: FlowOptions, window: datetime) -> list[dict[str, Any]]:
@@ -212,7 +349,8 @@ def _collect(store: RawPayloadStore, options: FlowOptions, window: datetime) -> 
     news_start = (window - timedelta(days=options.news_days)).strftime("%Y-%m-%d")
     records: list[dict[str, Any]] = []
     for symbol in options.pool:
-        records.extend(news_collector.fetch_news_records(symbol, news_start, end, store=store))
+        records.extend(news_collector.fetch_news_records(symbol, news_start, end, store=store,
+                                                          include_fresh=options.as_of is None))
         if options.filings:
             records.extend(filings_collector.fetch_filings_records(symbol, news_start, end))
     # 持仓不一定仍在研究池中；daily 仍须先补齐其行情，才能对它做止损和回撤检查。

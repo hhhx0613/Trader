@@ -43,8 +43,8 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-from core.research import DataGateway, ResearchLedger, ResearchPacket
-from core.research.contracts import CriticVerdict
+from core.database import DataGateway, ResearchLedger, ResearchPacket
+from core.database.contracts import CriticVerdict
 
 from .event_agent import EventAgent
 from .fundamental_agent import FundamentalAgent

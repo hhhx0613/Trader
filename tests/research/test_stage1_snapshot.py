@@ -14,9 +14,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.research import DataGateway, ResearchLedger, SnapshotBuilder
-from core.research.providers import PITValidationError
-from core.research.raw import RawPayloadStore
+from core.database import DataGateway, ResearchLedger, SnapshotBuilder
+from core.database.providers import PITValidationError
+from core.database.raw import RawPayloadStore
 
 
 AS_OF = datetime(2026, 10, 3, 20, tzinfo=timezone.utc)

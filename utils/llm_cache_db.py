@@ -28,7 +28,7 @@ class LLMCacheDB:
         初始化数据库连接
         
         Args:
-            db_path: 数据库文件路径，默认为 core/data/cache/llm_cache.db
+            db_path: 数据库文件路径，默认为 core/collect/cache/llm_cache.db
         """
         if db_path is None:
             # 默认路径：data/cache/llm/llm_cache.db

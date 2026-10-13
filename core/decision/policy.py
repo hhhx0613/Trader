@@ -7,7 +7,7 @@ from math import sqrt
 import cvxpy as cp
 import numpy as np
 
-from core.research.contracts import IntentConstraints, PortfolioIntent, PortfolioWeight, TargetPortfolio
+from core.database.contracts import IntentConstraints, PortfolioIntent, PortfolioWeight, TargetPortfolio
 
 
 @dataclass(frozen=True)

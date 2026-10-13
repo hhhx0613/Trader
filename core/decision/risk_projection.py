@@ -5,13 +5,13 @@ from math import sqrt
 
 import numpy as np
 
-from core.research.contracts import (
+from core.database.contracts import (
     PortfolioWeight,
     RiskAdjustment,
     RiskProjectedPortfolio,
     TargetPortfolio,
 )
-from core.research.reasons import ReasonCode
+from core.database.reasons import ReasonCode
 
 
 @dataclass(frozen=True)

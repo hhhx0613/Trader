@@ -25,9 +25,9 @@
 
 ## 3. 目标业务状态机
 
-系统由两个独立图组成：`DecisionGraph` 产生研究意图与模拟成交；`OutcomeGraph` 在结果到期后复盘。后者不反向修改已经结束的决策。
+系统由两个独立业务流程组成：`ResearchDecisionFlow` 产生研究意图与模拟成交；`OutcomeReviewFlow` 在结果到期后复盘。后者不反向修改已经结束的决策。只有 `PerAssetResearchGraph` 是 LangGraph 实现；两个顶层流程均为业务编排名称。
 
-### 3.1 DecisionGraph：从每日感知到组合意图与模拟执行
+### 3.1 ResearchDecisionFlow：从每日感知到组合意图与模拟执行
 
 #### 3.1.1 每日数据更新、新闻分流与触发
 
@@ -54,9 +54,9 @@ graph TD
     B --> C["Event Agent triage"]
     C -->|irrelevant| D["记录理由，不进入研究"]
     C -->|weekly| E["周度新闻队列"]
-    C -->|immediate| F["临时 DecisionGraph"]
+    C -->|immediate| F["临时 ResearchDecisionFlow"]
     G["行情硬风险告警"] --> F
-    H["固定周度调仓日"] --> I["周度 DecisionGraph"]
+    H["固定周度调仓日"] --> I["周度 ResearchDecisionFlow"]
     E --> I
 
     classDef program fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E
@@ -67,11 +67,11 @@ graph TD
     class F,I decision
 ```
 
-行情风险告警不会直接下单。daily 在行情入库后用 `runtime.update_risk_state` 从 PIT 日线重放 ATR 止损、`peak_equity` 与回撤；它把新 `risk_state` 回交账户。若止损或首次锁仓，daily 必须已获注入模型，并在同一个 `run_research_round` 内复用本轮卡池自动启动既有临时 DecisionGraph；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate 后才产出 `OrderPlan`。没有风险事件时 daily 不调用模型。`untradable` 是当轮 `TradingInputs` 的现算交易能力，不写入 `risk_state`；`risk_locked` 自动置位、只能由人工显式复位。
+行情风险告警不会直接下单。daily 在行情入库后用 `runtime.update_risk_state` 从 PIT 日线重放 ATR 止损、`peak_equity` 与回撤；它把新 `risk_state` 回交账户。若止损或首次锁仓，daily 必须已获注入模型，并在同一个 `run_research_round` 内复用本轮卡池自动启动既有临时 ResearchDecisionFlow；即使 Agent 建议 `hold`、`reduce` 或 `exit`，也必须继续经过 PortfolioPolicy、RiskProjection 和 CostGate 后才产出 `OrderPlan`。没有风险事件时 daily 不调用模型。`untradable` 是当轮 `TradingInputs` 的现算交易能力，不写入 `risk_state`；`risk_locked` 自动置位、只能由人工显式复位。
 
-建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、按「正文哈希 + 标的」去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（DecisionGraph 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死，本轮新拉数据因 available_at 晚于时点被 PIT 闸门拒绝。
+建卡与冻结由 `SnapshotBuilder` 的两个独立入口承接，对应上图的两种节奏：`ingest_records`（每日/事件驱动：PIT 校验、按「正文哈希 + 标的」去重、落正文、建 EvidenceCard，不冻结）与 `freeze_snapshot`（ResearchDecisionFlow 启动时按标的与可得时间窗口从卡片池选卡冻结，不建卡）。两者各占独立 trace；周度脚本可顺序串联两步（沿用本轮建卡结果显式传卡集），每日也可只跑建卡。实盘模式下采集脚本在全部采集完成后才定 `as_of`，本轮到达的数据本轮即可用；传 `--as-of` 回放时时点钉死。采集器按 `include_fresh` 处理可得时间（news 与 market 同名同义）：行情 PIT 闸门默认钉在 `as_of`（`include_fresh=False`），仅实盘首拉显式放行到当前时刻；新闻历史条目的真实可得时刻无从得知，回放时 `available_at` 退化为 `published_at`（`include_fresh=False`），实盘才用网络接收时刻——这样回填的新闻卡才框得住 freeze 选卡窗口、不被 PIT 闸门当作未来数据拒绝。
 
-##### 编排入口收敛于 `agents/research/flow.py`
+##### 编排入口收敛于 `agents/flow.py`
 
 「采集 -> 建卡 -> 冻结 -> 逐标的研究图 -> Committee」的阶段门控与 trace_id 生成只有一个实现处：`run_research_round(options, *, model=None)`，三种节奏为 `daily`（只采集建卡入池，不冻结）、`collect`（采集并用本轮卡集点名冻结）、`decide`（按 `available_from` 池选卡冻结，再跑研究图与 Committee 产出 `PortfolioIntent`）。
 
@@ -81,7 +81,7 @@ graph TD
 2. **要决策就必须给真实账户。** `decide` 要求调用方传入 `account_state`（cash/positions/limits/regime/成本估计），缺账户直接失败而不退回占位值：Risk Critic 的 prompt 明确「缺 limits 或持仓状态不得当作放行」，占位账户只会跑出一轮全 `abstain` 的无效意图，白烧模型还留下一条看起来成功的 trace。
 3. **观测不属于编排。** 逐节点打印是调用方对模型客户端的包装（`research_run.py` 的终端 `TracingModel`、`viz/` 的事件版包装各一份，只解读调用内容），`flow` 内不含 `print`、事件总线或前端耦合，同一函数可被 CLI、外部调度器和 `viz/` 复用。采集能力始终在 `flow` 这一侧，研究 Agent 侧拿不到任何采集入口（见 4.2）。
 
-#### 3.1.2 一次 DecisionGraph 的执行顺序
+#### 3.1.2 一次 ResearchDecisionFlow 的执行顺序
 
 ```mermaid
 graph TD
@@ -141,7 +141,7 @@ graph TD
 
 研究节点采用「注入 hook + 单工具补查」：每个 Agent 在调用模型**之前**先执行一个数据注入 hook（由各 Agent 自行声明读哪些冻结批次），把该标的本周证据（Event 读 news、Fundamental 读 filing/XBRL、Market 只读本标的 market）**无条件组装进初始 prompt**——类别取数由代码直接调 Gateway 完成，不再作为模型工具暴露，因此模型默认单轮即可产出 ClaimCard，不再需要花一轮工具调用去「要」它本就该看到的证据。模型唯一可自主发起的只读工具是 `search_evidence`（补查），仅当它判断注入批次不足时才调用；若仍不足则走一次性 `data_request` 弃权而不是无限补查。`tools.py`（`ResearchTools`）是工具目录与受控执行循环的**唯一实现处**（预算/参数校验/正文截断/trace 记账），Agent 文件只负责声明挂载哪几个工具与注入 hook；模型不能取得 API key、Provider、文件路径或数据库连接，也不能触发任何网络请求。Risk Critic 是例外：它的四项上下文（当前仓位、换手/成本估计、regime、peer）本就是每轮必读的固定输入，因而全部走注入 hook 直接拼装、**不挂载任何工具**，以单轮 `chat_json` 输出 verdict。Gateway 全程只读账本与原始正文库；缺证据不在研究过程中补——补齐数据是采集脚本在冻结之前的职责。补查工具名、参数、来源、返回 EvidenceCard ID、失败码与结果数均写入研究 trace（默认注入的批次则由 Gateway 的 `gateway_queries` 审计）。
 
-研究图的输入是采集脚本在 DecisionGraph 启动前冻结好的决策 Snapshot：`as_of`、股票池与卡集此后不再改变。Gateway 不联网，因此研究过程中不存在“补到新卡”，也不再需要 `ResearchRun` 生命周期；实盘与历史回放走完全相同的只读路径，同一份 Snapshot 重放得到同一批输入。证据不足时模型走显式的 `data_request` 路由并弃权，原因写入 trace；缺口由下一轮采集脚本补齐后重新冻结再研究，未补齐的数据不会进入本次决策。所有 Claim 只能引用本节点可见的 EvidenceCard ID——即初始 prompt 注入的冻结批次，加上 `search_evidence` 补查实际返回的卡片；补查被 `ResearchTools` 锁在本节点证据维度内（Event 只能搜 news、Fundamental 只能搜 filing、Market 只能搜 market），维度分工不给补查开后门；二者均严格落在本 Snapshot 冻结卡集内。行情继续复用 `core/indicators.py` 预处理为 market EvidenceCard（由采集脚本计算），财报/XBRL 由 SEC 采集器结构化，新闻保持 EvidenceCard 摘录；模型不做数值计算，也不存在静默 fallback 或人工重跑。
+研究图的输入是采集脚本在 ResearchDecisionFlow 启动前冻结好的决策 Snapshot：`as_of`、股票池与卡集此后不再改变。Gateway 不联网，因此研究过程中不存在“补到新卡”，也不再需要 `ResearchRun` 生命周期；实盘与历史回放走完全相同的只读路径，同一份 Snapshot 重放得到同一批输入。证据不足时模型走显式的 `data_request` 路由并弃权，原因写入 trace；缺口由下一轮采集脚本补齐后重新冻结再研究，未补齐的数据不会进入本次决策。所有 Claim 只能引用本节点可见的 EvidenceCard ID——即初始 prompt 注入的冻结批次，加上 `search_evidence` 补查实际返回的卡片；补查被 `ResearchTools` 锁在本节点证据维度内（Event 只能搜 news、Fundamental 只能搜 filing、Market 只能搜 market），维度分工不给补查开后门；二者均严格落在本 Snapshot 冻结卡集内。行情继续复用 `core/indicators.py` 预处理为 market EvidenceCard（由采集脚本计算），财报/XBRL 由 SEC 采集器结构化，新闻保持 EvidenceCard 摘录；模型不做数值计算，也不存在静默 fallback 或人工重跑。
 
 所有 Agent 的调用输入由 Snapshot Builder 在该节点即时组装，并保存输入 Card ID、Gateway 查询 ID、模型/提示词版本和输出 schema 校验结果。数据包超出 token 预算时，Builder 减少选择范围并保留可回查 ID；研究事实始终以 Snapshot、EvidenceCard、ClaimCard 和 Gateway 回查结果为准。每个研究节点的提示词必须显式声明证据范围、允许的推断边界、引用/反证/未知项处理规则、弃权条件与精确的输出 schema；细化提示词只为提高 schema 合规率，绝不因此赋予 Agent 读取非冻结数据或绕过确定性控制的能力。
 
@@ -180,12 +180,12 @@ graph TD
 | 输入块 | 内容 |
 | --- | --- |
 | 固定规则 | 投资范围、允许动作、持有期与成本敏感原则、输出 schema。 |
-| 当前组合快照 | 全股票池 ResearchPacket 摘要、持仓/现金/入场价/持有期、市场 regime、可交易性和本周成本估计。 |
+| 当前组合快照 | 全股票池 ResearchPacket 摘要、持仓/现金/入场价/持有期、市场 regime、可交易性和本周成本估计；对每个活动 `PositionEpisode` 另给出 `episode_id`、首次实际成交日、`current_due_at`、剩余交易日、原始 horizon 与当前仓位。 |
 | 调仓差异 | 上次 PortfolioIntent、实际成交或未成交、期间成本与换手、本周新增、失效或被反证的 ClaimCard。 |
-| 可选结果记忆 | 少量已具备 OutcomeCard 与 Review 标签的相似案例；首版可以为空。 |
+| 历史案例输入 | Committee 在 ResearchPacket 完成后按当前标的查询少量历史案例；结果仅是本次 prompt 的临时输入，可为空。案例是决策的一等校准依据，可影响动作、强度、优先级与持有窗口；实际采用时经 `IntentItem.calibration_episode_ids` 显式引用，不得写入本轮事实引用字段。 |
 
-- **实现：** 在全股票池比较 ResearchPacket，结合当前组合和调仓差异决定每只标的的研究动作、候选准入优先级和持有期。
-- **输出：** PortfolioIntent；每只标的包含 `long/hold/reduce/exit/abstain`、动作强度、持有期、优先级、支持/反对 Card ID 和不交易理由。
+- **实现：** 先在全股票池比较 ResearchPacket；随后以已完整终结的 `PositionEpisode` 为历史案例候选单位，复用账本查询与案例排序函数沿其关联的 Intent、Plan、Fill、Outcome 与 Review 物化案例摘要，再按冻结的决策状态、持仓状态、行业/设定、研究来源组合、立场、regime 与配置版本排序，并在 Committee 内部组装临时的 `historical_episodes_by_symbol` 字典。最后 Committee 才结合当前组合、调仓差异和对应标的的 episode 案例决定研究动作、候选准入优先级与持有期。三个研究 Agent 不读取历史案例，避免结果反向污染本轮事实判断。
+- **输出：** PortfolioIntent；每只标的包含 `long/hold/reduce/exit/abstain`、动作强度、`horizon_action`、必要时的持有期、优先级、支持/反对 Card ID、校准 episode ID 和不交易理由。
 - **边界：** 不读原始全文或 Agent 聊天，不输出百分比权重、预期收益数值、连续强弱分数或订单。Committee 先由冻结的 `ResearchPacket` 摘要构建 `ThesisBook`，再只产出带引用的 `PortfolioIntent`；被 Critic 判为 `abstain`/`human_review` 的标的，在 Intent 中必须保持 `abstain`。
 - **违规治理（分级）：** `_validate_items` 的拦截按违规粒度分流，不再一律全池弃权：
   1. **标的局部违规**（单只 bypass Critic 否决、引用 ID 越出本标的 Packet、非 abstain 缺支持 Card）——仅该标的的 item 强制替换为 `abstain`，`no_trade_reason` 写明原始违规；其余合规 item 保留。
@@ -283,7 +283,7 @@ CostGate 的目标是避免小额、频繁或不可成交的调仓，RiskProject
 
 阶段 4 的实现必须使用上述受约束目标函数；求解器版本、目标系数、行情窗口和全部约束均写入版本化配置与审计对象。不得以启发式截断、默认成本或缺失行情替代任何一个约束。
 
-政策参数（单仓上限、保持带、行业映射、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`，以无 `PORTFOLIO_` 前缀的模块级常量追加，与旧基线同名语义参数并存但口径分注；`data/account*.json` 只承载账户状态（`cash`/`positions`/`limits`/`regime`/`risk_state`/成本估计），不再内嵌政策配置。`core/portfolio/runtime.py` 从 `config` 读取政策、从账户读取 `risk_state`，任一缺失即拒绝而不退回占位值。
+政策参数（单仓上限、保持带、行业映射、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`，以无 `PORTFOLIO_` 前缀的模块级常量追加，与旧基线同名语义参数并存但口径分注；`data/account*.json` 只承载账户状态（`cash`/`positions`/`limits`/`regime`/`risk_state`/成本估计），不再内嵌政策配置。`core/decision/runtime.py` 从 `config` 读取政策、从账户读取 `risk_state`，任一缺失即拒绝而不退回占位值。
 
 `PortfolioPolicy` 的稳定接口为：
 
@@ -303,28 +303,73 @@ TargetPortfolio = portfolio_policy(
 
 该设计采用风险预算与波动率目标，而非用 Agent 观点预测个股预期收益。交易成本、风险和暴露约束可通过优化程序纳入组合构建；权重约束也能缓解大组合协方差估计误差造成的极端配置。[Lobo、Fazel 与 Boyd（2007）](https://stanford.edu/~boyd/papers/portfolio.html)；[Jagannathan 与 Ma（2002）](https://www.nber.org/system/files/working_papers/w8922/w8922.pdf)。逆波动率、等权和 PPO 保留为统一接口下的对照策略；PPO 不属于主线仓位决策。
 
-### 3.2 OutcomeGraph：结果复盘与记忆写入
+### 3.2 OutcomeReviewFlow：量化归因、复盘与受控经验
 
 ```mermaid
 graph TD
-    S([START：持有期到期、退出或复盘日]) --> L["LoadTrace"]
-    L --> O["BuildOutcomeCard：收益、成本、回撤、市场环境"]
-    O --> R["Review Agent：标注有效性或失败模式"]
-    R --> G{"证据完整、结果到期且复盘完成？"}
-    G -->|否| E([END：不写入记忆])
-    G -->|是| M["UpdateMemory：写入结果绑定案例"] --> X([END])
+    I["PortfolioIntent / IntentItem"] --> P["OrderPlan（直接 intent_id）"]
+    P --> F["Fill：实际成交/部分成交/未成交"]
+    F --> E["PositionEpisode：实际持仓生命周期"]
+    D["每日收盘后的 OutcomeScheduler"] --> E
+    E -->|"horizon 到期或终局"| O["OutcomeCard：确定性量化归因"]
+    O --> R["Review Agent：受限经验说明"]
+    R --> G{"结果、证据与复盘完整？"}
+    G -->|否| X([END：不得检索])
+    G -->|是| C["可检索历史案例"]
+    Q["当前 ResearchPacket"] --> B["账本查询与案例排序函数"]
+    C --> B
+    B --> M["逐标的 PositionEpisode 摘要（临时 prompt 输入）"]
+    M --> K["Committee"]
 
     classDef program fill:#E0F2FE,stroke:#0284C7,color:#0C4A6E
     classDef agent fill:#F3E8FF,stroke:#9333EA,color:#581C87
     classDef gate fill:#FFF7ED,stroke:#EA580C,color:#7C2D12
-    class L,O,M program
-    class R agent
+    class I,P,F,E,D,O,C,Q,B,M program
+    class R,K agent
     class G gate
 ```
 
-外部调度器每天检查已有 `trace_id` 是否达到预定义观察窗口（例如决策/交易后第 1、5、20 个交易日）、是否退出或 thesis 失效。`NoTrade` 同样应形成反事实 OutcomeCard，用来评估观望是否合理。
+#### 3.2.1 决策、订单、成交与持仓生命周期
 
-长期记忆只保存“论点—证据—交易—客观结果—复盘标签”的完整案例；未到期交易、无来源摘要和 LLM 自评不得写入。检索只返回少量时间安全、标的/事件/行业/regime 相关且结果已验证的案例，并始终附带原始 `trace_id`。
+`PortfolioIntent` 是决策前上下文的唯一来源。每个 `PlannedOrder` 以其 `symbol` 对应同一 Intent 的唯一 `IntentItem`，并记录来源是 Committee 意图还是硬风控动作。
+
+`OrderPlan` 是“应如何调仓”的冻结计划；`Fill` 是执行层实际发生的事实，必须允许零成交、部分成交、多笔成交、成交时点/价格/佣金差异。它不是 OrderPlan 的落盘副本。外部券商接入后仅以券商回报写入 Fill，绝不以计划假定成交。
+
+复盘单位不是机械的一张订单，而是一个 `PositionEpisode`，也是可检索案例的聚合根：首次实际买入开启；它保存 `intent_item_ids`、`order_plan_ids`、`fill_ids`，终结后再关联唯一的 `outcome_card_id` 与 `review_label_id`。这些字段只保存关联 ID，事实仍由对应原始对象保存；后续加仓、减仓和执行 Fill 都关联该 episode。每个活动 episode 只有一个不可延后的 `current_due_at`；它在到期、完全退出或 thesis 被显式判定失效时终结。到期后若仓位仍存在，完成 Outcome/Review 后的下一轮决策可由该存续仓位 `carry_in` 开启后继 episode，不要求再有一笔买入 Fill。v1 限制为每个标的一次净多头 episode，不支持同标的重叠的独立 thesis/lot；新 thesis 必须先终结旧 episode 再开启。未成交订单只保留执行事实与原因码，不伪装为实际选股收益。
+
+#### 3.2.2 HorizonPolicy：先离线校准，再冻结线上桶
+
+持有期不是 LLM 的自由整数，也不是一组固定复盘日。`HorizonPolicy` 是版本化的确定性配置：候选桶为 `5/20/60` 个交易日；Committee 必须连同每个 item 输出 `horizon_action`。无活动 episode 的新 thesis 使用 `start` 并从桶中选择 `horizon_days`；有活动 episode 的同一 thesis 只能输出 `retain`（保留 `current_due_at`）或 `shorten`（从桶中选择一个使“本轮决策日 + horizon_days”严格早于 `current_due_at` 的窗口）。`exit`、`abstain` 与纯硬风控动作用 `none`，不设 horizon。无法在这些约束内说明窗口时必须输出 `abstain`。
+
+v1 固定 `5/20/60` 个交易日（约一周、一个月、一个季度）为线上可选 horizon 桶：每个新 episode 由 Committee 三选一，不设默认桶，也不为同一 episode 同时生成三份结果。选择该集合的原因是覆盖短事件、月度调仓和较慢基本面/趋势信号的不同衰减尺度。`retain` 不产生第二个 timer，`shorten` 只能提前，不能以连续调仓无限延后验证。
+
+离线实验分别监测三个已批准桶在滚动、PIT 安全样本外的净主动收益/风险、最大回撤、命中率、换手与实现成本、样本数和区间估计，用于评估未来是否需要版本化调整桶集合或 Policy；不得以单次回测、单次复盘或事后最佳 horizon 改写线上配置。线上 `horizon_policy_version` 固定后，只有完成新的预注册实验和版本切换才能改变。
+
+#### 3.2.3 调度与 OutcomeCard
+
+`OutcomeScheduler` 在每日收盘且当日 PIT 价格可得后扫描未终结 episode；“每日扫描”只判断今天是否到期，不代表每日写卡。它以每个 episode 唯一的 `current_due_at` 调度，而不是为每次调仓叠加 timer。每个 episode 只在以下任一事件首次发生时追加一张 OutcomeCard：
+
+1. 实际成交锚点后的已批准 horizon 到期；
+2. 完全退出；
+3. 调用方以冻结证据显式触发 `thesis_invalidated`。
+
+调仓时，`retain` 把新 Fill 关联到原 episode 而不改 `current_due_at`；`shorten` 仅可把它提前；完全退出无论是否到期都以 `early_exit` 终结该 episode。`T+1` 只核对 Fill 的成交、滑点、佣金和未成交原因，不生成“选股结果”卡。未成交写入零数量的 `Fill` 与原因码，但不创建 episode、OutcomeCard、ReviewLabel 或可检索案例；若仍需交易，下一轮必须生成新的 OrderPlan。部分成交只对已成交部分开启或延续 episode。离线 horizon 校准可以分别计算 `5/20/60` 日前瞻诊断指标，但不写入线上账本、不生成 OutcomeCard 或 ReviewLabel。
+
+OutcomeCard 是不可修改的客观归因：以 Fill 和 PIT 价格计算实际净收益、回撤、持有期与执行成本；并相对决策时冻结的替代方案计算主动结果。新开仓的替代方案是“不建仓”，既有仓位的替代方案是“维持原仓”，不得一律用 NoTrade 替代。缺少成交或 PIT 价格链时显式未完成；未成交仅保留执行记录，不能进入实际结果案例。
+
+#### 3.2.4 Review、检索与边界
+
+仅在 horizon 到期或终局的完整 OutcomeCard 上调用 Review Agent。它通过该 `PositionEpisode` 读取关联的 IntentItem、OrderPlan、Fill 与量化归因，输出 `complete/abstain`、`reflection`、提示词版本，以及 `memory_eligibility=eligible/reject`，并将其 ID 回关联至 episode；不得接收或引用 EvidenceCard。研究证据链仍保留在 Intent/Claim/账本中供回放，不能被 Outcome 复盘混同为结果归因。Review 不得生成 `effective/failed/mixed` 总评，不修改决策、账户、订单、客观数值、prompt 或策略参数，也不承担全节点审计。`complete` 只表示复盘合规，不等于可借鉴；默认 `reject`，只有决策链清晰、执行/结果可归因且包含可迁移模式的反思才可 `eligible`。不得按盈利筛选：清晰证伪 thesis 的亏损案例可以进入记忆，偶然获利、纯硬风险、执行噪声或归因不足的案例必须 `reject`。
+
+可检索的 Historical Episode Case 是一个完整终结的 `PositionEpisode` 按关联 ID 物化出的只读案例视图：其 IntentItem、OrderPlan、Fill、OutcomeCard 与 `complete + eligible` ReviewLabel 必须齐全。`PositionEpisode` 只保存规范化生命周期和这些关联 ID；它不是经验文本本身。账本查询函数在入 prompt 前沿 ID 打包决策、执行、客观结果与受限 reflection，Committee 接收该案例摘要与其审计锚点 `episode_id`。
+
+每个摘要必须可回溯到其 `episode_id`，且只包含当时可得的决策材料与之后的实际结果：相似原因、原始动作/持有期/理由、决策前 Claim 摘要、实际成交/滑点/成本、净主动结果/回撤/终局原因，以及受限的 Review reflection。它不能把事后收益或 reflection 伪装成当时的证据；经验影响只能经 `IntentItem.calibration_episode_ids` 显式引用留痕，不得混入 `supporting_card_ids`/`opposing_card_ids` 等事实引用字段，也不能覆盖 Critic 的否决。
+
+v1 在 ResearchPacket 完成后、Committee 前，复用账本查询与案例排序函数做确定性结构化近邻检索：候选必须在本轮 `as_of` 之前完整终结，具有实际 Fill、完整 PIT 链、完整 OutcomeCard 和 `complete + eligible` ReviewLabel，且不是只由硬风险产生的选股 episode。排序按当前/历史持仓状态、行业或产业、regime、Event/Fundamental/Market 的来源组合、Claim 立场，以及程序已生成的市场/波动/流动性状态的相似度；同标的是局部性加分，不是硬过滤，历史动作和 horizon 作为返回上下文而非当前查询的硬条件。不得按盈利筛选，正反结果都保留；时间衰减在 v1 只作确定性重排或同分决胜，半衰期须由样本外实验校准；Top-K 须按标的/行业多样化，避免单一历史来源淹没案例。
+
+因此经验可以跨标的迁移，但只能作为相似决策状态的候选来源，不能形成全池共享结论。Committee 仅在本轮内为每个当前标的组装 `historical_episodes_by_symbol[symbol]`：每个键都有独立的、带 `episode_id` 的 PositionEpisode 案例摘要列表，可为空。跨标的 episode 可以因相似设定进入目标标的的列表，但不得把某个 item 已检索或已采用的结论扩散为其他 item 的共享输入。上线跨标的候选前，必须在滚动 PIT 样本外比较无检索、同标的基线和结构化近邻检索的净收益/风险、回撤、换手及成本、稳定性和区间估计。未来若该消融证明增益，才可将**冻结的决策前** ResearchPacket/Claim 摘要的向量检索作为补充候选通道；不得对事后 Outcome 或 reflection 建向量来驱动检索。
+
+`PortfolioIntent` 的每个 `IntentItem` 分别保存自己的 `calibration_episode_ids`，不存在 PortfolioIntent 级别的全局列表。经验是一等决策输入，但影响必须显式留痕：Committee 若实际采用某条经验校准判断，必须在目标标的的 `IntentItem.calibration_episode_ids` 显式列出 `episode_id`；该字段独立于该 item 的当前事实 `supporting_card_ids`，为空表示没有采用案例。对任意 item `i`（标的为 `s`），校验器要求 `i.calibration_episode_ids ⊆ ids(historical_episodes_by_symbol[s])`，并限制数量。检索调用复用现有 `ledger.record_tool_call` 记录查询画像/版本、全量候选 ID、分项排序或得分、选中 ID 与排除原因；最终被 Committee 引用的 ID 随其 IntentItem 持久保存，使每次经验影响都可重放。
 
 ## 4. 数据、工具与审计边界
 
@@ -359,7 +404,7 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 
 ### 4.3 审计记录与恢复
 
-每次图运行共享 `trace_id`。审计账本以追加式版本保存输入 Snapshot、EvidenceCard、ClaimCard、ResearchPacket、PortfolioIntent、TargetPortfolio、OrderPlan、成交、OutcomeCard，以及模型/提示词/配置版本、失败原因和耗时。LLM 缓存与审计账本分离：缓存用于复用调用，不能充当长期记忆。
+每次图运行共享 `trace_id`。审计账本以追加式版本保存输入 Snapshot、EvidenceCard、ClaimCard、ResearchPacket、PortfolioIntent、TargetPortfolio、OrderPlan、成交、PositionEpisode、OutcomeCard，以及模型/提示词/配置版本、失败原因和耗时。历史案例检索复用 `ledger.record_tool_call` 保存查询画像、候选、排序、选中与排除记录；由 episode 关联 ID 物化的 prompt 摘要和 IntentItem 中实际采用的 `calibration_episode_ids` 共同保证经验影响可重放。LLM 缓存与审计账本分离：缓存用于复用调用，不能充当长期记忆。
 
 给定任一 `trace_id`，系统应能在不访问实时数据的前提下重建当时的输入与决策链；缺失任一关键对象即标记回放失败。
 
@@ -383,13 +428,15 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 | `EvidenceCard` | 来源、URL、发布时间、`available_at`、内容哈希、标的、PIT 状态 | 不可变事实与引用入口 |
 | `ClaimCard` | 论点、立场、证据/反证 ID、置信度、时效、未知项 | Agent 的可审计研究结论 |
 | `ResearchPacket` | 单标的 ClaimCard、冲突、引用覆盖率、当前持仓与 Critic 结论 | Committee 的单标的输入 |
-| `PortfolioIntent` | `long/hold/reduce/exit/abstain`、动作强度、优先级、理由、持有期限 | LLM 研究到组合层的唯一边界 |
+| `PortfolioIntent` | 每标的 IntentItem 的 `long/hold/reduce/exit/abstain`、动作强度、优先级、理由、持有期限及 `calibration_episode_ids` | LLM 研究到组合层的唯一边界；每个 item 的历史经验引用与当前事实 Card 引用分离 |
 | `IntentConstraints` | 可持有资格、权重下限/上限、交易许可、强制退出与准入原因 | 将研究动作转为确定性组合边界 |
 | `TargetPortfolio` | 股票与现金权重、总暴露、Policy 版本与理由 | 风控前组合目标 |
 | `RiskProjectedPortfolio` | 硬风险限制后的权重、现金、收缩项与原因码 | CostGate 的组合输入 |
-| `OrderPlan` | 风控/成本后的订单、原因码与执行限制 | 执行引擎输入 |
+| `OrderPlan` | 直接 `intent_id`、风控/成本后的订单、来源与执行限制 | 执行引擎输入；不可只经中间组合对象间接追溯意图 |
 | `DeferredTrade` | 未执行目标差额、延后原因和下次重评条件 | 防止系统把未成交误认为已完成 |
-| `OutcomeCard` | 实际收益、成本、回撤、持有期、市场环境 | 复盘与结果绑定记忆输入 |
+| `Fill` | 实际成交数量、价格、时间、佣金、部分/未成交原因 | 执行事实；|
+| `PositionEpisode` | 同标的实际持仓生命周期，以及 Intent/Plan/Fill/Outcome/Review 的关联 ID | 可检索案例的聚合根与选股结果的最小归因单位；不重复保存事实 |
+| `OutcomeCard` | 到期或终局时的实际/主动结果、成本、回撤、持有期与市场环境 | 每个 episode 只追加一次的客观复盘输入 |
 
 分层职责固定如下：数据层保存事实；研究 Agent 生成论点；Committee 做跨标的意图选择；PortfolioPolicy 做数学分配；RiskProjection 与 CostGate 做确定性拒绝或收缩；Execution Engine 模拟成交；Review Agent 只解释已经发生的结果。任何上游 LLM 均不得绕过下游硬约束。
 

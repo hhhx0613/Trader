@@ -3,8 +3,8 @@ from collections.abc import Mapping, Set
 from dataclasses import dataclass
 from math import sqrt
 
-from core.research.contracts import DeferredTrade, OrderPlan, PlannedOrder, RiskProjectedPortfolio
-from core.research.reasons import ReasonCode
+from core.database.contracts import DeferredTrade, OrderPlan, PlannedOrder, RiskProjectedPortfolio
+from core.database.reasons import ReasonCode
 
 
 @dataclass(frozen=True)

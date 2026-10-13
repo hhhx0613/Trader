@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """研究链统一入口：一条命令跑完全程（采集 → 建卡 → 冻结 → 研究图 → 委员会）
 
-编排本体在 `agents/research/flow.py`，本脚本只做参数装配与逐节点打印。命令行只暴露
+编排本体在 `agents/flow.py`，本脚本只做参数装配与逐节点打印。命令行只暴露
 「跑全程」这一个节奏（= flow 的 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→
 委员会）。`daily`（只补数据、不冻结）与 `decide`（不采集、从卡片池冻结后决策）是给外部定时
 调度器直接调用 `run_research_round` 用的，不再各自养一份命令行参数装配。
@@ -11,6 +11,10 @@
   python scripts/research_run.py --pool NVDA AAPL                   # 只跑指定标的
   python scripts/research_run.py --account data/account.json        # 换账户文件
   python scripts/research_run.py --as-of 2026-10-03T18:00:00+00:00  # 历史时点回放（本轮新拉数据被 PIT 拒绝）
+  python scripts/research_run.py --mode execute --order-plan-id op_xxx --as-of 2026-10-06T20:00:00+00:00
+  python scripts/research_run.py --mode review --as-of 2026-11-01T20:00:00+00:00  # 扫描全部到期 episode
+  python scripts/research_run.py --mode review --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
+  python scripts/research_run.py --mode review --trigger thesis_invalidated --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
 
 账户口径：全链要跑 Risk Critic，必须带真实持仓（`cash`/`positions`/`limits`）。缺账户时 flow
 直接拒绝而不是退回占位值——Risk Critic 的 prompt 规定「缺 limits 或持仓状态不得当作放行」，
@@ -32,13 +36,16 @@ if str(_PROJECT_ROOT) not in sys.path:
 import argparse
 import ast
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
-from agents.research.flow import FlowOptions, run_research_round
+from agents.flow import FlowOptions, run_research_round
+from core.outcome import OutcomeScheduler
+from core.database import ResearchLedger
+from core.database.raw import RawPayloadStore
 from utils.llm_client import LLMClient
 
-# 与 core/data 采集器、viz 一致的默认观察池（保持脚本间可对照）
+# 与 core/collect 采集器、viz 一致的默认观察池（保持脚本间可对照）
 DEFAULT_POOL = ["AAPL", "AMZN", "GOOGL", "JNJ", "JPM", "MSFT", "NVDA", "UNH", "V", "WMT"]
 
 
@@ -50,6 +57,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--account", default=str(_PROJECT_ROOT / "data" / "account.json"),
                    help="账户状态 JSON 路径，必须含 cash/positions/limits")
     p.add_argument("--as-of", default=None, help="决策时点 ISO-8601（默认当前 UTC = 实盘）")
+    p.add_argument("--mode", choices=("collect", "execute", "review"), default="collect",
+                   help="collect=研究决策；execute=人工 T 日模拟成交；review=手工触发 OutcomeScheduler")
+    p.add_argument("--order-plan-id", default=None, help="execute 必填；review 可选，用于限定 scheduler 扫描的 OrderPlan")
+    p.add_argument("--trigger", choices=("exit", "thesis_invalidated"), default=None,
+                   help="仅 review：显式记录退出或 thesis 失效时点")
+    p.add_argument("--trigger-evidence-id", nargs="+", default=(),
+                   help="仅 thesis_invalidated：该 episode 原冻结 Snapshot 内的 EvidenceCard ID")
     return p.parse_args()
 
 
@@ -134,7 +148,7 @@ class TracingModel:
                 return str(data["agent"])
             if "portfolio" in data:
                 return "risk_critic"
-            if "thesis_book" in data:
+            if "portfolio_state" in data:
                 return "committee"
         return message[:24]
 
@@ -161,9 +175,8 @@ class TracingModel:
                   f"turnover={'有' if data.get('turnover_cost') else '空'} regime={data.get('regime') is not None} "
                   f"peer={len(data.get('peer_comparison') or {})} 组")
         elif node == "committee":
-            book = data.get("thesis_book") or {}
-            print(f"  ThesisBook  : packets={len(book.get('packet_ids', []))} regime={book.get('regime')} "
-                  f"portfolio_keys={list((book.get('portfolio_state') or {}).keys())}")
+            state = data.get("portfolio_state") or {}
+            print(f"  账户摘要    : portfolio_keys={list(state.keys())} regime={data.get('regime')}")
             print(f"  标的摘要    : {len(data.get('packets', []))} 个 Packet digest")
 
     def _show_tool(self, name: str, arguments: dict, raw_out: str) -> None:
@@ -234,6 +247,11 @@ class TracingModel:
 
 def _report(result, *, ledger_path: Path) -> None:
     print(f"\n[{result.mode}] as_of={result.as_of.isoformat()} 建卡={result.ingested} 张", flush=True)
+    if result.fills:
+        for fill in result.fills:
+            print(f"  Fill {fill.symbol:6s} {fill.side:4s} status={fill.status} shares={fill.filled_shares}/{fill.requested_shares}")
+    if result.mode == "execute":
+        return
     if result.snapshot is None:
         print(f"  未冻结 Snapshot（每日节奏）；卡片已入池，账本：{ledger_path}")
         return
@@ -266,20 +284,54 @@ def _report(result, *, ledger_path: Path) -> None:
         print(f"    defer {item.symbol:6s} target={item.target_weight:.2%} reason={item.reason_code}")
 
 
+def _run_outcome_scheduler(args: argparse.Namespace, as_of: datetime | None) -> int:
+    """CLI 只作为 scheduler 的手工调试入口；每日触发应由外部任务系统调用同一对象。"""
+    when = as_of or datetime.now(timezone.utc)
+    if args.trigger and not args.order_plan_id:
+        raise ValueError("--trigger requires --order-plan-id so the terminal episode is explicit")
+    ledger = ResearchLedger(config.RESEARCH_LEDGER_PATH)
+    store = RawPayloadStore(config.RESEARCH_RAW_DIR)
+    client = LLMClient(provider=config.DEFAULT_LLM_PROVIDER, model=config.DEFAULT_LLM_MODEL)
+    try:
+        episode_ids = None
+        if args.order_plan_id:
+            episode_ids = tuple(episode.episode_id for episode in ledger.list_active_position_episodes()
+                                if args.order_plan_id in episode.order_plan_ids)
+        reason = "early_exit" if args.trigger == "exit" else args.trigger
+        result = OutcomeScheduler(ledger=ledger, raw_store=store, model=TracingModel(client)).scan(
+            as_of=when, trace_prefix="run-outcome", episode_ids=episode_ids, terminal_reason=reason,
+            trigger_evidence_ids=tuple(args.trigger_evidence_id))
+    finally:
+        store.close()
+    print(f"[outcome-scheduler] as_of={when.isoformat()} settled={len(result.outcomes)}", flush=True)
+    for outcome, label in zip(result.outcomes, result.review_labels):
+        print(f"  Outcome {outcome.symbol:6s} {outcome.observation}: actual net={outcome.net_return:.2%}")
+        print(f"  Review {label.outcome_card_id}: {label.status}")
+    return 0
+
+
 def main() -> int:
     _enable_utf8_console()
     args = _parse_args()
-    account = _load_account(args.account)
-    options = FlowOptions(pool=tuple(args.pool), mode="collect", as_of=_utc_or_parse(args.as_of),
-                          account_state=account, trace_prefix="run")
+    as_of = _utc_or_parse(args.as_of)
+    if args.mode == "review":
+        try:
+            return _run_outcome_scheduler(args, as_of)
+        except ValueError as exc:
+            print(f"[entry rejected] {exc}", file=sys.stderr, flush=True)
+            return 2
+    account = _load_account(args.account) if args.mode != "review" else None
+    options = FlowOptions(pool=tuple(args.pool), mode=args.mode, as_of=as_of,
+                          account_state=account, order_plan_id=args.order_plan_id, trace_prefix="run")
     # 默认口径跟 config 和 viz 一致：裸 LLMClient() 会读环境变量 DEFAULT_LLM_PROVIDER（缺省 openai），
     # 与 config 里的 deepseek 对不上，直接抛「未配置 OPENAI_API_KEY」。显式传 config 默认值免这个坑。
-    client = LLMClient(provider=config.DEFAULT_LLM_PROVIDER, model=config.DEFAULT_LLM_MODEL)
-    print(f"[全程] provider={client.provider}/{client.model}｜标的 {len(options.pool)} 只｜"
-          f"账户 {args.account}；逐节点交互另见 logs/llm_calls.jsonl", flush=True)
+    client = LLMClient(provider=config.DEFAULT_LLM_PROVIDER, model=config.DEFAULT_LLM_MODEL) if args.mode != "execute" else None
+    print(f"[{args.mode}] 标的 {len(options.pool)} 只｜账户 {args.account if account else '(review 不读账户)'}"
+          + (f"｜provider={client.provider}/{client.model}" if client else "")
+          + "；逐节点交互另见 logs/llm_calls.jsonl", flush=True)
 
     try:
-        result = run_research_round(options, model=TracingModel(client))
+        result = run_research_round(options, model=TracingModel(client) if client else None)
     except ValueError as exc:
         # 入口把关（账户字段不齐、同时点重跑撞 trace）是调度器要读的一句话，
         # 带非零退出码让外部任务能区分「本轮已记过账」与真崩溃。

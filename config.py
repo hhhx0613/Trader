@@ -236,10 +236,10 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
 LLM_NETWORK_RETRIES = int(os.getenv("LLM_NETWORK_RETRIES", "2"))
 
 
-# ==================== 组合政策（PortfolioPolicy，core/portfolio/ 使用） ====================
+# ==================== 组合政策（PortfolioPolicy，core/decision/ 使用） ====================
 # 本块是新确定性组合层的政策默认值，与上方旧基线常量（TARGET_VOLATILITY /
 # COMMISSION_PER_TRADE / MAX_POSITION_RATIO 等）并存：旧常量服务于 strategy/run_backtest
-# 基线，新常量服务于 core/portfolio/PortfolioPolicy，两者口径不同，勿混用。
+# 基线，新常量服务于 core/decision/PortfolioPolicy，两者口径不同，勿混用。
 # config_version 会写入审计对象，回放时据此识别当时所用规则版本。
 
 POLICY_VERSION = "portfolio-policy-v1-provisional"  # 含 provisional：多数阈值未经真实成交校准

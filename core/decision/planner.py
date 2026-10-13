@@ -10,7 +10,7 @@
 """
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
-from core.research.contracts import (
+from core.database.contracts import (
     IntentConstraints,
     OrderPlan,
     PortfolioIntent,

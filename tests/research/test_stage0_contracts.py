@@ -17,8 +17,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-import core.research.contracts as contracts_module
-from core.research import (
+import core.database.contracts as contracts_module
+from core.database import (
     ClaimCard,
     EvidenceCard,
     PortfolioIntent,
@@ -29,12 +29,12 @@ from core.research import (
     RouteDecision,
     ThesisBook,
 )
-from core.research.contracts import (
-    Contract, CriticVerdict, Fill, IntentConstraints, IntentItem, OrderPlan,
-    RiskProjectedPortfolio, TargetPortfolio,
+from core.database.contracts import (
+    Contract, CriticVerdict, Fill, IntentConstraints, IntentItem, OrderPlan, OutcomeCard,
+    PositionEpisode, ReviewLabel, RiskProjectedPortfolio, TargetPortfolio,
 )
-from core.research.providers import PITValidationError, validate_available_at
-from core.research.store import OBJECT_TABLES
+from core.database.providers import PITValidationError, validate_available_at
+from core.database.store import OBJECT_TABLES
 
 AS_OF = datetime(2026, 10, 3, 20, tzinfo=timezone.utc)
 TRACE = "trace-0"
@@ -80,6 +80,7 @@ def test_only_documented_contracts_are_frozen():
     assert found == {
         EvidenceCard, ResearchSnapshot, ClaimCard, ResearchPacket, ThesisBook, PortfolioIntent,
         IntentConstraints, TargetPortfolio, RiskProjectedPortfolio, OrderPlan, Fill,
+        PositionEpisode, OutcomeCard, ReviewLabel,
     }
 
 

@@ -12,10 +12,14 @@ package neither calls models nor produces intents or orders.
 from .contracts import (
     ClaimCard,
     EvidenceCard,
+    Fill,
+    OutcomeCard,
+    PositionEpisode,
     PortfolioIntent,
     ResearchPacket,
     ResearchSnapshot,
     RouteDecision,
+    ReviewLabel,
     ThesisBook,
 )
 from .gateway import DataGateway
@@ -24,7 +28,7 @@ from .snapshot import SnapshotBuilder
 from .store import ResearchLedger
 
 __all__ = [
-    "ClaimCard", "DataGateway", "EvidenceCard", "PortfolioIntent",
+    "ClaimCard", "DataGateway", "EvidenceCard", "Fill", "OutcomeCard", "PositionEpisode", "PortfolioIntent",
     "ReasonCode", "ResearchLedger", "ResearchPacket", "ResearchSnapshot",
-    "RouteDecision", "SnapshotBuilder", "ThesisBook",
+    "RouteDecision", "ReviewLabel", "SnapshotBuilder", "ThesisBook",
 ]

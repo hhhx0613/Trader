@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from core.portfolio.runtime import update_risk_state
+from core.decision.runtime import update_risk_state
 
 
 def _frame(final_close: float) -> pd.DataFrame:

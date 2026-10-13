@@ -1,7 +1,7 @@
 """研究风险批评 Agent / Soft research veto over upstream ClaimCards."""
 
-from core.research import ReasonCode
-from core.research.contracts import CriticVerdict
+from core.database import ReasonCode
+from core.database.contracts import CriticVerdict
 
 from .types import JsonModel, ResearchState
 from .prompting import load_prompt
@@ -22,8 +22,6 @@ class RiskCritic:
         if not claims:
             return {"critic": CriticVerdict(verdict="abstain", reasons=["no valid upstream claims"])}
         try:
-            schema = (self.prompt + '\n\n' + 'Return exactly one JSON object with keys verdict (allow, caution, abstain, or human_review), '
-                      'reasons (non-empty array of strings), and card_ids (array of supplied claim IDs). Do not add keys.')
             prompt = {"prompt_version": self.prompt_version,
                       "claims": [item.model_dump(mode="json") for item in claims]}
             # 注入 hook：仓位/换手成本/regime/peer 本就是每轮必读的固定上下文，直接拼装后单轮定夺，
@@ -34,7 +32,7 @@ class RiskCritic:
             prompt["regime"] = self.gateway.get_regime(**common)
             prompt["peer_comparison"] = self.gateway.get_peer_comparison(**common)
             # deepseek-flash 为混合推理模型：max_tokens 过小会被内部思考 token 吃光、content 返回空。
-            response = self.model.chat_json(str(prompt), system_prompt=schema,
+            response = self.model.chat_json(str(prompt), system_prompt=self.prompt,
                                             temperature=0.0, max_tokens=8000, max_retries=1)
             verdict = CriticVerdict(verdict=response["verdict"], reasons=tuple(response["reasons"]),
                                     card_ids=tuple(response.get("card_ids", ())))

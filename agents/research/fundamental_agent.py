@@ -1,7 +1,7 @@
 """财报基本面 Agent / Filing-only verification of an event thesis."""
 
-from core.research import ReasonCode
-from core.research.contracts import RouteDecision
+from core.database import ReasonCode
+from core.database.contracts import RouteDecision
 
 from .claim_agent import ClaimAgent
 from .types import ResearchState
@@ -26,6 +26,9 @@ class FundamentalAgent(ClaimAgent):
         evidence = self.gateway.get_filing_section(snapshot_id=state["snapshot_id"], symbol=state["symbol"],
                                                     as_of=state["as_of"], section="")
         upstream = tuple(c.claim_id for c in event_claims)
+        # 只传 claim_id 无法执行「用披露核验上游论点」：把论点摘要随 context 注入，正文仍锁在 filing 维度。
+        context = {"upstream_claims": [{"claim_id": c.claim_id, "statement": c.statement, "stance": c.stance}
+                                       for c in event_claims]}
         claims, route = self._claim(state, instruction="Verify the upstream event claims with independent filing evidence.",
-                               evidence=evidence, upstream=upstream, allowed_kinds=("filing",))
+                               evidence=evidence, upstream=upstream, context=context, allowed_kinds=("filing",))
         return {"fundamental_route": route, **({"fundamental_claims": claims} if claims else {})}

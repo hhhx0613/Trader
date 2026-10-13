@@ -5,7 +5,7 @@
 
 ## 1. 实施总则
 
-1. **一条主线。** `采集 -> PIT 过滤 -> Snapshot -> PerAssetResearch -> Committee -> PortfolioPolicy -> RiskProjection -> CostGate -> SimulatedExecution -> OutcomeGraph`。旧 Top-K、VADER、单 LLM 分数、逆波动率公式和 PPO 只作为独立对照，不与新主线共同决定任何一笔订单。
+1. **一条主线。** `ResearchDecisionFlow（采集 -> PIT 过滤 -> Snapshot -> PerAssetResearch -> Committee -> PortfolioPolicy -> RiskProjection -> CostGate -> SimulatedExecution） -> OutcomeReviewFlow`。旧 Top-K、VADER、单 LLM 分数、逆波动率公式和 PPO 只作为独立对照，不与新主线共同决定任何一笔订单。
 2. **复用优先的次序。** 先用现有函数完成任务；现有职责不满足 `Plan.md` 的 PIT/审计边界时才改造；只有确认全仓库没有等价实现时才新增。新增前先在本文件第 2 节的资产清单里找不到落点，才允许建目录。
 3. **数据和判断分离。** `core/research/` 只保存事实、引用、冻结快照和审计；`agents/research/` 只在冻结输入上形成研究判断；组合、风控、成本和订单是确定性程序，不接收原始 LLM 文本。
 4. **骨架不等于完成。** 离线 fixture 通过只说明行为可测；每阶段还需真实小样本验收、记录已知限制并满足阶段门槛，才可进入下一阶段。
@@ -21,7 +21,7 @@
 | `core/research/snapshot.py` | `SnapshotBuilder` 双入口：`ingest_records`（PIT 校验 -> 去重 -> 存原始载荷 -> 建卡）与 `freeze_snapshot`（显式卡集或 `select_evidence` 池选卡后冻结），各占独立 trace | 【改造】加最低数据要求检查与拒绝记录；不重写流程 |
 | `core/research/gateway.py` | `DataGateway.evidence_for_symbol`：snapshot/symbol/as_of 边界校验 + `record_query` 审计 | 【改造】按 Plan.md 4.2 表扩展查询方法，复用同一校验与审计模式 |
 | `core/research/raw.py` | `RawPayloadStore` 内容寻址存储 | 【复用】 |
-| `core/data/news.py` | `fetch_news_records`：三源同构记录 + coverage 拉取台账（历史网格段整段/未走完段拆单日）+ AV->Finnhub 降级，正文直落 news.db | 【复用】主线新闻入口 |
+| `core/data/news.py` | `fetch_news_records`：三源同构记录 + coverage 拉取台账（历史网格段整段/未走完段拆单日）+ AV->Finnhub 降级，正文直落 news.db；`include_fresh` 与 market 同名（回放 False→available_at=发布时刻，实盘 True→=接收时刻） | 【复用】主线新闻入口 |
 | `core/data/market.py` | `ensure_market_coverage`（K 线素材批次）+ `build_feature_card`（每周一张特征卡=事实）+ `load_price_frame`（PIT 价格帧，同日取最早 available_at） | 【复用】主线行情入口 |
 | `core/legacy/news_data.py`、`core/legacy/market_data.py` | 旧 CSV 缓存路径 `fetch_news`/`fetch_ohlcv`（PPO/回测管线在用） | 【封存】主线不再回用 |
 | `core/data/llm_cache_db.py` | `LLMCacheDB`：LLM 调用缓存 | 【改造】缓存 key 补输入哈希与 prompt 版本，可关联 trace |
@@ -32,7 +32,7 @@
 | `core/risk_manager.py` | 止损、回撤、成本与原因信息 | 【改造】拆为硬约束输入 + `RiskProjection` 确定性规则 |
 | `core/base_engine.py`、`core/multi_stock_engine.py` | 账户、持仓、费用记账、T-1 决策/T 日开盘模拟成交 | 【改造】输入边界改为 `OrderPlan` + `trace_id`，账本逻辑不动 |
 | `agents/research/graph.py` | `PerAssetResearchGraph.run`：**单标的**、只读已冻结 Snapshot 的研究图（Event → Fundamental ‖ Market → Critic → Packet） | 【复用】只覆盖链路第四段，多标的循环由上层编排负责 |
-| `agents/research/flow.py` | `run_research_round`：采集→建卡→冻结→逐标的研究→Committee 的阶段门控编排，`daily`/`collect`/`decide` 三种节奏 | 【复用】CLI、外部定时调度与 `viz/` 共用唯一入口 |
+| `agents/research/flow.py` | `run_research_decision_flow`：ResearchDecisionFlow 的采集→建卡→冻结→逐标的研究→Committee 阶段门控编排，`daily`/`collect`/`decide` 三种节奏 | 【复用】CLI、外部定时调度与 `viz/` 共用唯一入口 |
 | `scripts/run_backtest.py` | `--purpose`/`--experiment-id`、manifest、`docs/experiment_index.csv` 登记 | 【复用】；【改造】加新主线入口，旧策略保留独立标识 |
 | `core/ppo/` | 总暴露实验路径 | 【复用】仅作对照，不进主线仓位决策 |
 | `core/data/filings.py` | EDGAR Provider 已交付：ticker→CIK 映射、submissions/XBRL facts 筛选、acceptance 时刻即 `available_at`；网络备忘缓存写 `data/cache/filings/`（非账本） | 【复用】主线披露入口 |
@@ -40,14 +40,14 @@
 ## 3. 当前状态
 
 - 阶段 1 主线已交付（2026-10-03）：三采集器（`core/data/news.py`/`market.py`/`filings.py`）+ 建卡/冻结双入口 + `select_evidence` 池选卡 + 入口薄壳；离线回归 30 项（`tests/research/`）全绿；NVDA 真实轮已冻结验收（news 1045 条、去重后 891 卡，`snap_223d227a…`）。
-- 编排收敛（2026-10-05）：采集/建卡/冻结/研究图/委员会的阶段门控上移为 `agents/research/flow.py` 的 `run_research_round`，原 `scripts/capture_research_snapshot.py`（只到冻结）与 `scripts/trace_research_flow.py`（通到 Committee 的逐节点打印）已删除并合并为 `scripts/research_run.py`；`research_run.py` 只保留「跑全程」一个入口（默认 `collect` + 注入模型），`daily`/`decide` 交给外部定时调度器直接调用 `run_research_round`，不再各自养命令行。`viz/` 也已删掉自带的 `pipeline.py`：观测层（事件总线/SSE/取消/TracingModel）合并进 `viz/server.py`，「跑全程」直接复用 `flow.run_research_round`，与 CLI、定时调度器同一函数；仅保留 flow 没有的「复用已冻结 Snapshot 单阶段调试」节奏直接调用生产原语 `PerAssetResearchGraph`/`Committee`。
-- 风险状态收敛（2026-10-10）：`core/portfolio/runtime.py:update_risk_state` 是 ATR 止损、`peak_equity`、回撤和 `risk_locked` 的纯状态转换；主线 daily 在行情入库后读取 PIT 日线、把返回值回写至调用方账户的 `risk_state`。若止损或首次锁仓，daily 必须要求调用方已注入模型，并在同一个 `run_research_round` 内复用本轮卡池自动进入既有 `decide` 流程，最终只产出 `OrderPlan`；无风险时不触碰模型。`untradable` 不入库，只由本轮 `TradingInputs` 现推。`risk_locked` 只会自动置位，人工解除须由调用方显式把账户字段复位。旧 `MultiStockBacktestEngine` 不在此接线范围内。
+- 编排收敛（2026-10-05，2026-10-13 重命名）：采集/建卡/冻结/研究图/委员会的阶段门控上移为 `agents/research/flow.py` 的 `run_research_decision_flow`，原 `scripts/capture_research_snapshot.py`（只到冻结）与 `scripts/trace_research_flow.py`（通到 Committee 的逐节点打印）已删除并合并为 `scripts/research_run.py`；`research_run.py` 只保留「跑全程」一个入口（默认 `collect` + 注入模型），`daily`/`decide` 交给外部定时调度器直接调用 `run_research_decision_flow`，不再各自养命令行。`viz/` 也已删掉自带的 `pipeline.py`：观测层（事件总线/SSE/取消/TracingModel）合并进 `viz/server.py`，「跑全程」直接复用 `flow.run_research_decision_flow`，与 CLI、定时调度器同一函数；仅保留 flow 没有的「复用已冻结 Snapshot 单阶段调试」节奏直接调用生产原语 `PerAssetResearchGraph`/`Committee`。
+- 风险状态收敛（2026-10-10）：`core/portfolio/runtime.py:update_risk_state` 是 ATR 止损、`peak_equity`、回撤和 `risk_locked` 的纯状态转换；主线 daily 在行情入库后读取 PIT 日线、把返回值回写至调用方账户的 `risk_state`。若止损或首次锁仓，daily 必须要求调用方已注入模型，并在同一个 `run_research_decision_flow` 内复用本轮卡池自动进入既有 `decide` 流程，最终只产出 `OrderPlan`；无风险时不触碰模型。`untradable` 不入库，只由本轮 `TradingInputs` 现推。`risk_locked` 只会自动置位，人工解除须由调用方显式把账户字段复位。旧 `MultiStockBacktestEngine` 不在此接线范围内。
 - 测试收敛（2026-10-05）：删除 PPO/回测线的 `tests/test_ppo_env.py`、`tests/test_ppo_stage2.py`、`tests/test_risk_manager.py`，`tests/` 下只保留研究链回归（`tests/research/`，当前 52 项）。被删测试覆盖的 `core/ppo/`、`core/risk_manager.py` 实现本身保留，但自此无测试覆盖——它们属于旧回测基线，随该线退役时一并删除，不再单独补测。
 - 实盘决策时点后置：入口脚本未传 `--as-of` 时采集完才定 `as_of`，本轮到达数据本轮可用；传 `--as-of` 时点钉死，本轮新拉数据被 PIT 正确拒绝。
 - 账户口径的已知敞口：`account_state`（含 `regime`、持仓、限额）由调用方手填 JSON 提供，`freeze_snapshot` 对其不做 PIT 校验，因此 `--as-of` 历史回放会把当下的账户与行情判断带入历史时点。当前用法只在实盘时点决策，暂不加校验；`regime` 也不由系统推断，`DataGateway.get_regime()` 仅回读冻结值。
 - 尚未开始：最低数据要求检查与 `rejection_code` 落盘、Gateway 查询扩展（阶段 2 依赖）、事件驱动复核入口。
 - 历史欠账（用户决定延后）：`data/research/raw/` 下 957 个文件系统时代正文目录是 9 月旧卡的唯一副本，须先按哈希迁入分库再删；`data/cache/news/` 旧 CSV 网格未入账本，如需历史回放按 `available_at = published_at` 假设口径另行处理并明牌标注。
-- 阶段 4 重构中（2026-10-09）：此前仅有参考分配/简化门控，不满足 Plan。现改为显式配置的协方差/换手凸优化、完整硬风险投影与订单级成本门控，并把结果接入研究全流程终端输出；任何市场、账户、限额或成本输入缺失均显式拒绝。不接入旧回测引擎，也不运行回测。执行改造和 OutcomeGraph 尚未开始；研究 Agent、单标的图与 Committee 已交付（见阶段 2/3 条目与 `tests/research/`）。
+- 阶段 4 已接入研究流（2026-10-10）：显式配置的协方差/换手约束、硬风险投影和订单级成本门控会把 Committee 输出收口为 `OrderPlan`；任何市场、账户、限额或成本输入缺失均显式拒绝。阶段 5 已有独立 `SimulatedExecution`/`Fill` 契约和离线测试，但尚未写入主 flow；OutcomeReviewFlow 尚未实现。旧回测引擎不在此接线范围内。
 - 行情窗口重构（2026-10-10）：删除以 coverage 台账判断完整性的 `ensure_market_coverage`。采集阶段每轮以 `load_price_frame` 合并截至 `as_of` 向前 400 个自然日的 PIT 批次为唯一事实，仅补窗口缺失的前段或尾段并返回新旧合并帧；coverage 只保留请求审计。Portfolio 只读此窗口，并仍以全池至少 253 个对齐收盘价作为协方差前置条件。
 
 ## 4. 阶段 0：补齐契约与冻结图接口
@@ -176,15 +176,23 @@
 - 新旧路径不共享同一订单决定权；旧策略可独立运行作对照。
 - 任一成交可定位到 `OrderPlan` 与完整上游 trace。
 
-## 10. 阶段 6：OutcomeGraph、受控记忆与实验治理
+## 10. 阶段 6：OutcomeReviewFlow、受控记忆与实验治理
 
 **业务位置：** 结果到期后写入不可修改的客观结果，复盘产出标签；以统一协议验证增量。
 
+**实施顺序（2026-10-13 校正）：** `decide -> T+1 execute` 只负责写入真实 `Fill` 与更新 `PositionEpisode`。每日收盘后的外部 `OutcomeScheduler` 扫描 active episode，只在唯一 horizon 到期、完全退出或携冻结证据的 `thesis_invalidated` 时写一张 `OutcomeCard`，随后触发 Review Agent；调度不属于 research flow。Review Agent 复用既有模型边界，案例只从账本按 episode 关联 ID 物化，不建立平行记忆库。`complete` 只表示复盘可审计；Review 还必须明确 `memory_eligibility=eligible/reject`。只有 `complete + eligible` 的 episode 才物化为可检索的 Historical Episode Case，默认 `reject`，避免旧记录或模型/解析故障静默进入记忆。
+
+**状态：OutcomeReviewFlow 与 Committee 受控记忆实现已完成，端到端离线验收待重跑（2026-10-13）。** 已交付：`PositionEpisode` 聚合根及 revision 账本；`5/20/60` HorizonPolicy 的 `start/retain/shorten/none` 代码校验；T+1 Fill 关联、部分成交、未成交排除与 carry-in 后继 episode；PIT 安全的实际/主动收益、回撤、持有期和成本归因；`OutcomeScheduler`、受限 Review Agent 与冻结证据的 thesis-invalidated trigger；完整 episode 的结构化检索、按标的临时注入、`calibration_episode_ids` 留痕，以及逐候选得分/排除理由审计。不得把早先“第 1/5/20 日各写一张卡”、一律 NoTrade 反事实或 flow 内人工 review 视为当前实现。
+
+**Outcome 反思 LLM：** Outcome 的收益、成本、回撤和替代方案始终由确定性程序计算；Review Agent 只读取已终结 episode 的 Intent、OrderPlan、Fill 与 OutcomeCard，生成历史 reflection 并审核该 episode 是否具有可迁移的经验价值。它不读取或引用 EvidenceCard：研究证据链仍保留在 Intent/Claim/账本中供完整回放，不能被 Outcome 复盘伪装为结果归因。`eligible` 的依据是决策链清晰、执行/结果可归因且存在可迁移模式；不得按盈亏筛选，亏损但清晰证伪 thesis 的案例应保留，偶然获利、纯硬风险、执行噪声或归因不足的案例应 `reject`。它不输出 effective/failed/mixed 总评，不修改决策、账户、订单、prompt 或策略参数；`abstain`、模型失败、不完整 episode 或 `reject` 均不得进入检索。
+
+**本段剩余工作（仅 Outcome/记忆）：** 重跑并固定 `scripts/outcome_smoke.py` 的完整离线链路验收：OrderPlan -> T+1 Fill -> Episode -> Scheduler -> Outcome -> Review -> 下一轮 Committee 校准引用；再以滚动 PIT 样本外比较无检索、同标的基线和结构化近邻检索。后者是上线跨标的经验候选与调整时间衰减/多样化规则的前置条件，不得以单次案例决定参数。
+
 **工作项**
 
-- 【新增】`OutcomeGraph`：第 1/5/20 交易日、退出或 thesis 失效时生成 `OutcomeCard`；`NoTrade` 生成反事实 Outcome。收益/成本/回撤数值【复用】引擎账本与 `market_data` 计算，复盘调度由外部脚本承担，不引入新调度框架。
-- 【改造】Review Agent：复用阶段 2 的 Agent 边界与 `LLMClient`，只读原始证据、Intent、成交和 Outcome，标注有效性或失败模式；不得以 LLM 自评替代客观结果。
-- 【新增】受控案例检索：仅保存/返回证据完整、已到期、已复盘、带 trace 的少量案例；未到期不得入长期记忆。旧 L1 记忆（`llm_analyst`）不迁移。
+- 【已完成】`OutcomeCalculator`：每个 episode 仅在唯一 horizon、完全退出或证据化失效时生成一次 `OutcomeCard`；新开仓以 no-trade、carry-in 以 maintain 为替代方案。
+- 【改造】Review Agent：只读经账本 ID 物化的 Intent、订单、成交与 Outcome；不接收或引用 EvidenceCard，在不替代客观结果的前提下输出 `memory_eligibility`，并在 reflection 说明准入或拒绝理由。默认拒绝，禁止以收益方向作为准入条件。
+- 【改造】受控案例检索：仅返回决策 `as_of` 前完整终结、带实际结果且为 `complete + eligible` Review 的 episode；按标的物化 Historical Episode Case 后临时注入，实际采用经 `calibration_episode_ids` 留痕。旧 L1 记忆不迁移。
 - 【复用】`experiment_index.csv` 登记协议：固定 PIT 截止、股票池、调仓日历、成本模型、风险限额、基线与成功/失败标准。
 - 【改造】依次进行研究层消融（无 LLM / 单 LLM / 无 Critic / 完整多 Agent）与组合层对照（等权、逆波动率、约束风险预算、PPO 多种子 + 滚动样本外 + block bootstrap）。
 

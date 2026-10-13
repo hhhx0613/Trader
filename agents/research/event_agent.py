@@ -1,7 +1,7 @@
 """新闻事件 Agent / Cited event interpretation over frozen news."""
 
-from core.research import ReasonCode
-from core.research.contracts import RouteDecision
+from core.database import ReasonCode
+from core.database.contracts import RouteDecision
 
 from .claim_agent import ClaimAgent
 from .types import ResearchState

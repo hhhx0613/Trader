@@ -24,13 +24,33 @@ PIT 数据 → EvidenceCard → 个股研究 Agent → ClaimCard
 
 ### 阶段 4 组合政策（离线）
 
-`core/portfolio/` 已提供确定性的 `PortfolioPolicy`：`PortfolioIntent -> IntentConstraints -> TargetPortfolio -> RiskProjectedPortfolio -> OrderPlan`。它使用动作边界、逆波动率参考分配、协方差波动率目标、只减风险的硬约束投影和成本门控；所有中间对象均可写入 `ResearchLedger`。**组合政策参数（单仓上限、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`**（无 `PORTFOLIO_` 前缀的模块级常量），`data/account*.json` 只承载账户状态；`risk_state`（峰值/回撤/止损/锁仓）由 daily 节奏从 PIT 日线重算并回写账户。研究链入口（flow）在 Committee 后自动调用组合政策，旧回测引擎不调用它。
+`core/decision/` 已提供确定性的 `PortfolioPolicy`：`PortfolioIntent -> IntentConstraints -> TargetPortfolio -> RiskProjectedPortfolio -> OrderPlan`。它使用动作边界、逆波动率参考分配、协方差波动率目标、只减风险的硬约束投影和成本门控；所有中间对象均可写入 `ResearchLedger`。**组合政策参数（单仓上限、分配/波动率/风险/成本阈值与模型、`config_version`）集中管理在根 `config.py`**（无 `PORTFOLIO_` 前缀的模块级常量），`data/account*.json` 只承载账户状态；`risk_state`（峰值/回撤/止损/锁仓）由 daily 节奏从 PIT 日线重算并回写账户。研究链入口（flow）在 Committee 后自动调用组合政策，旧回测引擎不调用它。
 
 ### 阶段 5 模拟执行（离线）
 
-`core/execution/` 的 `SimulatedExecution` 只接收冻结的 `OrderPlan`：T-1 形成订单，T 日按开盘价、成交量参与率、滑点、佣金、现金与持仓撮合，并输出显式 `Fill`（完整、部分或延后）。它不重选标的、不重算权重，旧 Top-K/PPO 回测路径也不调用它。只读 replay 与新回测命令入口仍未接入。
+`core/decision/` 的 `SimulatedExecution`（与组合政策同一包，旧 `core/execution/` 已合并到 `core/decision/`）只接收冻结的 `OrderPlan`：T-1 形成订单，T 日按开盘价、成交量参与率、滑点、佣金、现金与持仓撮合，并输出显式 `Fill`（完整、部分或延后）。它不重选标的、不重算权重，旧 Top-K/PPO 回测路径也不调用它。人工调用 `execute` 模式才会在下一可交易日写入 Fill，绝不在 `decide` 当天伪造成交。
 
-研究全流程在 Committee 后会继续运行组合链：`agents/research/flow.py` 从 `config.py` 政策参数与 PIT 行情、账户状态构造输入，产出 `IntentConstraints`/`TargetPortfolio`/`RiskProjectedPortfolio`/`OrderPlan` 四个对象并写入账本；viz 调试台的「组合政策」阶段与账本回放可直接展示。任何一个行情、账户或限额输入缺失均会拒绝本轮组合决策，绝不填充默认值。
+### 阶段 6 OutcomeReviewFlow（人工复盘）
+
+`review` 模式只读取已冻结的 `OrderPlan`、实际 `Fill` 和 PIT 行情，在 episode 到期、完全退出或 thesis 显式失效时结算唯一一张 `OutcomeCard`；没有成交时明确记录为反事实，不能当作真实收益。可选 Review Agent 只能解释完整客观结果；只有非 `abstain` 的复盘标签才可作为受控案例检索。项目不安装周频任务，人工按需要运行：
+
+```powershell
+python scripts/research_run.py --mode execute --order-plan-id op_xxx --as-of 2026-10-06T20:00:00+00:00
+python scripts/research_run.py --mode review --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
+python scripts/research_run.py --mode review --trigger thesis_invalidated --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
+```
+
+若只验证 OutcomeReviewFlow 是否完整接线、而不等待真实 T+1 成交与到期结算，可运行明确标注为离线 fixture 的单命令 smoke（不联网、不调用真实 LLM）：
+
+```powershell
+D:\Miniconda3\envs\trader\python.exe scripts/outcome_smoke.py
+```
+
+`--trigger exit|thesis_invalidated` 必须由人工明确给出；系统不会让模型自行宣布 thesis 失效。Committee 只收到同标的、同冻结 regime 的已验证 Outcome 摘要，它们不能写入本轮事实引用字段或覆盖 Risk Critic。
+
+可注入模型的 Review Agent 不计算收益，也没有调参/下单权限；它只为单个已终结的持仓 episode 形成带冻结证据引用的历史反思摘要，决策、执行与证据材料在入 prompt 前沿账本物化。摘要随已验证案例注入未来同标的、同 regime 的 Committee prompt，经验影响只能经 `calibration_episode_ids` 显式引用，不得写入当前事实引用字段；越界引用、模型失败或证据不足都会使该案例降级为 `abstain`，不得注入。
+
+研究全流程在 Committee 后会继续运行组合链：`agents/flow.py` 从 `config.py` 政策参数与 PIT 行情、账户状态构造输入，产出 `IntentConstraints`/`TargetPortfolio`/`RiskProjectedPortfolio`/`OrderPlan` 四个对象并写入账本；viz 调试台的「组合政策」阶段与账本回放可直接展示。任何一个行情、账户或限额输入缺失均会拒绝本轮组合决策，绝不填充默认值。
 
 ### 阶段 2 研究图谱
 
@@ -38,7 +58,7 @@ PIT 数据 → EvidenceCard → 个股研究 Agent → ClaimCard
 
 研究节点采用「注入 hook + 单工具补查」：每个 Agent 在调用模型前先执行注入 hook，把自己那一份冻结批次（Event 读 news、Fundamental 读 filing、Market 读 market/peer/regime，并把 Event 论点作只读语境注入以供判断价量确认/背离）无条件拼进初始 prompt，因此模型默认单轮即可产出 ClaimCard，不再花一轮工具去「要」本就该看到的数据；模型唯一可自主发起的只读工具是 `search_evidence`（同维度定向补查：`ResearchTools` 按节点锁定证据类别，Event 只能搜 news、Fundamental 只能搜 filing、Market 只能搜 market，维度分工不给补查开后门），`tools.py`（`ResearchTools`）一遍实现其预算/校验/截断/trace 记账，Agent 文件只声明挂载哪些工具与本节点可见的证据类别。Risk Critic 是例外：仓位/换手成本/regime/peer 四项固定上下文全部注入、不挂载任何工具，以单轮 `chat_json` 输出 verdict。证据仍不足时模型走一次性 `data_request` 弃权而非无限补查。
 
-图谱只通过 `core/research/` 的 `DataGateway` 读取 Snapshot 绑定数据，不生成权重、订单或回测，也绝不触网：`DataGateway` 只读账本与原始载荷库。采集与冻结发生在 Snapshot 之前，统一由 `agents/research/flow.py` 编排（见「运行入口」）。离线验收套件：`python -m pytest tests/research -q`。
+图谱只通过 `core/database/` 的 `DataGateway` 读取 Snapshot 绑定数据，不生成权重、订单或回测，也绝不触网：`DataGateway` 只读账本与原始载荷库。采集与冻结发生在 Snapshot 之前，统一由 `agents/flow.py` 编排（见「运行入口」）。离线验收套件：`python -m pytest tests/research -q`。
 
 `DataGateway` 不暴露任何采集面：没有 `ensure_*` 工具、没有运行生命周期，卡片查询严格限定在所指名 Snapshot 冻结时选定的卡片集合内。冻结窗口确实证据过薄时，节点显式返回 `data_request` 路由并弃权；缺口由下一次采集补齐，未补齐的数据绝不进入本轮决策。`DataGateway.get_news_batch()` 确定性地按情绪分绝对值降序取至多 100 张冻结卡片、至多 24,000 字符（两者任一命中即截断），防止历史大卡片池变成无界的付费模型请求。因为实盘与回放研究读的都是同一份冻结 Snapshot，一个 Snapshot 永远对应一套固定输入集；`ResearchLedger.list_evidence` 在一次查询内完成冻结集合与 symbol 过滤解析，Snapshot 引用的卡片若已不在账本会直接报错。
 
@@ -72,7 +92,7 @@ python -m pytest tests/research -q
 
 ## 运行入口：研究链主线（阶段 1-3）
 
-编排本体在 `agents/research/flow.py` 的 `run_research_round(FlowOptions, model=...)`：阶段门控与 trace_id 生成只在这一处。`scripts/research_run.py` 只暴露「跑全程」一个命令（默认 flow 的 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→委员会并逐节点打印）；`daily`（只补数据、不冻结）与 `decide`（不采集、从卡片池冻结后决策）是给外部定时调度器直接调用同一函数用的，不再各自养一份命令行参数装配。
+编排本体在 `agents/flow.py` 的 `run_research_round(FlowOptions, model=...)`：阶段门控与 trace_id 生成只在这一处。`scripts/research_run.py` 只暴露「跑全程」一个命令（默认 flow 的 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→委员会并逐节点打印）；`daily`（只补数据、不冻结）与 `decide`（不采集、从卡片池冻结后决策）是给外部定时调度器直接调用同一函数用的，不再各自养一份命令行参数装配。
 
 ```bash
 python scripts/research_run.py                                    # 全默认：10 只观察池 + data/account.json
@@ -134,11 +154,17 @@ python scripts/run_backtest.py \
 
 ```text
 agents/                         LLM、VADER 与当前 Top-K 决策
+agents/flow.py                  全流程编排入口（collect→research→committee→decision→fill→outcome）
+agents/research/                per-asset LangGraph 与 Committee（事件/基本面/行情/风险/claim/tools/prompting）
+agents/outcome/                 阶段 6 Review Agent
 core/                           数据、指标、回测、风控与 PPO
-core/research/                  PIT Snapshot、原始载荷、审计账本与只读 DataGateway
-core/portfolio/                 阶段 4 确定性组合约束、配置、硬风控投影与成本门控
-core/execution/                 阶段 5 冻结订单的 T-1/T 日模拟撮合
-tests/research/                 阶段 0-5 契约、离线数据、审计、组合与执行回归测试
+core/database/                  跨阶段事实层：契约、Snapshot、原始载荷、审计账本与只读 DataGateway
+core/collect/                   阶段 1 三采集器（market/news/filings）
+core/decision/                  阶段 4-5 组合政策与模拟执行（PortfolioPolicy+SimulatedExecution）
+core/outcome/                   阶段 6 Outcome 计算与调度（OutcomeCalculator+OutcomeScheduler）
+core/ppo/                       PPO 训练与预测（decision 的择时输入）
+utils/                          LLM 客户端、日志与 LLM 缓存 SQLite
+tests/research/                 阶段 0-6 契约、离线数据、审计、组合、执行与结果回归测试
 scripts/research_run.py         研究链唯一人类入口（一条命令跑全程；daily/decide 由调度器直接调 flow）
 scripts/run_backtest.py         统一回测入口
 scripts/train_ppo.py            PPO 训练入口

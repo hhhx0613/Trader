@@ -16,12 +16,12 @@ import pandas as pd
 import pytest
 
 from core import config
-from core.data import market
-from core.data.market import _bars_batch_record, build_feature_card, load_price_frame, prepare_market_history
-from core.data.news import _segments_for
-from core.research.raw import RawPayloadStore
-from core.research.snapshot import SnapshotBuilder
-from core.research.store import ResearchLedger
+from core.collect import market
+from core.collect.market import _bars_batch_record, build_feature_card, load_price_frame, prepare_market_history
+from core.collect.news import _news_record, _segments_for
+from core.database.raw import RawPayloadStore
+from core.database.snapshot import SnapshotBuilder
+from core.database.store import ResearchLedger
 
 AS_OF = datetime(2026, 10, 3, 20, tzinfo=timezone.utc)
 
@@ -260,3 +260,40 @@ def test_mixed_window_keeps_whole_finished_head_and_daily_tail():
     assert whole and daily
     assert all(pd.Timestamp(we) < pd.Timestamp("2026-10-03") for _, we in whole)
     assert "2026-08-25" in _covered_days(windows)  # 尾部日子也罩住
+
+
+# ---------- 6: 新闻 available_at 随节奏切换（include_fresh） ----------
+
+def test_news_record_pins_available_at_to_published_for_replay():
+    """回放（include_fresh=False）：历史条目真实可得时刻未知，钉到发布时间，
+    PIT 与 freeze 选卡窗口才能框住回填卡（与 market 同名同义）。"""
+    published = AS_OF - timedelta(days=3)
+    fetched_at = AS_OF  # 拉取时壁钟晚于 as_of，模拟“今天回填三天前的新闻”
+    record = _news_record("AAPL", source="fixture", title="t", summary="s", url="u",
+                          published_at=published, fetched_at=fetched_at, extra={},
+                          include_fresh=False)
+    assert record["available_at"] == published
+
+
+def test_news_record_uses_fetch_wallclock_in_live_mode():
+    """实盘（include_fresh=True）：本轮拉到的本轮即可用，available_at = 网络接收时刻。"""
+    published = AS_OF - timedelta(hours=2)
+    fetched_at = AS_OF - timedelta(hours=1)
+    record = _news_record("AAPL", source="fixture", title="t", summary="s", url="u",
+                          published_at=published, fetched_at=fetched_at, extra={},
+                          include_fresh=True)
+    assert record["available_at"] == fetched_at
+
+
+def test_news_content_hash_ignores_available_at():
+    """卡片去重以正文哈希为键：切换 include_fresh 不会变 content_hash，
+    同一事实跨节奏回到 builder 依旧命中 find_evidence_by_content，不新建卡。
+    同时也确认 available_at 已写入记录，提醒采集器必须在“首次拉取”时就定对
+    节奏，不能事后改写（改写会变 payload sha，产生重复正文）。"""
+    published = AS_OF - timedelta(days=3)
+    base = dict(source="fixture", title="t", summary="s", url="u",
+                published_at=published, extra={}, fetched_at=AS_OF)
+    live = _news_record("AAPL", include_fresh=True, **base)
+    replay = _news_record("AAPL", include_fresh=False, **base)
+    assert live["available_at"] != replay["available_at"]
+    assert live["content_hash"] == replay["content_hash"]

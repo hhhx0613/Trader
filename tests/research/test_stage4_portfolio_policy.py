@@ -1,8 +1,8 @@
 """阶段 4：每一项 Plan 约束必须进入求解、投影或成本门控。"""
 import pytest
-from core.portfolio import (AllocationConfig, CostLimits, CostModel, IntentConstraintBuilder, PortfolioPolicy,
+from core.decision import (AllocationConfig, CostLimits, CostModel, IntentConstraintBuilder, PortfolioPolicy,
                             RiskLimits, TradingInputs, VolatilityTarget)
-from core.research.contracts import IntentItem, PortfolioIntent
+from core.database.contracts import IntentItem, PortfolioIntent
 
 def intent():
     return PortfolioIntent(trace_id="committee",snapshot_id="snap",items=(

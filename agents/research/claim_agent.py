@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.research import ClaimCard, DataGateway, ReasonCode, ResearchLedger
-from core.research.contracts import RouteDecision
+from core.database import ClaimCard, DataGateway, ReasonCode, ResearchLedger
+from core.database.contracts import RouteDecision
 
 from .types import JsonModel, ResearchState
 from .prompting import load_prompt
@@ -49,28 +49,16 @@ class ClaimAgent:
         # 可引用集从注入批次起步；补查命中的卡片随后并入。
         ids = {item["evidence_id"] for item in evidence}
         try:
-            schema = (self.prompt + '\n\n' + f'Return a JSON object with key "claims": an array of 1 to {_MAX_CLAIMS_PER_AGENT} claim objects. '
-                      'Each claim object has keys statement (string), stance '
-                      '(bullish, bearish, or neutral), confidence (number 0..1), '
-                      'supporting_evidence_ids (non-empty array of only supplied evidence_id values), '
-                      'contradicting_evidence_ids (array of only supplied evidence_id values, may be empty), '
-                      'and unknowns (array of strings). Do not add keys to claim objects. '
-                      'Group related evidence into one claim; separate independent catalysts into separate claims. '
-                      'Judge primarily from the evidence already injected in this prompt; you may call the '
-                      'read-only search_evidence tool once or twice to re-check other cards of the same evidence '
-                      'kind frozen in this same snapshot. If even so no directional thesis is supported, '
-                      'return exactly {"route":"data_request","reason_code":"insufficient_evidence",'
-                      '"detail":"what frozen evidence is missing"} instead.')
             if hasattr(self.model, "chat_with_tools"):
                 tools = ResearchTools(gateway=self.gateway, state=state, node=self.name,
                                       allowed_tools=_RECHECK_TOOLS, max_calls=_RECHECK_BUDGET,
                                       allowed_kinds=allowed_kinds)
-                response = self.model.chat_with_tools(str(prompt), system_prompt=schema, tools=tools.tools,
+                response = self.model.chat_with_tools(str(prompt), system_prompt=self.prompt, tools=tools.tools,
                                                       tool_executor=tools.execute, max_tool_calls=_RECHECK_BUDGET,
                                                       temperature=0.0, max_tokens=6000)
                 ids |= tools.evidence_ids
             else:
-                response = self.model.chat_json(str(prompt), system_prompt=schema, temperature=0.0,
+                response = self.model.chat_json(str(prompt), system_prompt=self.prompt, temperature=0.0,
                                                 max_tokens=6000, max_retries=0)
             if not isinstance(response, dict):
                 return [], RouteDecision(node=self.name, route="abstain", reason_code=ReasonCode.SCHEMA_VIOLATION,

@@ -2,8 +2,8 @@
 
 from collections.abc import Mapping
 
-from core.research.contracts import IntentConstraints, PortfolioIntent, WeightConstraint
-from core.research.reasons import ReasonCode
+from core.database.contracts import IntentConstraints, PortfolioIntent, WeightConstraint
+from core.database.reasons import ReasonCode
 
 
 class IntentConstraintBuilder:

@@ -10,8 +10,8 @@ import json
 from agents.research import PerAssetResearchGraph
 from agents.research.event_agent import EventAgent
 from agents.research.market_agent import MarketAgent
-from core.research import DataGateway, ResearchLedger, SnapshotBuilder
-from core.research.raw import RawPayloadStore
+from core.database import DataGateway, ResearchLedger, SnapshotBuilder
+from core.database.raw import RawPayloadStore
 from agents.research.tools import ResearchTools
 
 
@@ -294,7 +294,7 @@ def test_reads_never_touch_the_network_even_for_uncovered_windows(tmp_path, monk
         called.append(args)
         raise AssertionError("gateway must not call collectors")
 
-    monkeypatch.setattr("core.data.news.fetch_news_records", fail_fetch)
+    monkeypatch.setattr("core.collect.news.fetch_news_records", fail_fetch)
     assert gateway.get_news_batch(snapshot_id=snapshot.snapshot_id, symbol="AAPL", as_of=AS_OF) == []
     assert gateway.search_evidence(snapshot_id=snapshot.snapshot_id, symbol="AAPL", as_of=AS_OF, query="anything") == []
     assert called == []

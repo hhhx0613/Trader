@@ -6,7 +6,9 @@
      只问已收口的日子——绝不再把提前问到段尾的未走完段整段封口。
      已问过的段永不重烧配额——空段也算"问过"，这正是文件名索引干不了的事
   2. 新段的每条新闻立即落 news.db（内容寻址正文），并返回规范化记录
-     （published_at = 发布时间；available_at = 本次网络接收时刻）
+     （published_at = 发布时间；available_at 随节奏切换，与 market 同名 include_fresh：
+      实盘 True 用本次网络接收时刻，回放 False 退化为发布时间——历史条目的真实
+      可得时刻无从得知，以发布时间近似，PIT 闸门与选卡窗口才框得住回填的新闻卡）
   3. 记录交给 SnapshotBuilder 建卡入 ledger.db；崩溃时宁可少记 coverage
      多烧一次配额（重复正文被哈希去重），绝不谎报已拉
 
@@ -23,8 +25,8 @@ import pandas as pd
 import requests
 
 from .. import config
-from ..research.providers import canonical_content_hash, record_from_payload
-from ..research.raw import RawPayloadStore
+from ..database.providers import canonical_content_hash, record_from_payload
+from ..database.raw import RawPayloadStore
 
 # 与旧基线共用网格定义（锚点/段长是数据布局常量，不是逻辑），保证
 # 存量导入写出的 coverage 窗口与这里询问的窗口可比对。
@@ -92,11 +94,16 @@ def _to_utc(value: pd.Timestamp) -> datetime:
 
 
 def _news_record(symbol: str, *, source: str, title: str, summary: str, url: str,
-                 published_at: datetime, fetched_at: datetime, extra: Dict[str, Any]) -> Dict[str, Any]:
+                 published_at: datetime, fetched_at: datetime, extra: Dict[str, Any],
+                 include_fresh: bool = False) -> Dict[str, Any]:
     """构造与 SnapshotBuilder.normalize_record 逐字节一致的记录。
 
     采集器写入正文用的就是这个 dict，builder 再 put 同一份规范化记录时
     序列化字节相同 -> 同哈希 -> INSERT OR IGNORE，正文全库只存一份。
+
+    available_at 随节奏切换（include_fresh 与 market 同名同义）：实盘 True 用本次
+    网络接收时刻，兑现"本轮拉到的本轮即可用"；回放 False 退化为发布时间——历史
+    条目的真实可得时刻无从得知，以发布时间近似，PIT 与 freeze 选卡窗口才框得住。
     """
     record = {
         "kind": "news",
@@ -106,7 +113,7 @@ def _news_record(symbol: str, *, source: str, title: str, summary: str, url: str
         "summary": summary,
         "url": url,
         "published_at": published_at,
-        "available_at": fetched_at,
+        "available_at": fetched_at if include_fresh else published_at,
         "provider_id": url or f"{source}:{published_at.isoformat()}:{title[:40]}",
         **extra,
     }
@@ -122,7 +129,8 @@ _SUBSTANTIVE_TOPICS = {"earnings", "company", "product", "regulation", "merger",
 
 
 def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
-                                 fetched_at: datetime) -> Optional[List[Dict[str, Any]]]:
+                                 fetched_at: datetime, *,
+                                 include_fresh: bool = False) -> Optional[List[Dict[str, Any]]]:
     """AV News & Sentiment；过滤低价值新闻后返回规范化记录，失败返回 None（不标记 coverage）。"""
     api_key = config.ALPHA_VANTAGE_API_KEY
     if not api_key:
@@ -169,6 +177,7 @@ def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
             published_at=_to_utc(published),
             fetched_at=fetched_at,
             extra={"sentiment_score": score, "topics": list(topics & _SUBSTANTIVE_TOPICS)},
+            include_fresh=include_fresh,
         ))
     dropped = len(feed) - kept
     if dropped:
@@ -177,7 +186,8 @@ def _fetch_segment_alpha_vantage(symbol: str, seg_start: str, seg_end: str,
 
 
 def _fetch_segment_finnhub(symbol: str, seg_start: str, seg_end: str,
-                           fetched_at: datetime) -> Optional[List[Dict[str, Any]]]:
+                           fetched_at: datetime, *,
+                           include_fresh: bool = False) -> Optional[List[Dict[str, Any]]]:
     """Finnhub company-news 兜底（免费 60 次/天，仅近 30 天）。"""
     api_key = os.getenv("FINNHUB_API_KEY")
     if not api_key:
@@ -208,13 +218,21 @@ def _fetch_segment_finnhub(symbol: str, seg_start: str, seg_end: str,
             published_at=_to_utc(pd.Timestamp(item["datetime"], unit="s")),
             fetched_at=fetched_at,
             extra={"sentiment_score": 0.0},
+            include_fresh=include_fresh,
         ))
     return records
 
 
 def fetch_news_records(symbol: str, start_date: str, end_date: str, *,
-                       store: Optional[RawPayloadStore] = None) -> List[Dict[str, Any]]:
-    """主线入口：返回窗口内的新闻记录（拉新段 + 从正文库重放已问段）。"""
+                       store: Optional[RawPayloadStore] = None,
+                       include_fresh: bool = False) -> List[Dict[str, Any]]:
+    """主线入口：返回窗口内的新闻记录（拉新段 + 从正文库重放已问段）。
+
+    ``include_fresh`` 与 market 同名：实盘节奏（as_of 未钉）置 True，新拉条目的
+    available_at 取本次接收时刻；回放/回测置 False，available_at 退化为发布时间，
+    使 PIT 校验与后续 freeze 选卡窗口能框住历史回填的新闻卡。已问段走库内重放，
+    available_at 沿用落库时的值（与首次拉取节奏一致），不在此改写正文哈希。
+    """
     store = store or _default_store()
     covered = set(store.covered("news", symbol))
     records: List[Dict[str, Any]] = []
@@ -233,10 +251,12 @@ def fetch_news_records(symbol: str, start_date: str, end_date: str, *,
             print(f"[News] 本次运行配额已用完，{seg_start}~{seg_end} 留待下次")
             continue
         fetched_at = datetime.now(timezone.utc)
-        segment_records = _fetch_segment_alpha_vantage(symbol, seg_start, seg_end, fetched_at)
+        segment_records = _fetch_segment_alpha_vantage(symbol, seg_start, seg_end, fetched_at,
+                                                       include_fresh=include_fresh)
         source = "alpha_vantage"
         if segment_records is None:
-            segment_records = _fetch_segment_finnhub(symbol, seg_start, seg_end, fetched_at)
+            segment_records = _fetch_segment_finnhub(symbol, seg_start, seg_end, fetched_at,
+                                                     include_fresh=include_fresh)
             source = "finnhub"
         api_calls += 1
         if segment_records is None:

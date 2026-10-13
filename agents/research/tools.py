@@ -16,7 +16,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from core.research import DataGateway
+from core.database import DataGateway
 
 from .types import ResearchState
 

@@ -18,8 +18,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.research.contracts import RawReference
-from core.research.raw import RawPayloadStore
+from core.database.contracts import RawReference
+from core.database.raw import RawPayloadStore
 
 # 账本里的对象表 → 前端展示分组名；顺序即前端分组顺序
 _TABLES = (

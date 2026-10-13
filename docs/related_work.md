@@ -31,7 +31,7 @@
 | 拒答 / 弃权路径 | ✅ 显式 `abstain`/`data_request`/`human_review` 路由 + 原因码 | ❌ 一定给方向 | ❌ 一定给方向 | N/A | N/A | N/A | ⚠️ | ✅ "查无此言"就说查无此言 |
 | 全链路回放 | ✅ `trace_id` 串接所有对象（Snapshot/Card/Intent/Order/Fill/Outcome） | ❌ 只保留最终报告 | ❌ | ❌ | ❌ | ❌ | ⚠️ 数据库有历史 | ❌ |
 | 执行环境 | T-1 决策 + T 日开盘模拟撮合；不接入实盘 | 无（决策报告） | 无 | 无 | 无 | 支持实盘（vnpy/easytrader） | 加密货币/美股/外汇实盘 | 无 |
-| 结果复盘 | ✅ `OutcomeGraph` + 反事实 `NoTrade` OutcomeCard | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ❌ |
+| 结果复盘 | ✅ `OutcomeReviewFlow` + 反事实 `NoTrade` OutcomeCard | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ❌ |
 | 开源协议 | 私有 | Apache-2.0 | MIT | AGPLv3（部分核心）| MIT | MIT | Apache-2.0 | MIT |
 | GitHub Stars（量级） | — | ~93k | ~62k | ~70k | ~30k+ | ~17k | ~10k | ~1k |
 

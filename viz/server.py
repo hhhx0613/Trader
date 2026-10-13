@@ -2,7 +2,7 @@
 """研究链路可视化调试台 / Local read-only HTTP + SSE front for the research flow.
 
 一个后端文件，三段职责：
-  1. 运行观测：把 `agents/research/flow.py` 的一次调用摊成前端事件——阶段产出取自
+  1. 运行观测：把 `agents/flow.py` 的一次调用摊成前端事件——阶段产出取自
      `RoundResult`，逐节点的注入输入/工具调用/JSON 输出取自套在 `LLMClient` 外的 TracingModel。
   2. 只读查询：账本与正文库一律走 `viz/readmodel.py`，不写任何生产存储。
   3. 传输：标准库 HTTP + SSE，只监听 127.0.0.1，前端为无构建的原生页面。
@@ -40,14 +40,14 @@ if str(_ROOT) not in sys.path:
 
 import config
 from agents.research.committee import Committee
-from agents.research.flow import FlowOptions, run_research_round
+from agents.flow import FlowOptions, run_research_round
 from agents.research.graph import PerAssetResearchGraph
-from core.data import filings as filings_collector
-from core.data import news as news_collector
-from core.data.market import INDICATORS_VERSION
-from core.research import DataGateway
-from core.research.raw import RawPayloadStore
-from core.research.store import ResearchLedger
+from core.collect import filings as filings_collector
+from core.collect import news as news_collector
+from core.collect.market import INDICATORS_VERSION
+from core.database import DataGateway
+from core.database.raw import RawPayloadStore
+from core.database.store import ResearchLedger
 from utils.llm_client import LLMClient
 from viz.readmodel import LedgerReader
 
@@ -151,7 +151,7 @@ def _detect_node(data: dict | None, *, fallback: str = "unknown") -> str:
             return str(data["agent"])
         if "portfolio" in data:
             return "risk_critic"
-        if "thesis_book" in data:
+        if "portfolio_state" in data:
             return "committee"
     return fallback
 
@@ -487,7 +487,7 @@ class RunObserver:
         """collect / decide 两个节奏都交给 flow：差别只在是否联网采集与用哪种冻结口径。"""
         run, opts = self.run, self.options
         collecting = opts.mode == "collect"
-        run.stage_start("collect", via_flow=True, handled_by="agents/research/flow.py",
+        run.stage_start("collect", via_flow=True, handled_by="agents/flow.py",
                         as_of=opts.as_of or ("实盘：采集完成后由 flow 定时点" if collecting
                                              else "决策：不联网，as_of 默认取当前 UTC"))
         for stage in ("ingest", "freeze", "research", "committee", "portfolio"):

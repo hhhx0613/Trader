@@ -5,8 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable, Protocol, TypedDict
 
-from core.research import ClaimCard, ResearchPacket
-from core.research.contracts import CriticVerdict, RouteDecision
+from core.database import ClaimCard, ResearchPacket
+from core.database.contracts import CriticVerdict, RouteDecision
 
 
 class JsonModel(Protocol):

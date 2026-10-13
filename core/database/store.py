@@ -22,6 +22,7 @@ from .contracts import (
     ClaimCard,
     EvidenceCard,
     Fill,
+    IntentItem,
     IntentConstraints,
     OrderPlan,
     PortfolioIntent,
@@ -30,6 +31,9 @@ from .contracts import (
     ResearchSnapshot,
     TargetPortfolio,
     ThesisBook,
+    OutcomeCard,
+    PositionEpisode,
+    ReviewLabel,
 )
 
 
@@ -37,7 +41,7 @@ OBJECT_TABLES = (
     # 表集合包含后续阶段对象；阶段 4-6 启动时只需补契约类与 typed 方法，不再改表结构。
     "traces", "snapshots", "evidence_cards", "claim_cards", "research_packets",
     "thesis_books", "portfolio_intents", "intent_constraints", "target_portfolios",
-    "risk_projected_portfolios", "order_plans", "deferred_trades", "fills",
+    "risk_projected_portfolios", "order_plans", "deferred_trades", "fills", "position_episodes",
     "outcome_cards", "review_labels",
 )
 
@@ -99,6 +103,11 @@ class ResearchLedger:
                 conn.execute("CREATE TABLE tool_calls (call_id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL REFERENCES traces(trace_id), snapshot_id TEXT NOT NULL, symbol TEXT NOT NULL, node TEXT NOT NULL, tool_name TEXT NOT NULL, arguments TEXT NOT NULL, requested_at TEXT NOT NULL, result_count INTEGER NOT NULL, evidence_ids TEXT NOT NULL)")
                 conn.execute("CREATE INDEX idx_tool_calls_trace_id ON tool_calls(trace_id)")
                 conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))")
+            if 6 not in applied:
+                conn.execute("CREATE TABLE IF NOT EXISTS position_episodes (object_id TEXT PRIMARY KEY, trace_id TEXT NOT NULL REFERENCES traces(trace_id), payload TEXT NOT NULL, created_at TEXT NOT NULL)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_position_episodes_trace_id ON position_episodes(trace_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_position_episodes_symbol ON position_episodes(json_extract(payload, '$.symbol'))")
+                conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))")
 
     @staticmethod
     def _dump(value: Any) -> str:
@@ -113,6 +122,13 @@ class ResearchLedger:
             cursor = conn.execute("UPDATE traces SET status='completed', completed_at=? WHERE trace_id=? AND status='running'", (completed_at.isoformat(), trace_id))
             if cursor.rowcount != 1:
                 raise ValueError(f"trace cannot be completed: {trace_id}")
+
+    def fail_trace(self, trace_id: str, completed_at: datetime) -> None:
+        """保留失败调度的审计锚点，避免异常后留下可继续写入的 running trace。"""
+        with self._connect() as conn:
+            cursor = conn.execute("UPDATE traces SET status='failed', completed_at=? WHERE trace_id=? AND status='running'", (completed_at.isoformat(), trace_id))
+            if cursor.rowcount != 1:
+                raise ValueError(f"trace cannot be failed: {trace_id}")
 
     def append_snapshot(self, snapshot: ResearchSnapshot) -> None:
         self._append("snapshots", snapshot.snapshot_id, snapshot.trace_id, snapshot.model_dump(mode="json"), snapshot.created_at)
@@ -145,6 +161,16 @@ class ResearchLedger:
 
     def get_intent(self, intent_id: str) -> PortfolioIntent:
         return PortfolioIntent.model_validate_json(self._get("portfolio_intents", intent_id)["payload"])
+
+    def get_intent_item(self, intent_item_id: str) -> IntentItem:
+        with self._connect() as conn:
+            rows = tuple(conn.execute("SELECT payload FROM portfolio_intents ORDER BY created_at DESC"))
+        for row in rows:
+            intent = PortfolioIntent.model_validate_json(row["payload"])
+            for item in intent.items:
+                if item.intent_item_id == intent_item_id:
+                    return item
+        raise KeyError(f"intent item not found: {intent_item_id}")
 
     def append_constraints(self, constraints: IntentConstraints) -> None:
         self._append("intent_constraints", constraints.intent_id, constraints.trace_id,
@@ -181,6 +207,205 @@ class ResearchLedger:
     def get_fill(self, fill_id: str) -> Fill:
         return Fill.model_validate_json(self._get("fills", fill_id)["payload"])
 
+    def list_fills_for_order_plan(self, order_plan_id: str) -> tuple[Fill, ...]:
+        return tuple(Fill.model_validate_json(row["payload"]) for row in self._find_payloads(
+            "fills", "$.order_plan_id", order_plan_id))
+
+    def append_position_episode(self, episode: PositionEpisode) -> None:
+        """追加 Episode 快照；同一 episode_id 的 revision 单调递增，旧快照永不覆盖。"""
+        object_id = f"{episode.episode_id}:{episode.revision}"
+        self._append("position_episodes", object_id, episode.trace_id,
+                     episode.model_dump(mode="json"), episode.created_at)
+
+    def get_position_episode(self, episode_id: str) -> PositionEpisode:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM position_episodes WHERE json_extract(payload, '$.episode_id') = ? "
+                "ORDER BY CAST(json_extract(payload, '$.revision') AS INTEGER) DESC LIMIT 1", (episode_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"position episode not found: {episode_id}")
+        return PositionEpisode.model_validate_json(row["payload"])
+
+    def list_active_position_episodes(self) -> tuple[PositionEpisode, ...]:
+        return tuple(episode for episode in self._latest_position_episodes() if episode.status == "active")
+
+    def find_active_position_episode(self, symbol: str) -> PositionEpisode | None:
+        symbol = symbol.upper()
+        matches = [episode for episode in self.list_active_position_episodes() if episode.symbol == symbol]
+        if len(matches) > 1:
+            raise ValueError(f"multiple active position episodes for {symbol}")
+        return matches[0] if matches else None
+
+    def list_verified_memory_episodes(self) -> tuple[PositionEpisode, ...]:
+        """只返回可物化为 Historical Episode Case 的聚合根。"""
+        episodes = []
+        for episode in self._latest_position_episodes():
+            if episode.status != "terminal" or not episode.outcome_card_id or not episode.review_label_id:
+                continue
+            label = self.get_review_label(episode.review_label_id)
+            if label.status == "complete" and label.memory_eligibility == "eligible":
+                episodes.append(episode)
+        return tuple(episodes)
+
+    def select_verified_memory_episodes(self, *, symbols: tuple[str, ...], regime: str | None,
+                                        as_of: datetime, query_profiles: dict[str, dict[str, Any]],
+                                        limit_per_symbol: int = 4) -> tuple[dict[str, tuple[PositionEpisode, ...]], dict[str, list[dict[str, Any]]]]:
+        """确定性近邻排序；返回审计明细，避免把“检索到什么”藏在 prompt 外。"""
+        if limit_per_symbol < 1:
+            raise ValueError("episode selection limit must be positive")
+        # 决策时点之后才完成的 Outcome/Review 属于未来信息，绝不能进入本轮 prompt。
+        verified = self.list_verified_memory_episodes()
+        candidates = tuple(
+            episode for episode in verified
+            if (outcome := self.get_outcome_card(episode.outcome_card_id or "")).observed_at < as_of
+            and (label := self.get_review_label(episode.review_label_id or "")).created_at < as_of
+        )
+        result: dict[str, tuple[PositionEpisode, ...]] = {}
+        audit: dict[str, list[dict[str, Any]]] = {}
+        for symbol in symbols:
+            profile = query_profiles.get(symbol, {})
+            rows: list[tuple[PositionEpisode, dict[str, int]]] = []
+            details = [{"episode_id": episode.episode_id, "score": {}, "total_score": None,
+                        "selected": False, "exclusion_reason": "completed_after_decision_as_of"}
+                       for episode in verified if episode not in candidates]
+            for episode in candidates:
+                plans = [self.get_order_plan(plan_id) for plan_id in episode.order_plan_ids]
+                orders = [order for plan in plans for order in plan.orders if order.symbol == episode.symbol]
+                if orders and all(order.forced for order in orders):
+                    details.append({"episode_id": episode.episode_id, "score": {}, "total_score": None,
+                                    "selected": False, "exclusion_reason": "hard_risk_only_episode"})
+                    continue
+                outcome = self.get_outcome_card(episode.outcome_card_id or "")
+                intents = [self.get_intent_item(item_id) for item_id in episode.intent_item_ids]
+                claim_ids = {claim_id for intent in intents for claim_id in (*intent.supporting_card_ids, *intent.opposing_card_ids)}
+                claims = [self.get_claim(claim_id) for claim_id in claim_ids]
+                historical_agents = {claim.agent for claim in claims}
+                historical_stances = {claim.stance for claim in claims}
+                score = {
+                    "same_symbol": 8 * int(episode.symbol == symbol),
+                    "same_regime": 4 * int(outcome.market_regime == regime),
+                    "source_overlap": 2 * len(set(profile.get("agents", ())) & historical_agents),
+                    "stance_overlap": 2 * len(set(profile.get("stances", ())) & historical_stances),
+                    "same_holding_state": 3 * int(bool(profile.get("held")) == any(item.action in {"hold", "reduce", "exit"} for item in intents)),
+                }
+                rows.append((episode, score))
+            rows.sort(key=lambda row: (sum(row[1].values()), row[0].created_at, row[0].episode_id), reverse=True)
+            selected, source_counts = [], {}
+            for episode, score in rows:
+                exclusion = None
+                if source_counts.get(episode.symbol, 0) >= 2:
+                    exclusion = "source_symbol_diversity_cap"
+                elif len(selected) >= limit_per_symbol:
+                    exclusion = "top_k_limit"
+                else:
+                    selected.append(episode)
+                    source_counts[episode.symbol] = source_counts.get(episode.symbol, 0) + 1
+                details.append({"episode_id": episode.episode_id, "score": score,
+                                "total_score": sum(score.values()), "selected": exclusion is None,
+                                "exclusion_reason": exclusion})
+            result[symbol] = tuple(selected)
+            audit[symbol] = details
+        return result, audit
+
+    def materialize_review_context(self, episode: PositionEpisode) -> dict[str, Any]:
+        """入 prompt 前沿 ID 物化 review 素材：决策与执行；结果由调用方单独传入。
+
+        Plan.md 3.2.4：Review 通过 Episode 读取关联的 IntentItem、OrderPlan 与 Fill。研究
+        证据不进入 Outcome 复盘 prompt；物化只发生在调用侧，账本不保存摘要副本。
+        """
+        intents = [self.get_intent_item(item_id) for item_id in episode.intent_item_ids]
+        plans = [self.get_order_plan(plan_id) for plan_id in episode.order_plan_ids]
+        fills = [self.get_fill(fill_id) for fill_id in episode.fill_ids]
+        return {
+            "original_decisions": [{"action": item.action, "strength": item.strength,
+                                    "horizon_days": item.horizon_days, "horizon_action": item.horizon_action,
+                                    "rationale": item.rationale} for item in intents],
+            "execution": {
+                "orders": [{"side": order.side, "target_weight": order.target_weight, "forced": order.forced,
+                            "reason_codes": [code.value for code in order.reason_codes]}
+                           for plan in plans for order in plan.orders],
+                "fills": [{"fill_id": fill.fill_id, "side": fill.side, "status": fill.status,
+                           "filled_shares": fill.filled_shares, "executed_price": fill.executed_price,
+                           "commission": fill.commission, "reason_codes": [code.value for code in fill.reason_codes],
+                           "executed_at": fill.executed_at.isoformat()} for fill in fills],
+            },
+        }
+
+    def _latest_position_episodes(self) -> tuple[PositionEpisode, ...]:
+        with self._connect() as conn:
+            rows = tuple(conn.execute("SELECT payload FROM position_episodes ORDER BY created_at, object_id"))
+        latest: dict[str, PositionEpisode] = {}
+        for row in rows:
+            episode = PositionEpisode.model_validate_json(row["payload"])
+            if episode.episode_id not in latest or episode.revision > latest[episode.episode_id].revision:
+                latest[episode.episode_id] = episode
+        return tuple(latest.values())
+
+    def append_outcome_card(self, outcome: OutcomeCard) -> None:
+        self._append("outcome_cards", outcome.outcome_card_id, outcome.trace_id,
+                     outcome.model_dump(mode="json"), outcome.created_at)
+
+    def get_outcome_card(self, outcome_card_id: str) -> OutcomeCard:
+        return OutcomeCard.model_validate_json(self._get("outcome_cards", outcome_card_id)["payload"])
+
+    def list_outcomes_for_order_plan(self, order_plan_id: str) -> tuple[OutcomeCard, ...]:
+        outcomes = []
+        for episode in self._latest_position_episodes():
+            if order_plan_id in episode.order_plan_ids and episode.outcome_card_id:
+                outcomes.append(self.get_outcome_card(episode.outcome_card_id))
+        return tuple(outcomes)
+
+    def get_outcome_for_episode(self, episode_id: str) -> OutcomeCard | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM outcome_cards WHERE json_extract(payload, '$.episode_id') = ? "
+                "ORDER BY created_at DESC LIMIT 1", (episode_id,)
+            ).fetchone()
+        return OutcomeCard.model_validate_json(row["payload"]) if row else None
+
+    def append_review_label(self, label: ReviewLabel) -> None:
+        self._append("review_labels", label.review_label_id, label.trace_id,
+                     label.model_dump(mode="json"), label.created_at)
+
+    def get_review_label(self, review_label_id: str) -> ReviewLabel:
+        return ReviewLabel.model_validate_json(self._get("review_labels", review_label_id)["payload"])
+
+    def get_verified_review_label(self, outcome_card_id: str) -> ReviewLabel | None:
+        """只有完整且通过经验准入的反思可随历史案例进入下一轮 Committee。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM review_labels WHERE json_extract(payload, '$.outcome_card_id') = ? "
+                "AND json_extract(payload, '$.status') = 'complete' "
+                "AND json_extract(payload, '$.memory_eligibility') = 'eligible' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (outcome_card_id,),
+            ).fetchone()
+            return ReviewLabel.model_validate_json(row["payload"]) if row else None
+
+    def list_verified_memory_outcomes(self, *, limit: int = 8) -> tuple[OutcomeCard, ...]:
+        """仅返回已通过经验准入的客观结果，供上游按相关性再筛选。"""
+        if limit < 1:
+            raise ValueError("memory outcome limit must be positive")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT o.payload FROM outcome_cards o JOIN review_labels r "
+                "ON json_extract(r.payload, '$.outcome_card_id') = o.object_id "
+                "WHERE json_extract(r.payload, '$.status') = 'complete' "
+                "AND json_extract(r.payload, '$.memory_eligibility') = 'eligible' "
+                "ORDER BY o.created_at DESC LIMIT ?", (limit,),
+            )
+            return tuple(OutcomeCard.model_validate_json(row["payload"]) for row in rows)
+
+    def select_verified_memory_outcomes(self, *, symbols: tuple[str, ...], regime: str | None,
+                                        limit: int = 4) -> tuple[OutcomeCard, ...]:
+        """先以标的和同一冻结 regime 缩小案例池；不匹配时宁可返回空而非泛化记忆。"""
+        if not symbols or limit < 1:
+            raise ValueError("memory selection requires symbols and a positive limit")
+        selected = [outcome for outcome in self.list_verified_memory_outcomes(limit=64)
+                    if outcome.symbol in set(symbols) and outcome.market_regime == regime]
+        return tuple(selected[:limit])
+
     def _append(self, table: str, object_id: str, trace_id: str, payload: dict[str, Any], created_at: datetime) -> None:
         if table not in OBJECT_TABLES[1:]:
             raise ValueError(f"unsupported ledger table: {table}")
@@ -189,6 +414,15 @@ class ResearchLedger:
             if trace is None or trace["status"] != "running":
                 raise ValueError(f"trace is not writable: {trace_id}")
             conn.execute(f"INSERT INTO {table}(object_id, trace_id, payload, created_at) VALUES (?, ?, ?, ?)", (object_id, trace_id, self._dump(payload), created_at.isoformat()))
+
+    def _find_payloads(self, table: str, json_path: str, value: str) -> tuple[sqlite3.Row, ...]:
+        if table not in OBJECT_TABLES[1:]:
+            raise ValueError(f"unsupported ledger table: {table}")
+        with self._connect() as conn:
+            return tuple(conn.execute(
+                f"SELECT payload FROM {table} WHERE json_extract(payload, ?) = ? ORDER BY created_at, object_id",
+                (json_path, value),
+            ))
 
     def get_snapshot(self, snapshot_id: str) -> ResearchSnapshot:
         row = self._get("snapshots", snapshot_id)

@@ -16,12 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import agents.research.flow as flow
-from agents.research.flow import FlowOptions, run_research_round
-from core.research import ResearchLedger
-from core.research.raw import RawPayloadStore
-from core.research.snapshot import SnapshotBuilder
-from core.portfolio import AllocationConfig, CostLimits, CostModel, IntentConstraintBuilder, PortfolioPolicy, RiskLimits, TradingInputs, VolatilityTarget
+import agents.flow as flow
+from agents.flow import FlowOptions, run_research_round
+from core.database import ResearchLedger
+from core.database.raw import RawPayloadStore
+from core.database.snapshot import SnapshotBuilder
+from core.decision import AllocationConfig, CostLimits, CostModel, IntentConstraintBuilder, PortfolioPolicy, RiskLimits, TradingInputs, VolatilityTarget
 
 AS_OF = datetime(2026, 10, 5, 20, tzinfo=timezone.utc)
 
@@ -77,7 +77,7 @@ class FlowModel:
                             "supporting_evidence_ids": [hits[0]["evidence_id"]]}]}
 
     def chat_json(self, message, **_kwargs):
-        if "'thesis_book'" in message:
+        if "'portfolio_state'" in message:
             cited = _CLAIM_ID.findall(message)
             return {"items": [{"symbol": "AAPL", "action": "long", "strength": 2, "priority": 1,
                                "horizon_days": 20, "supporting_card_ids": cited[:1],
@@ -94,7 +94,7 @@ def stores(tmp_path):
 def _stub_collectors(monkeypatch, records):
     """把 flow 的四个采集触点换成 fixture 记录；口径字段保留，source_versions 仍要读。"""
     monkeypatch.setattr(flow, "news_collector", SimpleNamespace(
-        NEWS_VERSION="news-v1", fetch_news_records=lambda symbol, start, end, *, store=None:
+        NEWS_VERSION="news-v1", fetch_news_records=lambda symbol, start, end, *, store=None, include_fresh=False:
         [item for item in records if item["kind"] == "news" and item["symbol"] == symbol]))
     monkeypatch.setattr(flow, "filings_collector", SimpleNamespace(
         FILINGS_VERSION="filings-v1", fetch_filings_records=lambda symbol, start, end:

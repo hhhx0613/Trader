@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from math import floor
 
-from core.research.contracts import Fill, OrderPlan, PlannedOrder
-from core.research.reasons import ReasonCode
+from core.database.contracts import Fill, OrderPlan, PlannedOrder
+from core.database.reasons import ReasonCode
 
 
 @dataclass

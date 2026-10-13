@@ -23,6 +23,9 @@ from .reasons import ReasonCode
 
 SCHEMA_VERSION = "1.0"
 
+# Review 的“复盘可用”与“经验可迁移”是两个不同判断；后者绝不能由收益方向代替。
+MemoryEligibility = Literal["eligible", "reject"]
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -195,19 +198,31 @@ class ThesisBook(Contract):
     portfolio_state: dict[str, Any]
     regime: str | None = None
     deltas: dict[str, Any] = Field(default_factory=dict)
-    memory_case_ids: tuple[str, ...] = ()
+    # 仅保存本轮检索到的 Episode 审计锚点；可读摘要只在 Committee prompt 内临时物化。
+    historical_episode_ids_by_symbol: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
 
 class IntentItem(ValueObject):
+    intent_item_id: str = Field(default_factory=lambda: f"ii_{uuid4().hex}")
     symbol: str = Field(min_length=1)
     action: IntentAction
     strength: int = Field(ge=1, le=3)
     priority: int = Field(ge=1)
     horizon_days: int | None = Field(default=None, ge=1)
+    horizon_action: Literal["start", "retain", "shorten", "none"] = "none"
     supporting_card_ids: tuple[str, ...] = ()
     opposing_card_ids: tuple[str, ...] = ()
+    # 历史校准引用必须与本轮事实 ClaimCard 引用分离。
+    calibration_episode_ids: tuple[str, ...] = ()
     rationale: str = Field(min_length=1)
     no_trade_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_horizon_action(self) -> "IntentItem":
+        # 只有创建或缩短观察期会改变 Episode 的到期日；保留不应悄悄重置计时器。
+        if self.horizon_action in {"start", "shorten"} and self.horizon_days not in {5, 20, 60}:
+            raise ValueError("start or shorten horizon action requires 5, 20, or 60 trading days")
+        return self
 
 
 class PortfolioIntent(Contract):
@@ -371,4 +386,96 @@ class Fill(Contract):
             raise ValueError("deferred status must not carry an execution")
         if self.status != "filled" and not self.reason_codes:
             raise ValueError("non-filled status requires a reason code")
+        return self
+
+
+class PositionEpisode(Contract):
+    """一个可检索持仓案例的聚合根；只保存关联 ID，不复制底层事实。"""
+
+    episode_id: str = Field(default_factory=lambda: f"ep_{uuid4().hex}")
+    revision: int = Field(default=1, ge=1)
+    symbol: str = Field(min_length=1)
+    source_trace_id: str = Field(min_length=1)
+    status: Literal["active", "terminal"]
+    anchor_at: datetime
+    current_due_at: datetime
+    original_horizon_days: Literal[5, 20, 60]
+    # carry-in 将到期后仍存在的冻结头寸作为新 thesis 的基准，而非伪造买入 Fill。
+    is_carry_in: bool = False
+    opening_shares: int = Field(default=0, ge=0)
+    opening_price: float | None = Field(default=None, gt=0.0)
+    intent_item_ids: tuple[str, ...] = ()
+    order_plan_ids: tuple[str, ...] = ()
+    fill_ids: tuple[str, ...] = ()
+    outcome_card_id: str | None = None
+    review_label_id: str | None = None
+    terminal_reason: Literal["horizon", "early_exit", "thesis_invalidated"] | None = None
+
+    @model_validator(mode="after")
+    def validate_episode_state(self) -> "PositionEpisode":
+        if self.current_due_at < self.anchor_at:
+            raise ValueError("episode due time cannot precede its anchor")
+        if self.status == "active":
+            if self.outcome_card_id or self.review_label_id or self.terminal_reason:
+                raise ValueError("active episode cannot carry terminal links")
+        elif not self.outcome_card_id or not self.terminal_reason:
+            raise ValueError("terminal episode requires outcome and terminal reason")
+        if self.is_carry_in and (self.opening_shares <= 0 or self.opening_price is None):
+            raise ValueError("carry-in episode requires frozen opening shares and price")
+        return self
+
+
+class OutcomeCard(Contract):
+    """一个终结 PositionEpisode 的、不可修改的客观结果。"""
+
+    outcome_card_id: str = Field(default_factory=lambda: f"outcome_{uuid4().hex}")
+    source_trace_id: str = Field(min_length=1)
+    episode_id: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    observation: Literal["horizon", "early_exit", "thesis_invalidated"]
+    observed_at: datetime
+    fill_ids: tuple[str, ...] = ()
+    anchor_at: datetime
+    entry_price: float = Field(gt=0.0)
+    mark_price: float = Field(gt=0.0)
+    filled_shares: int = Field(ge=0)
+    is_carry_in: bool = False
+    gross_return: float
+    net_return: float
+    # v1 新开仓以“不建仓”作冻结替代方案；carry-in 进入后才允许 maintain。
+    counterfactual_kind: Literal["no_trade", "maintain"] = "no_trade"
+    counterfactual_return: float = 0.0
+    active_return: float = 0.0
+    holding_trading_days: int = Field(default=0, ge=0)
+    max_drawdown: float = Field(le=0.0)
+    commission: float = Field(ge=0.0)
+    reason_codes: tuple[ReasonCode, ...] = ()
+    market_regime: str | None = None
+    trigger_evidence_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_outcome_basis(self) -> "OutcomeCard":
+        if self.observed_at < self.anchor_at:
+            raise ValueError("outcome observation cannot precede its anchor")
+        if not self.fill_ids and not self.is_carry_in:
+            raise ValueError("actual outcome requires actual fills unless it is a carry-in episode")
+        return self
+
+
+class ReviewLabel(Contract):
+    """Review Agent 对已完成客观结果的解释，不能替代 OutcomeCard。"""
+
+    review_label_id: str = Field(default_factory=lambda: f"review_{uuid4().hex}")
+    outcome_card_id: str = Field(min_length=1)
+    status: Literal["complete", "abstain"]
+    prompt_version: str | None = Field(default=None, min_length=1)
+    rationale: str = Field(min_length=1)
+    reason_codes: tuple[ReasonCode, ...] = ()
+    # 默认拒绝使旧记录、模型故障或未升级的调用方都不能静默进入经验记忆。
+    memory_eligibility: MemoryEligibility = "reject"
+
+    @model_validator(mode="after")
+    def validate_memory_eligibility(self) -> "ReviewLabel":
+        if self.status == "abstain" and self.memory_eligibility != "reject":
+            raise ValueError("abstaining review cannot be memory eligible")
         return self

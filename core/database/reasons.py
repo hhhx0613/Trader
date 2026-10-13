@@ -53,6 +53,11 @@ class ReasonCode(str, Enum):
     DEFERRED_COST = "deferred_cost"
     DEFERRED_LIQUIDITY = "deferred_liquidity"
 
+    # OutcomeReviewFlow / 未到期或事实链不完整时不得伪造结果
+    OUTCOME_NOT_DUE = "outcome_not_due"
+    OUTCOME_DATA_MISSING = "outcome_data_missing"
+    REVIEW_INCOMPLETE = "review_incomplete"
+
     def __str__(self) -> str:
         # f-string、日志与异常信息必须得到 "future_data" 而非 "ReasonCode.FUTURE_DATA"。
         return self.value

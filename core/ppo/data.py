@@ -87,7 +87,7 @@ def build_llm_provider(
     compute_llm_features 返回中性（conf/score=0, age=最陈旧），禁止乐观兜底。
     """
     import sqlite3
-    from core.data.llm_cache_db import get_cache_db
+    from utils.llm_cache_db import get_cache_db
     from agents.llm_analyst import load_prompts   # 延迟导入：避免 data 模块加载即拉起 LLM 依赖
 
     if model is None:
