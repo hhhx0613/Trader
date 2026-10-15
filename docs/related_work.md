@@ -70,7 +70,7 @@
 
 **可借鉴之处**：
 - **风格 personas 作为消融对照组**：可以在本项目契约不变的前提下，把 Committee 的 prompt 换成"Buffett 视角下的 ThesisBook 阅读"，作为**风格 vs. 证据**的 ablation arm，用来量化"人设多样性"是否比"证据维度分工"贡献更多 Rank IC。
-- **CLI + Web 双入口**：本项目当前 `scripts/research_run.py` 只有 CLI + [viz/](file:///d:/Codes/Trader/viz/server.py) 观测台，可以借鉴 ai-hedge-fund 把 `--selected-analysts` 类参数暴露给前端做逐 Agent 开关。
+- **CLI + Web 双入口**：本项目当前 `scripts/backtest.py` 只有 CLI + [viz/](file:///d:/Codes/Trader/viz/server.py) 观测台，可以借鉴 ai-hedge-fund 把 `--selected-analysts` 类参数暴露给前端做逐 Agent 开关。
 
 ### 2.3 OpenBB（OpenBB-finance）
 
@@ -206,7 +206,7 @@ TradingAgents / AI Hedge Fund 若 LLM 输出非法字段，通常整次调用失
 |---|---|---|---|
 | 六维评分卡作为 `ResearchPacket` 摘要视图 | zhengxi-views | [viz/readmodel.py](file:///d:/Codes/Trader/viz/readmodel.py) | Packet 目前字段较扁平，摘要视图能提升 Committee prompt 与人工 review 效率 |
 | Bull/Bear 对抗式 red-team 生成 `contradicting_evidence_ids` | TradingAgents | [agents/research/](file:///d:/Codes/Trader/agents/research/) 新增 red-team hook（不新增 Agent 文件） | 现有 schema 已预留字段但基本为空，加入对抗式补证 |
-| 多通道推送（邮件 / 飞书 webhook） | Qbot | [scripts/research_run.py](file:///d:/Codes/Trader/scripts/research_run.py) 决策完成后钩子 | 目前只落 logs，缺实时通知 |
+| 多通道推送（邮件 / 飞书 webhook） | Qbot | [scripts/backtest.py](file:///d:/Codes/Trader/scripts/backtest.py) 决策完成后钩子 | 目前只落 logs，缺实时通知 |
 | MCP Server 化 Gateway 只读接口 | QuantDinger | [viz/server.py](file:///d:/Codes/Trader/viz/server.py) 增加 MCP 端点 | 让外部 Agent（Claude Desktop / Cursor）能只读消费本项目证据 |
 
 ### 低优先（锦上添花或需先明确收益）

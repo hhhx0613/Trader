@@ -161,18 +161,23 @@ button.tiny { padding: 3px 7px; }
 
 /* ---------- 事件流 ---------- */
 
-.event {
+/* 行基类叫 evt：event 让给节点 badge，否则 .badge.event 会被行盒样式污染 */
+.evt {
   border: 1px solid var(--line-soft); border-left: 3px solid var(--line);
   border-radius: 6px; background: var(--bg-card); padding: 6px 9px; margin-bottom: 5px;
 }
-.event.node_input { border-left-color: var(--accent); }
-.event.node_output { border-left-color: var(--ok); }
-.event.tool_call { border-left-color: var(--purple); }
-.event.log { border-left-color: var(--line); }
-.event.log.error { border-left-color: var(--err); }
-.event.log.warn { border-left-color: var(--warn); }
-.event.object { border-left-color: var(--cyan); }
-.event.stage_start, .event.stage_done, .event.stage_skip { background: var(--bg-soft); border-left-color: var(--fg-mute); }
+.evt.node_input { border-left-color: var(--accent); }
+.evt.node_output { border-left-color: var(--ok); }
+.evt.tool_call { border-left-color: var(--purple); }
+.evt.log { border-left-color: var(--line); }
+.evt.log.error { border-left-color: var(--err); }
+.evt.log.warn { border-left-color: var(--warn); }
+.evt.object { border-left-color: var(--cyan); }
+.evt.stage_start, .evt.stage_done, .evt.stage_skip { background: var(--bg-soft); border-left-color: var(--fg-mute); }
+/* 整行可点击展开详情：caret 指示状态，详情内的可交互元素自行处理点击 */
+.evt.expandable { cursor: pointer; }
+.evt.expandable:hover { background: var(--bg-soft); }
+.evt .caret { width: 10px; color: var(--fg-mute); font-size: 10px; }
 .event-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .event-head .t { color: var(--fg-mute); font-family: var(--mono); font-size: 10.5px; }
 .event-head .txt { flex: 1; min-width: 200px; }
@@ -186,28 +191,10 @@ pre.json {
   white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; color: var(--fg);
 }
 
-/* ---------- Agent 节点 ---------- */
+/* ---------- 节点详情区（事件流展开后的注入/工具/输出分段） ---------- */
 
-.symbol-block { margin-bottom: 14px; }
-.symbol-block > h3 {
-  font-size: 12px; color: var(--fg-dim); margin-bottom: 7px; padding-bottom: 4px;
-  border-bottom: 1px solid var(--line);
-}
-.node-card { border: 1px solid var(--line); border-radius: 8px; background: var(--bg-card); margin-bottom: 8px; }
-/* 静默弃权节点：没有模型调用，只占位说明流水线没缺段 */
-.node-card.silent { background: transparent; border-style: dashed; }
-.node-card.silent .node-head { cursor: default; opacity: .75; }
-.node-head { display: flex; gap: 8px; align-items: center; padding: 7px 10px; cursor: pointer; flex-wrap: wrap; }
-.node-head:hover { background: var(--bg-hover); }
-.node-head .title { font-weight: 600; font-size: 12px; }
-.node-head .spacer { flex: 1; }
 .node-section { padding: 8px 10px; border-top: 1px solid var(--line-soft); }
 .node-section h4 { margin: 0 0 4px; font-size: 11px; letter-spacing: .02em; color: var(--fg-mute); }
-.tool-line {
-  display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px dashed var(--line-soft);
-  font-size: 11.5px;
-}
-.tool-line .nm { font-family: var(--mono); color: var(--purple); }
 .claim-line { padding: 3px 0; font-size: 11.5px; }
 .claim-line .st { text-transform: uppercase; font-size: 10px; color: var(--fg-mute); }
 
@@ -224,6 +211,8 @@ table.obj tr:hover td { background: var(--bg-hover); }
   border-bottom: 1px dotted var(--cyan); white-space: nowrap;
 }
 .id-chip:hover { color: #0550ae; }
+/* chip 里的一句话摘要：非等宽、弱化色，与短 ID 区分；正文仍靠 title 与抽屉看全 */
+.id-chip .id-note { font-family: inherit; color: var(--fg-dim); font-weight: 400; }
 .clip { color: var(--fg-dim); max-width: 640px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ---------- 抽屉 ---------- */

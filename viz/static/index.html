@@ -44,6 +44,15 @@
         <select id="snapshotSelect"></select>
         <button id="btnRefreshSnapshots" class="ghost tiny" title="重新读取账本">↻</button>
       </div>
+      <div id="replayPick" class="stack hidden">
+        <div class="row">
+          <label>回放起始（周五）<input id="replayStart" type="text" placeholder="YYYYMMDD，如 20260501"></label>
+          <label>回放结束（可空）<input id="replayEnd" type="text" placeholder="留空 = 起始+110 天"></label>
+        </div>
+        <label class="check"><input id="forceReplay" type="checkbox" checked><span>force：预置 seed episode + 委员会强制开仓/引用（AcceptanceHarness，仅结构性回放，非模型判断；仅 full 生效）</span></label>
+        <label>复盘 OrderPlan ID（可空）<input id="orderPlanId" type="text" placeholder="review：先对该 OrderPlan 做 T+1 execute 成交，再扫描到期 Episode"></label>
+        <p class="hint">full 从本地缓存 CSV 逐交易日推进（需先有该标的地 cache，缺档先跑「跑全程」）；force 默认开</p>
+      </div>
     </section>
 
     <section>
@@ -97,7 +106,6 @@
 
     <nav class="tabs">
       <button class="tab active" data-tab="stream">事件流</button>
-      <button class="tab" data-tab="nodes">Agent 节点</button>
       <button class="tab" data-tab="objects">产出对象</button>
       <button class="tab" data-tab="replay">账本回放</button>
       <div class="tab-tools">
@@ -108,7 +116,6 @@
 
     <div class="tab-body">
       <div id="tab-stream" class="tab-pane active"></div>
-      <div id="tab-nodes" class="tab-pane"></div>
       <div id="tab-objects" class="tab-pane"></div>
       <div id="tab-replay" class="tab-pane">
         <div class="row inline">

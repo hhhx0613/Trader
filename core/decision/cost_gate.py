@@ -1,6 +1,7 @@
 """订单级成本/流动性门控，强制退出仅能拆分或排队。"""
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
+from datetime import datetime
 from math import sqrt
 
 from core.database.contracts import DeferredTrade, OrderPlan, PlannedOrder, RiskProjectedPortfolio
@@ -69,6 +70,7 @@ class CostGate:
         limits: CostLimits,
         model: CostModel,
         forced_exits: Set[str] = frozenset(),
+        created_at: datetime | None = None,
     ) -> OrderPlan:
         # targets：投影后的目标权重；remaining_turnover/cash 是逐单递减的两本账
         targets = {x.symbol: x.weight for x in projected.weights}
@@ -185,10 +187,13 @@ class CostGate:
                     reason_code=ReasonCode.DEFERRED_LIQUIDITY,
                 ))
 
-        return OrderPlan(
-            trace_id=projected.trace_id,
-            projected_portfolio_id=projected.projected_portfolio_id,
-            snapshot_id=projected.snapshot_id,
-            orders=tuple(orders),
-            deferred_trades=tuple(deferred),
-        )
+        payload = {
+            "trace_id": projected.trace_id, 
+            "projected_portfolio_id": projected.projected_portfolio_id,
+            "snapshot_id": projected.snapshot_id, 
+            "orders": tuple(orders), 
+            "deferred_trades": tuple(deferred),
+        }
+        if created_at is not None:
+            payload["created_at"] = created_at
+        return OrderPlan(**payload)

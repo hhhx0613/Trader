@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from math import sqrt
 
 import cvxpy as cp
@@ -136,6 +137,7 @@ class VolatilityTarget:
         current_exposure: float,
         trace_id: str,
         policy_version: str,
+        created_at: datetime | None = None,
     ) -> TargetPortfolio:
         # 组合方差 = w^TΣw（满仓形状、每单位仓位的波动平方，与总仓无关）。
         symbols = tuple(sorted(relative_weights))
@@ -153,15 +155,18 @@ class VolatilityTarget:
             PortfolioWeight(symbol=s, weight=float(relative_weights[s] * exposure))
             for s in symbols
         )
-        return TargetPortfolio(
-            trace_id=trace_id,
-            intent_id=intent.intent_id,
-            snapshot_id=intent.snapshot_id,
-            policy_version=policy_version,
-            weights=weights,
-            total_exposure=sum(x.weight for x in weights),
-            cash_weight=1.0 - sum(x.weight for x in weights),
-        )
+        payload = {
+            "trace_id": trace_id,
+            "intent_id": intent.intent_id,
+            "snapshot_id": intent.snapshot_id,
+            "policy_version": policy_version,
+            "weights": weights,
+            "total_exposure": sum(x.weight for x in weights),
+            "cash_weight": 1.0 - sum(x.weight for x in weights),
+        }
+        if created_at is not None:
+            payload["created_at"] = created_at
+        return TargetPortfolio(**payload)
 
     def hold_target(
         self,
@@ -170,6 +175,7 @@ class VolatilityTarget:
         *,
         trace_id: str,
         policy_version: str,
+        created_at: datetime | None = None,
     ) -> TargetPortfolio:
         """把「边界内保持不动」的绝对权重直接落为 TargetPortfolio，绕开波动率再缩放。
 
@@ -182,12 +188,15 @@ class VolatilityTarget:
             for s, w in sorted(weights.items()) if w > 0.0
         )
         exposure = sum(x.weight for x in items)
-        return TargetPortfolio(
-            trace_id=trace_id,
-            intent_id=intent.intent_id,
-            snapshot_id=intent.snapshot_id,
-            policy_version=policy_version,
-            weights=items,
-            total_exposure=exposure,
-            cash_weight=1.0 - exposure,
-        )
+        payload = {
+            "trace_id": trace_id,
+            "intent_id": intent.intent_id,
+            "snapshot_id": intent.snapshot_id,
+            "policy_version": policy_version,
+            "weights": items,
+            "total_exposure": exposure,
+            "cash_weight": 1.0 - exposure,
+        }
+        if created_at is not None:
+            payload["created_at"] = created_at
+        return TargetPortfolio(**payload)

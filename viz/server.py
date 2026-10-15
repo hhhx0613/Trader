@@ -7,9 +7,11 @@
   2. 只读查询：账本与正文库一律走 `viz/readmodel.py`，不写任何生产存储。
   3. 传输：标准库 HTTP + SSE，只监听 127.0.0.1，前端为无构建的原生页面。
 
-这里不实现任何研究逻辑，也不复制阶段门控：「跑全程」就是调 `run_research_round`，与命令行
-`scripts/research_run.py`、外部定时调度器用的是同一个函数。唯一保留的直接调用是 flow 没有的
-节奏——复用已冻结 Snapshot 只重跑研究图/委员会，用于不重烧采集配额地反复调试研究节点。
+这里不实现任何研究逻辑，也不复制阶段门控：`collect`/`decide`/`evidence` 就是调 `run_research_round`，
+与命令行 `scripts/backtest.py`、外部定时调度器用的是同一个函数；`full` 闭环回放复用
+`scripts/backtest.py` 抽出的 `run_replay(...)`，终端 print 与这里的 SSE 只是同一事件流的两个 sink；
+`review` 走 flow `execute` + `OutcomeScheduler.scan`。唯一 flow 没有的直接调用是「复用已冻结 Snapshot
+只重跑研究图/委员会」，用于不重烧采集配额地反复调试研究节点。
 职责边界见 docs/Plan.md 3.1.1 与 4.4。
 
 用法（conda trader 环境）：
@@ -28,7 +30,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,8 @@ from core.collect.market import INDICATORS_VERSION
 from core.database import DataGateway
 from core.database.raw import RawPayloadStore
 from core.database.store import ResearchLedger
+from core.outcome import OutcomeScheduler
+from scripts.backtest import AcceptanceHarnessModel, _replay_account, run_replay
 from utils.llm_client import LLMClient
 from viz.readmodel import LedgerReader
 
@@ -58,19 +62,26 @@ DEFAULT_RUNS_DIR = config.PROJECT_ROOT / "output" / "viz_runs"
 DEFAULT_POOL = ["AAPL", "AMZN", "GOOGL", "JNJ", "JPM", "MSFT", "NVDA", "UNH", "V", "WMT"]
 
 STAGE_LABELS = {
-    # 编号对齐 docs/development_plan.md：阶段 1 采集/建卡/冻结，2 逐标的研究，3 委员会，4 组合政策
+    # 编号对齐 docs/development_plan.md：阶段 1 采集/建卡/冻结，2 逐标的研究，3 委员会，4 组合政策，5 成交，6 结算与复盘
     "collect": "阶段 1 · 采集原始数据",
     "ingest": "阶段 1 · 建卡",
     "freeze": "阶段 1 · 冻结 Snapshot",
     "research": "阶段 2 · 逐标的研究图",
     "committee": "阶段 3 · 委员会",
     "portfolio": "阶段 4 · 组合政策",
+    "execute": "阶段 5 · T+1 成交",
+    "outcome": "阶段 6 · Outcome 结算",
+    "review": "阶段 6 · 复盘标签",
 }
 
-# 数据来源三节奏，与 flow 对齐：collect/decide 走 run_research_round，snapshot 走生产原语
+# 数据来源节奏，与 flow/backtest.py 对齐：collect/decide/evidence 走 run_research_round，
+# full 走 run_replay（多周闭环），review 走 execute + OutcomeScheduler.scan，snapshot 走生产原语
 RUN_MODES = {
     "collect": "跑全程：联网采集 → 建卡 → 用本轮卡集点名冻结 → 研究图 → 委员会 → 组合政策",
     "decide": "决策：不联网，从已入池卡片按 available_from 窗口选卡冻结 → 研究图 → 委员会 → 组合政策（需真实账户）",
+    "evidence": "日频建卡：采集 → 建 Feature/EvidenceCard → 入池，不冻结、不跑模型（= flow daily）",
+    "full": "闭环回放：从缓存 CSV 逐交易日推进（周五决策 → T+1 成交 → 到期 Outcome → 复盘 → 次周引用），force 默认开",
+    "review": "复盘：对挂起 OrderPlan 做 T+1 execute 成交，再扫描到期 Episode 结算 OutcomeCard → ReviewLabel",
     "snapshot": "调试：复用已冻结 Snapshot，只重跑研究图/委员会（不采集不冻结，不烧采集配额）",
 }
 
@@ -130,7 +141,7 @@ def _ms_between(start: datetime | None, end: datetime | None) -> int | None:
     return max(0, int((end - start).total_seconds() * 1000))
 
 
-# 节点识别：与 scripts/research_run.py 的终端打印包装同构，改一处要一起看另一处，
+# 节点识别：与 scripts/backtest.py 的终端打印包装同构，改一处要一起看另一处，
 # 否则同一轮运行会在终端和前端指向不同节点。
 _RESEARCH_AGENTS = ("event", "fundamental", "market")
 
@@ -201,6 +212,10 @@ class RunOptions:
     filings: bool = True            # 是否采集 SEC 披露：关掉可演示 Fundamental 干净弃权
     run_research: bool = True       # 关掉 = 只做采集→建卡→冻结的数据验收轮（不给 flow 注入模型）
     run_committee: bool = True      # 仅 snapshot 调试节奏有意义：全链由 flow 一次跑到委员会
+    start: str | None = None        # full：回放窗口起始日（周五 YYYYMMDD）
+    end: str | None = None          # full：回放窗口结束日（缺省 start+110）
+    force: bool = True              # full：AcceptanceHarness + seed（默认开）
+    order_plan_id: str | None = None  # review：先对该 OrderPlan 做 T+1 execute
 
     @classmethod
     def from_payload(cls, body: dict[str, Any]) -> "RunOptions":
@@ -216,6 +231,15 @@ class RunOptions:
         as_of = str(body.get("as_of") or "").strip() or None
         if as_of:
             cls._parse_as_of(as_of)  # 先校验格式，让报错直接显示在前端而不是等线程抛异常
+        start = str(body.get("start") or "").strip() or None
+        end = str(body.get("end") or "").strip() or None
+        order_plan_id = str(body.get("order_plan_id") or "").strip() or None
+        if mode == "full":
+            if not start:
+                raise ValueError("full 回放需要 start（周五 YYYYMMDD，如 20260501）")
+            datetime.strptime(start, "%Y%m%d")
+            if end:
+                datetime.strptime(end, "%Y%m%d")
         return cls(pool=pool, mode=mode, provider=str(body.get("provider") or "deepseek"),
                    model=(str(body["model"]).strip() or None) if body.get("model") else None,
                    as_of=as_of, snapshot_id=snapshot_id,
@@ -223,7 +247,9 @@ class RunOptions:
                    market_lookback=_to_int(body.get("market_lookback"), 220, minimum=30),
                    filings=bool(body.get("filings", True)),
                    run_research=bool(body.get("run_research", True)),
-                   run_committee=bool(body.get("run_committee", True)))
+                   run_committee=bool(body.get("run_committee", True)),
+                   start=start, end=end, force=bool(body.get("force", True)),
+                   order_plan_id=order_plan_id)
 
     @staticmethod
     def _parse_as_of(raw: str) -> datetime:
@@ -411,11 +437,15 @@ class TracingModel:
             fields["result_raw"] = _clip_text(viewed["raw"])
         self._run.emit("tool_call", **fields)
 
+    def _audit(self, call_id: str, node: str, symbol: str) -> dict[str, Any]:
+        """审计关联键：与 node_input/node_output 用同一 call_id，使 llm_calls.jsonl 可回溯到本轮该节点。"""
+        return {"trace_id": self._run.run_id, "node": node, "symbol": symbol, "call_id": call_id}
+
     def chat_json(self, message: str, **kwargs):
         call_id, node, symbol = self._open_call(message)
         started = time.monotonic()
         try:
-            result = self._c.chat_json(message, **kwargs)
+            result = self._c.chat_json(message, audit=self._audit(call_id, node, symbol), **kwargs)
         except Exception as exc:
             self._close_call(call_id, node, symbol, started, None, f"{type(exc).__name__}: {exc}")
             raise
@@ -433,15 +463,63 @@ class TracingModel:
 
         started = time.monotonic()
         try:
-            result = self._c.chat_with_tools(message, **dict(kwargs, tool_executor=traced))
+            result = self._c.chat_with_tools(
+                message, audit=self._audit(call_id, node, symbol),
+                **dict(kwargs, tool_executor=traced))
         except Exception as exc:
             self._close_call(call_id, node, symbol, started, None, f"{type(exc).__name__}: {exc}")
             raise
         self._close_call(call_id, node, symbol, started, result, None)
         return result
 
+    def record_forced(self, message: str, result: dict) -> dict:
+        """force 验收轮观测：委员会/Review 被 harness 短路，不经 provider 也补发
+        node_input/node_output，否则记忆注入在事件流里完全隐身。"""
+        call_id, node, symbol = self._open_call(message)
+        self._close_call(call_id, node, symbol, time.monotonic(), result, None)
+        return result
+
 
 # ============================ 运行观测执行器 ============================
+
+# run_replay 的内部阶段名 → viz 流水线卡片：让闭环回放也驱动顶部阶段进度，而不是只出节点。
+# full 不联网，collect 这一步是把缓存 CSV 逐 bar 导入正文库（命中缓存），如实标注区分于 collect/decide 的联网采集。
+_REPLAY_STAGE_MAP = {
+    "raw-import": ("collect",),
+    "daily-ingest": ("ingest",),
+    "weekly-decision": ("freeze", "research", "committee", "portfolio"),
+    "execution": ("execute",),
+    "outcome-review": ("outcome", "review"),
+}
+
+
+def _replay_stage_summary(stage: str, day: Any, fields: dict[str, Any]) -> dict[str, Any]:
+    """把 run_replay 某阶段的计数/ID 折进对应流水线卡片的摘要。"""
+    base: dict[str, Any] = {"via_replay": True, "day": day}
+    if stage == "collect":
+        base.update(note="本地缓存 CSV 逐 bar 导入正文库（命中缓存，非联网）",
+                    market_bars=fields.get("market_bars"), news_days=fields.get("news_days"),
+                    version=fields.get("version"))
+    elif stage == "ingest":
+        base.update(cards=fields.get("cards"))
+    elif stage == "freeze":
+        base.update(snapshot_id=fields.get("snapshot"))
+    elif stage == "research":
+        base.update(packets=fields.get("packets"))
+    elif stage == "committee":
+        base.update(intent_id=fields.get("intent"))
+    elif stage == "portfolio":
+        base.update(order_plan_id=fields.get("order_plan"), orders=fields.get("orders"),
+                    actions=fields.get("actions"))
+    elif stage == "execute":
+        base.update(order_plan_id=fields.get("order_plan"), fills=fields.get("fills"),
+                    episodes=fields.get("episodes"))
+    elif stage == "outcome":
+        base.update(outcomes=fields.get("outcomes"))
+    elif stage == "review":
+        base.update(reviews=fields.get("reviews"), eligibility=fields.get("eligibility"))
+    return base
+
 
 class RunObserver:
     """执行一次运行并把过程转成事件：全链交给 flow，节点级细节交给 TracingModel。"""
@@ -455,6 +533,7 @@ class RunObserver:
         self.reader = LedgerReader(config.RESEARCH_LEDGER_PATH, config.RESEARCH_RAW_DIR)
         self.snapshot = None
         self.packet_ids: list[str] = []
+        self._replay_stages_started: set[str] = set()
 
     def close(self) -> None:
         """账本与只读视图都是按查询开/关连接，只有正文库需要显式收尾。"""
@@ -467,9 +546,16 @@ class RunObserver:
             client = LLMClient(provider=self.options.provider, model=self.options.model)
             run.log(f"模型：{client.provider}/{client.model}｜标的池：{', '.join(self.options.pool)}｜"
                     f"{RUN_MODES[self.options.mode]}", provider=client.provider, model=client.model)
-            if self.options.mode == "snapshot":
+            mode = self.options.mode
+            if mode == "snapshot":
                 self._run_snapshot(client)
-            else:
+            elif mode == "evidence":
+                self._run_evidence()
+            elif mode == "full":
+                self._run_replay(client)
+            elif mode == "review":
+                self._run_review(client)
+            else:  # collect / decide
                 self._run_flow(client)
             run.finish("done")
         except RunCancelled:
@@ -671,6 +757,115 @@ class RunObserver:
                                      "trace_id": trace_id},
                        duration_ms=_ms_between(committee_started, utc_now()))
 
+    # ---------- evidence：日频建卡入池（flow daily，不跑模型） ----------
+
+    def _run_evidence(self) -> None:
+        """日频建卡：采集→建 Feature/EvidenceCard→入池，不冻结、不跑模型（= flow daily）。"""
+        run, opts = self.run, self.options
+        run.stage_start("collect", via_flow=True, handled_by="agents/flow.py (daily)")
+        run.stage_start("ingest", via_flow=True)
+        started = utc_now()
+        result = run_research_round(FlowOptions(
+            pool=opts.pool, mode="daily", as_of=opts.flow_as_of(), news_days=opts.days,
+            market_lookback=opts.market_lookback, filings=opts.filings, trace_prefix=run.run_id))
+        ended = utc_now()
+        run.stage_done("collect", {"via_flow": True, "as_of": result.as_of.isoformat()},
+                       duration_ms=_ms_between(started, ended))
+        run.stage_done("ingest", {"via_flow": True, "cards": result.ingested}, duration_ms=None)
+        reason = "evidence 只做到入池：不冻结 Snapshot，研究图/委员会/组合政策都不跑"
+        for stage in ("freeze", "research", "committee", "portfolio"):
+            run.stage_skip(stage, reason)
+        run.log(f"[evidence] as_of={result.as_of.isoformat()} 建卡入池 {result.ingested} 张（未冻结）", level="ok")
+
+    # ---------- review：execute 成交 + 到期结算/复盘 ----------
+
+    def _run_review(self, client: LLMClient) -> None:
+        """复盘：可选对挂起 OrderPlan 做 T+1 execute，再扫描到期 Episode 结算 OutcomeCard→ReviewLabel。"""
+        run, opts = self.run, self.options
+        when = opts.flow_as_of() or utc_now()
+        for stage in ("collect", "ingest", "freeze", "research", "committee", "portfolio"):
+            run.stage_skip(stage, "复盘只处理成交与到期结算：不复建本轮决策")
+        episode_ids: tuple[str, ...] | None = None
+        if opts.order_plan_id:
+            run.stage_start("execute", order_plan_id=opts.order_plan_id)
+            started = utc_now()
+            execution = run_research_round(FlowOptions(
+                pool=opts.pool, mode="execute", as_of=when, account_state=run.account_state,
+                order_plan_id=opts.order_plan_id, trace_prefix=run.run_id),
+                ledger=self.ledger, raw_store=self.store)
+            for fill in execution.fills:
+                run.object("fill", fill.fill_id, fill.model_dump(mode="json"), symbol=fill.symbol)
+            for episode in execution.episodes:
+                run.object("position_episode", episode.episode_id, episode.model_dump(mode="json"),
+                           symbol=episode.symbol)
+            run.stage_done("execute", {"order_plan_id": opts.order_plan_id, "fills": len(execution.fills),
+                                       "episodes": len(execution.episodes)},
+                           duration_ms=_ms_between(started, utc_now()))
+            episode_ids = tuple(e.episode_id for e in self.ledger.list_active_position_episodes()
+                                if opts.order_plan_id in e.order_plan_ids)
+        else:
+            run.stage_skip("execute", "未指定 OrderPlan：只扫描已挂起且到期的 Episode")
+        run.stage_start("outcome")
+        run.stage_start("review")
+        started = utc_now()
+        settled = OutcomeScheduler(ledger=self.ledger, raw_store=self.store,
+                                   model=TracingModel(run, client)).scan(
+            as_of=when, trace_prefix=f"{run.run_id}-outcome", episode_ids=episode_ids)
+        for outcome in settled.outcomes:
+            run.object("outcome_card", outcome.outcome_card_id, outcome.model_dump(mode="json"),
+                       symbol=outcome.symbol)
+        for label in settled.review_labels:
+            run.object("review_label", label.review_label_id, label.model_dump(mode="json"),
+                       outcome_card_id=label.outcome_card_id)
+        for episode in settled.episodes:
+            run.object("position_episode", episode.episode_id, episode.model_dump(mode="json"),
+                       symbol=episode.symbol)
+        ended = utc_now()
+        run.stage_done("outcome", {"outcomes": len(settled.outcomes)}, duration_ms=None)
+        run.stage_done("review", {"labels": len(settled.review_labels),
+                                  "eligibility": [label.memory_eligibility for label in settled.review_labels]},
+                       duration_ms=_ms_between(started, ended))
+
+    # ---------- full：多周闭环回放（复用 scripts/backtest.run_replay） ----------
+
+    def _run_replay(self, client: LLMClient) -> None:
+        """闭环回放：终端 print 与这里的 SSE 共用同一 run_replay 事件流，不各写一份日循环。"""
+        run, opts = self.run, self.options
+        start = datetime.strptime(str(opts.start), "%Y%m%d").date()
+        end = datetime.strptime(str(opts.end), "%Y%m%d").date() if opts.end else start + timedelta(days=110)
+        live = TracingModel(run, client)
+        model = AcceptanceHarnessModel(live) if opts.force else live
+        run.log(f"[full] 闭环回放 {start}→{end}｜标的 {', '.join(opts.pool)}｜"
+                f"force={'开' if opts.force else '关'}｜账户为回放自洽满现金（非页面账户）")
+        run_replay(ledger=self.ledger, raw=self.store, pool=opts.pool, start=start, end=end,
+                   model=model, account=_replay_account(), sink=self._replay_sink, seed=opts.force,
+                   check_cancel=run.check_cancel, trace_prefix=run.run_id)
+
+    def _replay_sink(self, event_type: str, **fields: Any) -> None:
+        """把 run_replay 事件转进 SSE 总线：驱动流水线阶段卡片 + 文本日志 + 链路对象。"""
+        run = self.run
+        day = fields.pop("day", None)
+        if event_type == "log":
+            stage = fields.pop("stage", "")
+            mapped = _REPLAY_STAGE_MAP.get(stage, ())
+            self._replay_light_stages(stage, day, fields)
+            detail = " ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, "", [], {}))
+            # stage= 让顶部卡片点击过滤能命中回放日志：一条日志映射到多张卡片时全量带上
+            # （如 weekly-decision 同属冻结/研究/委员会/组合政策），逗号分隔；映射不到则留空
+            run.log(f"[{day}] {stage} {detail}".strip(), day=day, replay_stage=stage,
+                    stage=",".join(mapped) if mapped else None)
+        elif event_type == "object":
+            run.object(str(fields.get("kind")), str(fields.get("id")), fields.get("data"), day=day)
+
+    def _replay_light_stages(self, replay_stage: str, day: Any, fields: dict[str, Any]) -> None:
+        """把 run_replay 内部阶段名映射到 viz 卡片：首次 stage_start，之后每个决策日 stage_done 刷新摘要。"""
+        run = self.run
+        for stage in _REPLAY_STAGE_MAP.get(replay_stage, ()):
+            if stage not in self._replay_stages_started:
+                run.stage_start(stage, via_replay=True, day=day)
+                self._replay_stages_started.add(stage)
+            run.stage_done(stage, _replay_stage_summary(stage, day, fields), duration_ms=None)
+
 
 # ============================ 进程内状态 ============================
 
@@ -828,6 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(detail) if detail else self._error(404, "object not found")
             elif route == "/api/raw":
                 self._raw(query.get("evidence_id", ""))
+            elif route == "/api/digest":
+                refs = [s for s in str(query.get("ids", "")).split(",") if s.strip()]
+                self._json({"digests": STATE.reader.digests(refs[:400])})
             else:
                 self._error(404, f"unknown route: {route}")
         except ValueError as exc:
@@ -941,6 +1139,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="只允许本机监听，默认 127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR), help="运行事件流的落盘目录")
+    parser.add_argument("--ledger", default=None,
+                        help="只读回放指向的账本路径（如回测产物 data/backtests/.../ledger.db）；缺省用 config.RESEARCH_LEDGER_PATH")
+    parser.add_argument("--raw", default=None,
+                        help="配合 --ledger 指向的正文库目录；缺省用 config.RESEARCH_RAW_DIR")
     return parser.parse_args()
 
 
@@ -953,6 +1155,11 @@ def main() -> int:
         return 2
     runs_dir = Path(args.runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
+    # 只读回放覆盖：把账本/正文库指向指定路径，_State.reader 与 _meta 均按 config 实时读取，展示自然如实
+    if args.ledger:
+        config.RESEARCH_LEDGER_PATH = Path(args.ledger)
+    if args.raw:
+        config.RESEARCH_RAW_DIR = Path(args.raw)
     STATE = _State(runs_dir)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True

@@ -186,7 +186,17 @@
 
 **Outcome 反思 LLM：** Outcome 的收益、成本、回撤和替代方案始终由确定性程序计算；Review Agent 只读取已终结 episode 的 Intent、OrderPlan、Fill 与 OutcomeCard，生成历史 reflection 并审核该 episode 是否具有可迁移的经验价值。它不读取或引用 EvidenceCard：研究证据链仍保留在 Intent/Claim/账本中供完整回放，不能被 Outcome 复盘伪装为结果归因。`eligible` 的依据是决策链清晰、执行/结果可归因且存在可迁移模式；不得按盈亏筛选，亏损但清晰证伪 thesis 的案例应保留，偶然获利、纯硬风险、执行噪声或归因不足的案例应 `reject`。它不输出 effective/failed/mixed 总评，不修改决策、账户、订单、prompt 或策略参数；`abstain`、模型失败、不完整 episode 或 `reject` 均不得进入检索。
 
-**本段剩余工作（仅 Outcome/记忆）：** 重跑并固定 `scripts/outcome_smoke.py` 的完整离线链路验收：OrderPlan -> T+1 Fill -> Episode -> Scheduler -> Outcome -> Review -> 下一轮 Committee 校准引用；再以滚动 PIT 样本外比较无检索、同标的基线和结构化近邻检索。后者是上线跨标的经验候选与调整时间衰减/多样化规则的前置条件，不得以单次案例决定参数。
+**本段剩余工作（仅 Outcome/记忆）：** 重跑并固定 `scripts/full_flow_backtest.py`（取代已删除的 `scripts/outcome_smoke.py`）的完整离线链路验收：OrderPlan -> T+1 Fill -> Episode -> Scheduler -> Outcome -> Review -> 下一轮 Committee 校准引用；再以滚动 PIT 样本外比较无检索、同标的基线和结构化近邻检索。后者是上线跨标的经验候选与调整时间衰减/多样化规则的前置条件，不得以单次案例决定参数。
+
+**最小全流程回放（进行中，2026-10-14）：** 新增 `scripts/full_flow_backtest.py`，从本地历史
+news/market CSV 建立独立回放账本，按日建新闻 EvidenceCard、按周建 market feature 卡并驱动完整
+ResearchDecisionFlow、T+1 执行与 OutcomeReviewFlow。最小案例覆盖一个 60 交易日 episode 及其
+到期后的下一轮 Committee；研究节点和 Risk Critic 使用真实 LLMClient，且 Critic 的 `abstain`/`human_review`
+否决不可绕过。为稳定验收 Outcome 记忆链，Acceptance Harness 在 Critic 未否决时强制首轮 Committee 产生
+有当前 ClaimCard 支撑的 `long/start`，并强制 Review 的 `memory_eligibility=eligible` 和后续 Committee 的
+`calibration_episode_ids`；均以 `FORCED_ACCEPTANCE` 标识，不能当作 LLM 结论。终端输出每个节点的审计锚点，
+自动化测试断言 Review 准入、检索审计和 `calibration_episode_ids`。缓存新闻的 `available_at=published_at` 仅为明示的历史回放近似，
+不得把本脚本结果宣传为实时 PIT 或策略收益证据。
 
 **工作项**
 

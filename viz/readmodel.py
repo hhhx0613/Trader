@@ -33,6 +33,11 @@ _TABLES = (
     ("target_portfolios", "target_portfolio"),
     ("risk_projected_portfolios", "risk_projected_portfolio"),
     ("order_plans", "order_plan"),
+    # 阶段 5-6：执行与复盘后半程，回放页据此把 episode→outcome→review→引用画完整
+    ("fills", "fill"),
+    ("position_episodes", "position_episode"),
+    ("outcome_cards", "outcome_card"),
+    ("review_labels", "review_label"),
 )
 
 _OBJECT_KEY = {
@@ -46,7 +51,50 @@ _OBJECT_KEY = {
     "target_portfolios": "target_portfolio_id",
     "risk_projected_portfolios": "projected_portfolio_id",
     "order_plans": "order_plan_id",
+    "fills": "fill_id",
+    # position_episodes 行主键是 {episode_id}:{revision}；对外身份用 payload 里的 episode_id，详情取最新 revision
+    "position_episodes": "episode_id",
+    "outcome_cards": "outcome_card_id",
+    "review_labels": "review_label_id",
 }
+
+
+def _digest_label(kind: str, p: dict[str, Any]) -> dict[str, Any]:
+    """一行可进 chip 的摘要：只取能定性的一句话，不取大段正文（全文另走 /api/raw）。"""
+    sym = p.get("symbol") or ""
+    if kind == "evidence_card":
+        # 卡片本身不存正文（title/summary 在 raw 里）：chip 摘要只用卡片自带的 source·kind，
+        # 全文仍由抽屉按 evidence_id 走 /api/raw 取。
+        text = p.get("title") or p.get("summary") or f"{p.get('source') or ''} · {p.get('kind') or ''}"
+        return {"kind": kind, "symbol": sym, "source": p.get("source"), "label": text[:140]}
+    if kind == "claim_card":
+        return {"kind": kind, "symbol": sym, "stance": p.get("stance"),
+                "label": (p.get("statement") or "")[:140]}
+    if kind == "position_episode":
+        return {"kind": kind, "symbol": sym, "label": f"{p.get('status') or ''}"}
+    if kind == "outcome_card":
+        net = p.get("net_return")
+        return {"kind": kind, "symbol": sym, "label": p.get("observation") or (f"net={net}" if net is not None else "")}
+    if kind == "review_label":
+        return {"kind": kind, "symbol": sym, "label": f"{p.get('status') or ''} · {p.get('memory_eligibility') or ''}"}
+    if kind == "fill":
+        return {"kind": kind, "symbol": sym, "label": f"{p.get('side') or ''} {p.get('filled_shares')}/{p.get('requested_shares')}"}
+    if kind == "order_plan":
+        return {"kind": kind, "symbol": sym, "label": f"{len(p.get('orders') or [])} orders"}
+    if kind == "portfolio_intent":
+        # 委员会决策的实质内容都在 items 里：理由全文展示，不截断（用户明确要求）
+        parts = []
+        for i in p.get("items") or []:
+            seg = f"{i.get('symbol')}:{i.get('action')}"
+            if i.get("horizon_days"):
+                seg += f"/{i['horizon_days']}d"
+            seg += f"(强度{i.get('strength')},P{i.get('priority')})"
+            rationale = " ".join(str(i.get("rationale") or "").split())
+            if rationale:
+                seg += f" {rationale}"
+            parts.append(seg)
+        return {"kind": kind, "symbol": sym, "label": " | ".join(parts)}
+    return {"kind": kind, "symbol": sym, "label": ""}
 
 
 class LedgerReader:
@@ -140,6 +188,43 @@ class LedgerReader:
                           "source": f"{snapshot_id} 引用了 {missing} 张不在账本的卡", "missing": True})
         return cards
 
+    # ---------- 批量摘要（前端 chip 不再只显裸 ID） ----------
+
+    def digests(self, refs: list[str]) -> dict[str, dict[str, Any]]:
+        """把一批「kind:id」一次解析成一行摘要：只查摘要字段、不取正文。
+
+        未知 kind 或缺失 id 不报错、不兜底：前端拿不到的 id 自然回落短 ID。
+        """
+        by_kind: dict[str, set[str]] = {}
+        for ref in refs:
+            kind, _, oid = str(ref).partition(":")
+            if kind and oid:
+                by_kind.setdefault(kind, set()).add(oid)
+        out: dict[str, dict[str, Any]] = {}
+        conn = self._connect()
+        if conn is None:
+            return out
+        try:
+            for kind, ids in by_kind.items():
+                table = next((t for t, k in _TABLES if k == kind), None)
+                if table is None:
+                    continue
+                key = _OBJECT_KEY[table]
+                # position_episodes 行主键带 revision，对外身份是 payload.episode_id，只能按 payload 点查
+                match = ("json_extract(t.payload,'$.episode_id') = ids.value"
+                         if kind == "position_episode" else "t.object_id = ids.value")
+                rows = conn.execute(
+                    f"SELECT t.payload FROM {table} AS t, json_each(?) AS ids WHERE {match}",
+                    (json.dumps(list(ids)),)).fetchall()
+                for row in rows:
+                    payload = self._payload(row)
+                    object_id = payload.get(key)
+                    if object_id in ids:
+                        out[str(object_id)] = _digest_label(kind, payload)
+        finally:
+            conn.close()
+        return out
+
     # ---------- Trace ----------
 
     def traces(self, limit: int = 40) -> list[dict[str, Any]]:
@@ -220,8 +305,15 @@ class LedgerReader:
         if conn is None:
             return None
         try:
-            row = conn.execute(f"SELECT trace_id, created_at, payload FROM {table} WHERE object_id=?",
-                               (object_id,)).fetchone()
+            if kind == "position_episode":
+                # Episode 按 revision 追加不覆盖；详情只暴露最新快照，历史 revision 留在账本
+                row = conn.execute(f"SELECT trace_id, created_at, payload FROM {table} "
+                                   "WHERE json_extract(payload, '$.episode_id') = ? "
+                                   "ORDER BY CAST(json_extract(payload, '$.revision') AS INTEGER) DESC LIMIT 1",
+                                   (object_id,)).fetchone()
+            else:
+                row = conn.execute(f"SELECT trace_id, created_at, payload FROM {table} WHERE object_id=?",
+                                   (object_id,)).fetchone()
             if row is None:
                 return None
             payload = self._payload(row)
@@ -255,10 +347,62 @@ class LedgerReader:
                     links["packets"] = [self._payload(p) for p in conn.execute(
                         "SELECT r.payload FROM research_packets r, json_each(?) AS i WHERE r.object_id = i.value",
                         (json.dumps(list(ids)),)).fetchall()] if ids else []
+                if kind == "portfolio_intent":
+                    # 校准引用是「记忆→委员会」这条线的落点：把本轮意图引用的历史案例物化出来
+                    cited = sorted({episode_id for item in (payload.get("items") or ())
+                                    for episode_id in (item.get("calibration_episode_ids") or ())})
+                    links["calibration_episodes"] = [self._latest_episode(conn, episode_id)[0]
+                                                     for episode_id in cited
+                                                     if self._latest_episode(conn, episode_id)]
+            elif kind == "position_episode":
+                links["outcome_card"] = self._rows_by_object_ids(conn, "outcome_cards", [payload.get("outcome_card_id")])
+                links["review_label"] = self._rows_by_object_ids(conn, "review_labels", [payload.get("review_label_id")])
+                links["fills"] = self._rows_by_object_ids(conn, "fills", list(payload.get("fill_ids") or ()))
+                links["intents_citing"] = self._intents_citing(conn, payload.get("episode_id"))
+            elif kind == "outcome_card":
+                links["fills"] = self._rows_by_object_ids(conn, "fills", list(payload.get("fill_ids") or ()))
+                links["episode"] = self._latest_episode(conn, payload.get("episode_id"))
+            elif kind == "review_label":
+                links["outcome_card"] = self._rows_by_object_ids(conn, "outcome_cards", [payload.get("outcome_card_id")])
+            elif kind == "fill":
+                links["order_plan"] = self._rows_by_object_ids(conn, "order_plans", [payload.get("order_plan_id")])
         finally:
             conn.close()
         return {"kind": kind, "id": payload[_OBJECT_KEY[table]], "trace_id": row["trace_id"],
                 "created_at": row["created_at"], "data": payload, "links": links}
+
+    @staticmethod
+    def _rows_by_object_ids(conn: sqlite3.Connection, table: str, object_ids: list[Any]) -> list[dict[str, Any]]:
+        """fills/outcome_cards/review_labels/order_plans 的行主键即其对外 ID，可直接点查。"""
+        out = []
+        for object_id in object_ids:
+            if not object_id:
+                continue
+            row = conn.execute(f"SELECT payload FROM {table} WHERE object_id=?", (str(object_id),)).fetchone()
+            if row is not None:
+                out.append(json.loads(row["payload"]))
+        return out
+
+    @staticmethod
+    def _latest_episode(conn: sqlite3.Connection, episode_id: Any) -> list[dict[str, Any]]:
+        if not episode_id:
+            return []
+        row = conn.execute("SELECT payload FROM position_episodes "
+                           "WHERE json_extract(payload,'$.episode_id') = ? "
+                           "ORDER BY CAST(json_extract(payload,'$.revision') AS INTEGER) DESC LIMIT 1",
+                           (str(episode_id),)).fetchone()
+        return [json.loads(row["payload"])] if row else []
+
+    @staticmethod
+    def _intents_citing(conn: sqlite3.Connection, episode_id: Any) -> list[dict[str, Any]]:
+        """反查哪些 PortfolioIntent 在 calibration_episode_ids 里引用过该案例。"""
+        if not episode_id:
+            return []
+        rows = conn.execute(
+            "SELECT p.payload FROM portfolio_intents p, json_each(json_extract(p.payload,'$.items')) AS it "
+            "WHERE EXISTS (SELECT 1 FROM json_each(json_extract(it.value,'$.calibration_episode_ids')) AS ce "
+            "WHERE ce.value = ?)", (str(episode_id),)).fetchall()
+        return [json.loads(r["payload"]) for r in rows]
 
     def raw_payload(self, card: dict[str, Any]) -> dict[str, Any] | None:
         """按 EvidenceCard 的指针取正文；哈希不符时让 RawPayloadStore 直接报错。"""

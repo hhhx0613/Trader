@@ -178,6 +178,7 @@ class LLMClient:
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
         max_retries: int = 1,
+        audit: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         """
         发送聊天消息，返回 JSON 解析结果。
@@ -239,6 +240,7 @@ class LLMClient:
                     response=response_text,
                     result=result,
                     error=error,
+                    audit=audit,
                 )
                 return result
             
@@ -260,6 +262,7 @@ class LLMClient:
                 response=response_text,
                 result={},
                 error=f"JSON 解析失败（{parse_error}，已重试 {max_retries} 次）",
+                audit=audit,
             )
             return {
                 "error": f"JSON 解析失败（{parse_error}）",
@@ -278,6 +281,7 @@ class LLMClient:
         max_tool_calls: int,
         temperature: float = 0.0,
         max_tokens: Optional[int] = None,
+        audit: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """运行 OpenAI-compatible 原生 function calling，并由调用方执行受控工具。
 
@@ -309,6 +313,7 @@ class LLMClient:
                     response=content,
                     result=parsed or {},
                     error=None if parsed is not None else "tool-calling model did not return a JSON object",
+                    audit=audit,
                 )
                 if parsed is None:
                     raise ValueError("tool-calling model did not return a JSON object")
@@ -325,6 +330,7 @@ class LLMClient:
                 ),
                 result={"tool_calls": len(calls), "round": used_calls + 1},
                 error=None,
+                audit=audit,
             )
             if used_calls + len(calls) > max_tool_calls:
                 raise ValueError("model exceeded research tool-call budget")

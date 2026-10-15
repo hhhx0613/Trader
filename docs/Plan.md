@@ -75,11 +75,19 @@ graph TD
 
 「采集 -> 建卡 -> 冻结 -> 逐标的研究图 -> Committee」的阶段门控与 trace_id 生成只有一个实现处：`run_research_round(options, *, model=None)`，三种节奏为 `daily`（只采集建卡入池，不冻结）、`collect`（采集并用本轮卡集点名冻结）、`decide`（按 `available_from` 池选卡冻结，再跑研究图与 Committee 产出 `PortfolioIntent`）。
 
-`scripts/research_run.py` 不映射这三种节奏，只保留**一个跑全程的人类入口**：默认 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→委员会并逐节点打印。`daily` 与 `decide` 由外部定时调度器直接调用 `run_research_round`，不再各自养一份命令行参数装配。四条边界：
+`scripts/backtest.py` 是主线唯一的回测/研究人类入口（合并原 `scripts/research_run.py` 与 `scripts/full_flow_backtest.py`），用 `--phase` 选环节，默认 `full`：
+
+- `full`：多周闭环回放——以本地 `data/cache/` 历史 CSV 为准（逐 bar 落 PIT，联网整批会破坏回放可得性），逐交易日建卡、周五决策、T+1 成交、到期结算 Outcome、次周 Committee 校准引用；缺档先跑 `--phase collect` 联网补缓存。全程真实 `LLMClient`，`AcceptanceHarness` 默认开（`--no-force` 可关）。推进的是脚本内虚拟时钟，不改真实时间。
+- `collect`：只联网拉新闻/行情/披露入正文库（补缺口，不建卡不决策）。
+- `evidence`：对给定日期区间逐日建 Feature/EvidenceCard 并入池，不冻结、不跑模型（= flow `daily`）。
+- `decision`：指定 `--as-of` 冻结 Snapshot→研究图→委员会→组合政策→OrderPlan（= flow `decide` + 注入模型）。
+- `review`：对挂起 OrderPlan 做 T+1 `execute` 成交，再扫描到期 Episode 结算 OutcomeCard→ReviewLabel（= flow `execute` + `OutcomeScheduler.scan`）。
+
+所有节奏统一写生产账本 `config.RESEARCH_LEDGER_PATH`（测试期不设独立 backtest 目录、不提供 `--reset` 删库）；重跑靠 `trace_prefix`+`as_of` 秒级戳幂等、内容哈希 object_id 去重，force/seed 对象带 `FORCED_ACCEPTANCE` 标记与 run-tag 命名空间隔离。`daily`/`decide` 的外部定时调度器仍直接调用 `run_research_round`，不经过本脚本。四条边界：
 
 1. **不跑研究就不碰模型。** `daily` 不构造 `LLMClient`，定时采集因此不依赖 API key，也不会误烧付费调用。
 2. **要决策就必须给真实账户。** `decide` 要求调用方传入 `account_state`（cash/positions/limits/regime/成本估计），缺账户直接失败而不退回占位值：Risk Critic 的 prompt 明确「缺 limits 或持仓状态不得当作放行」，占位账户只会跑出一轮全 `abstain` 的无效意图，白烧模型还留下一条看起来成功的 trace。
-3. **观测不属于编排。** 逐节点打印是调用方对模型客户端的包装（`research_run.py` 的终端 `TracingModel`、`viz/` 的事件版包装各一份，只解读调用内容），`flow` 内不含 `print`、事件总线或前端耦合，同一函数可被 CLI、外部调度器和 `viz/` 复用。采集能力始终在 `flow` 这一侧，研究 Agent 侧拿不到任何采集入口（见 4.2）。
+3. **观测不属于编排。** 逐节点打印是调用方对模型客户端的包装（`backtest.py` 的终端 `TracingModel`、`viz/` 的事件版包装各一份，只解读调用内容），`flow` 内不含 `print`、事件总线或前端耦合，同一函数可被 CLI、外部调度器和 `viz/` 复用。采集能力始终在 `flow` 这一侧，研究 Agent 侧拿不到任何采集入口（见 4.2）。
 
 #### 3.1.2 一次 ResearchDecisionFlow 的执行顺序
 
@@ -305,6 +313,27 @@ TargetPortfolio = portfolio_policy(
 
 ### 3.2 OutcomeReviewFlow：量化归因、复盘与受控经验
 
+#### 3.2.0 最小全流程历史回放
+
+`scripts/backtest.py` 的 `full` 节奏（合并自原 `scripts/full_flow_backtest.py`）是主线的可重复诊断入口，不是旧回测引擎的兼容层。它以本地
+`data/cache/news/` 与 `data/cache/market/` 的历史 CSV 为输入，逐交易日导入新闻 EvidenceCard，
+逐周补一张程序生成的 Market EvidenceCard，并按既有 `ResearchDecisionFlow -> T+1
+SimulatedExecution -> OutcomeReviewFlow` 编排运行。v1 的最小窗口固定为一个 60 交易日
+episode 加其到期后的下一次周度决策；脚本必须打印每一节点的 trace/object ID 与结果，不自动
+生成 Markdown 报告。
+
+历史新闻 CSV 不携带当时的接收时间，导入时只能明确采用 `available_at = published_at` 的
+回放近似，并在 source/version 中标为 `legacy-cache-replay-v1`；因此该脚本是链路诊断和回归，
+不是实时可得性或 alpha 的证明。行情按日拆分为 raw batch，单日 bar 只在该日收盘时可得，禁止
+把一整段未来 K 线作为同一时点可见。所有 Snapshot、订单、Fill、Episode、Outcome 和检索审计
+仍必须由既有主线接口生成。研究节点和 Risk Critic 使用项目配置的真实 `LLMClient`；Risk Critic 的
+`abstain`/`human_review` 否决不可被验收工具绕过。为让一个最小 episode 稳定覆盖 Outcome 注入链，
+Acceptance Harness 在 Critic 未否决时明确标识地强制首轮 Committee 产生一笔有本轮 ClaimCard 支撑的
+`long/start`，再仅替代 Review 的 `memory_eligibility=eligible` 和已检索历史案例后的 Committee
+`calibration_episode_ids` 引用。
+终端输出与写入 rationale 均带 `FORCED_ACCEPTANCE` 标记；这只验证准入、检索与引用管线，不是 LLM 判断、
+实时 PIT 或策略收益证据。其余节点不得使用伪造响应。
+
 ```mermaid
 graph TD
     I["PortfolioIntent / IntentItem"] --> P["OrderPlan（直接 intent_id）"]
@@ -408,14 +437,16 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 
 给定任一 `trace_id`，系统应能在不访问实时数据的前提下重建当时的输入与决策链；缺失任一关键对象即标记回放失败。
 
+模型调用的完整 prompt/response 记在 `logs/llm_calls.jsonl`，每条附带 `trace_id/node/symbol/call_id/snapshot_id` 关联键，使审计 agent 能把任一节点的结论回溯到它当时看到的证据正文（按 `content_hash` 从正文库解析）与完整提示；`FORCED_ACCEPTANCE` 标记把脚手架强制的节点从「真实判断」样本里排除。
+
 ### 4.4 研究链路可视化调试台（`viz/`）
 
-`viz/` 是本地单人使用的观测工具，后端只有 `server.py`（HTTP + SSE + 运行观测）与 `readmodel.py`（账本只读视图）两个文件。它**自己不编排任何阶段**：跑全程就是调 `run_research_round`（与命令行同一个函数），模型客户端套一层事件包装器，把每个节点的注入输入、工具调用与 JSON 输出发到前端，不改变其行为。唯一的例外是 flow 没有的节奏「复用已冻结 Snapshot 只重跑研究图/委员会」——它直接调用生产原语 `PerAssetResearchGraph` 与 `Committee`，用途是不重烧采集配额地反复调试研究节点。从 prompt 结构识别节点的规则与 `scripts/research_run.py` 的终端包装同构，两边各留一份，改动时一起看。
+`viz/` 是本地单人使用的观测工具，后端只有 `server.py`（HTTP + SSE + 运行观测）与 `readmodel.py`（账本只读视图）两个文件。它**自己不编排任何阶段**：`collect`/`decide` 两个节奏就是调 `run_research_round`（与命令行同一个函数），`full`/`review` 回放节奏复用 `scripts/backtest.py` 抽出的 `run_replay(...)`——终端 print 与前端 SSE 只是同一事件流的两个 sink，不各写一份日循环。模型客户端套一层事件包装器，把每个节点的注入输入、工具调用与 JSON 输出发到前端，不改变其行为。唯一的例外是 flow 没有的节奏「复用已冻结 Snapshot 只重跑研究图/委员会」——它直接调用生产原语 `PerAssetResearchGraph` 与 `Committee`，用途是不重烧采集配额地反复调试研究节点。从 prompt 结构识别节点的规则与 `scripts/backtest.py` 的终端包装同构，两边各留一份，改动时一起看。
 
 边界四条：
 
 1. **不复制编排**：采集、建卡、冻结、研究图、委员会的阶段门控与 trace_id 生成一律由 `flow` 持有，`viz/` 里不留第二份。
-2. **只读生产存储**：前端 API 只读 `data/research/` 的账本与正文库，不写账本、不改契约、不给 Agent 开新的数据入口。
+2. **只读查询、写经主线**：账本与正文库的查询 API 一律只读；运行/回放节奏通过 `flow` 与 `OutcomeScheduler` 主线接口写生产账本，`viz/` 自身不直接写库、不改契约、不给 Agent 开新的数据入口。
 3. **零新依赖**：HTTP 服务与 SSE 用标准库实现，前端为无构建的原生 HTML/CSS/JS，只监听 `127.0.0.1`。
 4. **观测产物不入权威存储**：每次运行的事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略），仅供刷新后回看；权威审计仍是 `ResearchLedger` 与 `logs/llm_calls.jsonl`。
 

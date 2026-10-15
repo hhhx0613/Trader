@@ -129,6 +129,7 @@ def test_ledger_revisions_preserve_episode_aggregate_and_retrievable_completion(
     ledger.complete_trace("review", datetime(2026, 11, 1, tzinfo=UTC))
     assert ledger.get_position_episode("ep_1").review_label_id == label.review_label_id
     assert label.memory_eligibility == "eligible"
+    assert label.created_at == outcome.observed_at
     assert ledger.list_verified_memory_episodes() == (completed,)
 
 

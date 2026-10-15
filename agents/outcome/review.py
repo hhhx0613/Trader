@@ -33,14 +33,15 @@ class ReviewAgent:
         }, ensure_ascii=False, sort_keys=True)
         try:
             response = self._model.chat_json(message, system_prompt=self.prompt, temperature=0.0,
-                                             max_tokens=800, max_retries=1)
+                                             max_tokens=800, max_retries=3)
             reflection = str(response.get("reflection", "")).strip()
             if not reflection:
                 return self._abstain(trace_id, outcome, ReasonCode.SCHEMA_VIOLATION)
             memory_eligibility = str(response.get("memory_eligibility", "reject"))
             return ReviewLabel(trace_id=trace_id, outcome_card_id=outcome.outcome_card_id,
                                status="complete", prompt_version=self.prompt_version, rationale=reflection,
-                               memory_eligibility=memory_eligibility)
+                               memory_eligibility=memory_eligibility,
+                               created_at=outcome.observed_at)
         except Exception:
             return self._abstain(trace_id, outcome, ReasonCode.MODEL_FAILURE)
 
@@ -49,4 +50,4 @@ class ReviewAgent:
         return ReviewLabel(trace_id=trace_id, outcome_card_id=outcome.outcome_card_id,
                            status="abstain", rationale="review unavailable or output schema rejected",
                            prompt_version=None,
-                           reason_codes=(reason,), memory_eligibility="reject")
+                           reason_codes=(reason,), memory_eligibility="reject", created_at=outcome.observed_at)

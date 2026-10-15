@@ -35,16 +35,20 @@ PIT 数据 → EvidenceCard → 个股研究 Agent → ClaimCard
 `review` 模式只读取已冻结的 `OrderPlan`、实际 `Fill` 和 PIT 行情，在 episode 到期、完全退出或 thesis 显式失效时结算唯一一张 `OutcomeCard`；没有成交时明确记录为反事实，不能当作真实收益。可选 Review Agent 只能解释完整客观结果；只有非 `abstain` 的复盘标签才可作为受控案例检索。项目不安装周频任务，人工按需要运行：
 
 ```powershell
-python scripts/research_run.py --mode execute --order-plan-id op_xxx --as-of 2026-10-06T20:00:00+00:00
-python scripts/research_run.py --mode review --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
-python scripts/research_run.py --mode review --trigger thesis_invalidated --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
+python scripts/backtest.py --phase review --order-plan-id op_xxx --as-of 2026-10-06T20:00:00+00:00
+python scripts/backtest.py --phase review --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
+python scripts/backtest.py --phase review --trigger thesis_invalidated --order-plan-id op_xxx --as-of 2026-11-01T20:00:00+00:00
 ```
 
-若只验证 OutcomeReviewFlow 是否完整接线、而不等待真实 T+1 成交与到期结算，可运行明确标注为离线 fixture 的单命令 smoke（不联网、不调用真实 LLM）：
+`--phase review` 会在给出 `--order-plan-id` 时先做 T+1 `execute` 成交、再扫描到期 Episode 结算；只给 `--as-of` 不给订单则只扫描已挂起到期的 Episode。
+
+若要从本地历史 news/market CSV 完整回放一遍研究→执行→复盘链路（诊断链路接线与回归，非实时可得性或 alpha 证明），运行 `backtest.py` 的默认 `full` 环节：
 
 ```powershell
-D:\Miniconda3\envs\trader\python.exe scripts/outcome_smoke.py
+python scripts/backtest.py --pool AAPL --start 2026-05-01   # 从缓存 CSV 逐交易日闭环，force 默认开
 ```
+
+`full` 逐交易日导入新闻 EvidenceCard、逐周补一张程序生成的 Market EvidenceCard，驱动 `run_research_round -> T+1 SimulatedExecution -> OutcomeReviewFlow`，研究节点与 Risk Critic 使用项目配置的真实 `LLMClient`；缺缓存标的先跑 `python scripts/backtest.py --phase collect --pool <SYM>` 补数据。历史新闻不带当时接收时间，导入时按 `available_at = published_at` 的明示回放近似处理；为稳定验收 Outcome 记忆链，`force`（默认开，`--no-force` 关）会让 Acceptance Harness 在 Critic 未否决时强制首轮产生一笔有本轮 ClaimCard 支撑的 `long/start`，并替代 Review 的 `memory_eligibility` 与后续 Committee 的 `calibration_episode_ids`，终端与 rationale 均带 `FORCED_ACCEPTANCE` 标记——这些不是 LLM 判断，其余节点不得伪造响应。`full` 与其余环节都统一写生产账本 `data/research/`，用 `python viz/server.py` 直接只读回放，或在 viz 前端选 `full` 节奏在线重放并逐交易日 SSE 推送。
 
 `--trigger exit|thesis_invalidated` 必须由人工明确给出；系统不会让模型自行宣布 thesis 失效。Committee 只收到同标的、同冻结 regime 的已验证 Outcome 摘要，它们不能写入本轮事实引用字段或覆盖 Risk Critic。
 
@@ -92,13 +96,13 @@ python -m pytest tests/research -q
 
 ## 运行入口：研究链主线（阶段 1-3）
 
-编排本体在 `agents/flow.py` 的 `run_research_round(FlowOptions, model=...)`：阶段门控与 trace_id 生成只在这一处。`scripts/research_run.py` 只暴露「跑全程」一个命令（默认 flow 的 `collect` + 注入模型，一条命令走完采集→建卡→冻结→研究图→委员会并逐节点打印）；`daily`（只补数据、不冻结）与 `decide`（不采集、从卡片池冻结后决策）是给外部定时调度器直接调用同一函数用的，不再各自养一份命令行参数装配。
+编排本体在 `agents/flow.py` 的 `run_research_round(FlowOptions, model=...)`：阶段门控与 trace_id 生成只在这一处。`scripts/backtest.py` 是主线唯一的回测/研究人类入口（合并原 `research_run.py` 与 `full_flow_backtest.py`），用 `--phase` 选环节、默认 `full`：`collect` 只联网补数据入正文库、`evidence` 日频建卡入池（= flow daily）、`decision` 冻结→研究图→委员会→OrderPlan（= flow decide + 注入模型）、`review` 成交+到期结算复盘、`full` 多周闭环回放。`daily`/`decide`/`execute` 等单节奏仍由外部定时调度器直接调用 `run_research_round` 同一函数，脚本不各养一份命令行装配。
 
 ```bash
-python scripts/research_run.py                                    # 全默认：10 只观察池 + data/account.json
-python scripts/research_run.py --pool NVDA AAPL                   # 只跑指定标的
-python scripts/research_run.py --account data/account.json        # 换账户文件
-python scripts/research_run.py --as-of 2026-10-03T18:00:00+00:00  # 历史时点回放（本轮新拉数据被 PIT 拒绝）
+python scripts/backtest.py --phase decision --pool NVDA AAPL      # 冻结→研究图→委员会→OrderPlan（需 data/account.json）
+python scripts/backtest.py --phase decision --as-of 2026-10-03T18:00:00+00:00  # 历史时点回放（本轮新拉数据被 PIT 拒绝）
+python scripts/backtest.py --phase evidence --as-of 2026-10-09T20:00:00+00:00  # 日频建卡入池，不冻结、不跑模型
+python scripts/backtest.py                                        # 默认 full：从缓存 CSV 的多周闭环回放
 ```
 
 - **全链需要真实账户。** `data/account.json` 至少含 `cash`/`positions`/`limits`（可带 `regime`、`turnover_cost_estimate`；`risk_state` 由 daily 从 PIT 日线重算并回写，不要求手填）；组合政策参数不在账户文件里，统一读自 `config.py`。缺真实账户时 flow 直接失败而不是退回占位值：Risk Critic 的规定是「缺 limits 或持仓状态不得当作放行」，占位账户只会烧出一轮全 `abstain` 的意图。`data/account*.json` 已进 `.gitignore`，仓库不代存持仓。
@@ -109,15 +113,18 @@ python scripts/research_run.py --as-of 2026-10-03T18:00:00+00:00  # 历史时点
 
 ## 可视化调试台（`viz/`）
 
-本地单人用的观测页：标准库 HTTP + SSE，只监听 `127.0.0.1`，前端为无构建的原生页面（`viz/server.py` + `viz/readmodel.py` + `viz/static/`）。它**自己不编排**：“跑全程”就是调 `run_research_round`，与命令行、定时调度器同一个函数；只是把模型客户端套一层事件包装，将每个阶段的流转、逐节点的注入输入/工具调用/JSON 输出实时推到前端便于溯源。唯一多出的节奏是“复用已冻结 Snapshot 只重跑研究图/委员会”，用于不重烧采集配额地反复调试。
+本地单人用的观测页：标准库 HTTP + SSE，只监听 `127.0.0.1`，前端为无构建的原生页面（`viz/server.py` + `viz/readmodel.py` + `viz/static/`）。它**自己不编排、不复制阶段门控**：`collect`/`decide` 调 `run_research_round`，`evidence` 调 flow `daily`，`review` 调 flow `execute` + `OutcomeScheduler.scan`，`full` 复用 `scripts/backtest.py` 抽出的 `run_replay(...)`——终端 print 与这里的 SSE 是同一事件流的两个 sink，与命令行、定时调度器全用同一批函数；只是把模型客户端套一层事件包装，将每阶段流转、逐节点注入输入/工具调用/JSON 输出、后半程 `Fill`/`Episode`/`OutcomeCard`/`ReviewLabel` 实时推到前端。唯一 flow 没有的直接调用是「复用已冻结 Snapshot 只重跑研究图/委员会」，用于不重烧采集配额地反复调试。
 
 ```bash
 python viz/server.py                            # 默认 http://127.0.0.1:8765
 python viz/server.py --port 9000                # 换端口
 python viz/server.py --runs-dir tmp/viz_runs    # 换观测产物目录
+python viz/server.py --ledger <某份账本副本>.db --raw <对应正文库目录>  # 只读回放指定账本（缺省指向 config 的研究账本）
 ```
 
-页面选中标的池/账户/阶段开关后点运行即可看逐阶段实时流转；历史运行事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略）仅供刷新后回看，权威审计仍是账本与 `logs/llm_calls.jsonl`。
+页面选中标的池/账户/阶段开关后点运行即可看逐阶段实时流转（`full`/`review` 会展开回放面板填 start/end/force 与复盘 OrderPlan）；裸 ID 的 chip 会顺 `/api/digest` 批量解析成一行摘要（不再只显短 ID，点开抽屉仍看全文）。历史运行事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略）仅供刷新后回看，权威审计仍是账本与 `logs/llm_calls.jsonl`（每次模型调用带 `trace_id/node/symbol/call_id` 关联键，与事件流的 `node_input/node_output` 同一 `call_id` 对齐，供审计 agent 回溯每个节点当时看到的证据）。
+
+「账本回放」Tab 直接读账本，覆盖阶段 1-6 全部对象：除前半程（Snapshot→证据/论断/研究包→意图→组合政策→OrderPlan）外，还展示后半程 `Fill`/`PositionEpisode`/`OutcomeCard`/`ReviewLabel`——点开 Episode 详情抽屉可顺着「结果卡→复盘标签→成交→引用该案例的意图」逐跳溯源，PortfolioIntent 抽屉则反查它经 `calibration_episode_ids` 引用的已验证案例，即「outcome→review→记忆注入→被 Committee 引用」这条经验闭环在前端可视化。`--ledger/--raw` 为只读覆盖，缺省仍指向 `config` 的研究账本；回测产物账本用该参数即可直接观测，不改默认路径。
 
 ## 运行回测
 
@@ -165,7 +172,7 @@ core/outcome/                   阶段 6 Outcome 计算与调度（OutcomeCalcul
 core/ppo/                       PPO 训练与预测（decision 的择时输入）
 utils/                          LLM 客户端、日志与 LLM 缓存 SQLite
 tests/research/                 阶段 0-6 契约、离线数据、审计、组合、执行与结果回归测试
-scripts/research_run.py         研究链唯一人类入口（一条命令跑全程；daily/decide 由调度器直接调 flow）
+scripts/backtest.py             主线统一回测/研究入口（--phase full/collect/evidence/decision/review，默认 full）
 scripts/run_backtest.py         统一回测入口
 scripts/train_ppo.py            PPO 训练入口
 models/                         PPO 模型归档

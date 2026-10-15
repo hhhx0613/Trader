@@ -26,7 +26,7 @@ from core.decision import AllocationConfig, CostLimits, CostModel, IntentConstra
 AS_OF = datetime(2026, 10, 5, 20, tzinfo=timezone.utc)
 
 # 决策节奏要求的真实账户字段；缺 limits/positions 时 flow 必须拒绝而不是退回占位
-ACCOUNT = {"cash": 50_000.0, "positions": [{"symbol": "AAPL", "quantity": 100, "avg_cost": 210.0}],
+ACCOUNT = {"cash": 50_000.0, "positions": [{"symbol": "AAPL", "quantity": 100, "avg_cost": 210.0, "last_price": 215.0}],
            "limits": {"max_concentration": 0.35}, "regime": "risk-on"}
 
 _CLAIM_ID = re.compile(r"'claim_id': '([^']+)'")
@@ -80,7 +80,7 @@ class FlowModel:
         if "'portfolio_state'" in message:
             cited = _CLAIM_ID.findall(message)
             return {"items": [{"symbol": "AAPL", "action": "long", "strength": 2, "priority": 1,
-                               "horizon_days": 20, "supporting_card_ids": cited[:1],
+                               "horizon_days": 20, "horizon_action": "start", "supporting_card_ids": cited[:1],
                                "opposing_card_ids": [], "rationale": "cited claim survives critic"}]}
         return {"verdict": "allow", "reasons": ["cited claims are consistent"], "card_ids": []}
 
@@ -190,6 +190,7 @@ def test_decide_selects_cards_from_pool_and_reaches_intent(stores, monkeypatch):
     assert ledger.get_intent(result.intent.intent_id).snapshot_id == result.snapshot.snapshot_id
     assert ledger.get_packet(result.packets[0].packet_id).snapshot_id == result.snapshot.snapshot_id
     assert result.portfolio is not None and ledger.get_order_plan(result.portfolio.order_plan.order_plan_id)
+    assert result.portfolio.order_plan.created_at == AS_OF  # historical T+1 must anchor to decision as_of
 
 
 def test_same_as_of_rerun_reports_a_readable_rejection(monkeypatch, stores):

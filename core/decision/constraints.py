@@ -1,6 +1,7 @@
 """将研究动作编译为确定性的仓位边界。"""
 
 from collections.abc import Mapping
+from datetime import datetime
 
 from core.database.contracts import IntentConstraints, PortfolioIntent, WeightConstraint
 from core.database.reasons import ReasonCode
@@ -35,6 +36,7 @@ class IntentConstraintBuilder:
         current_weights: Mapping[str, float],
         *,
         trace_id: str,
+        created_at: datetime | None = None,
     ) -> IntentConstraints:
         # 进入逐票翻译前，先按优先级把 MAX_HOLDINGS 名额分完：
         #   retained = 当前已持有且不被退出的票（天然占坑）；
@@ -98,9 +100,12 @@ class IntentConstraintBuilder:
                     trading_allowed=allowed,
                 )
             items.append(bound)
-        return IntentConstraints(
-            trace_id=trace_id,
-            intent_id=intent.intent_id,
-            snapshot_id=intent.snapshot_id,
-            items=tuple(items),
-        )
+        payload = {
+            "trace_id": trace_id,
+            "intent_id": intent.intent_id,
+            "snapshot_id": intent.snapshot_id,
+            "items": tuple(items),
+        }
+        if created_at is not None:
+            payload["created_at"] = created_at
+        return IntentConstraints(**payload)

@@ -6,15 +6,21 @@
  * 页面刷新后事件流不在内存时，可从「账本回放 → 历史运行」按 JSONL 重放。
  */
 
-const NODE_ORDER = ["event", "fundamental", "market", "risk_critic", "committee", "packet"];
-// 逐标的研究图里应当出现的节点：某节点可能一次模型都不调就弃权（见 SILENT_HINTS），
-// 前端仍要把它排进流水线，否则用户会误以为链路缺了一段。
-const GRAPH_NODES = ["event", "fundamental", "market", "risk_critic"];
-const SILENT_HINTS = {
-  fundamental: "无模型调用：Event 未立论，或本 Snapshot 无 filing 证据（跑全程会采集 SEC filings；若该 Snapshot 无披露卡则本节点干净弃权）",
-  event: "无模型调用：注入证据为空，节点直接弃权",
-  market: "无模型调用：行情类证据为空",
-  risk_critic: "无模型调用：上游无 ClaimCard 时不进入审计",
+// 阶段卡片点击过滤：节点调用与产出对象事件本身不带 stage，由前端按归属映射回阶段
+const NODE_STAGE = {
+  event: "research", fundamental: "research", market: "research", risk_critic: "research",
+  committee: "committee",
+};
+const KIND_STAGE = {
+  snapshot: "freeze", evidence_card: "ingest", claim_card: "research", research_packet: "research",
+  thesis_book: "committee", portfolio_intent: "committee", intent_constraints: "portfolio",
+  target_portfolio: "portfolio", risk_projected_portfolio: "portfolio", order_plan: "portfolio",
+  fill: "execute", position_episode: "execute", outcome_card: "outcome", review_label: "review",
+};
+// 阶段摘要里的 ID 字段→对象类型：这些字段渲染成可点 chip（带 digest 摘要），而不是裸 JSON 字符串
+const ID_FIELD_KIND = {
+  snapshot_id: "snapshot", intent_id: "portfolio_intent", order_plan_id: "order_plan",
+  thesis_book_id: "thesis_book", packet_ids: "research_packet", trace_id: "trace",
 };
 const KIND_LABEL = {
   snapshot: "Snapshot",
@@ -27,6 +33,10 @@ const KIND_LABEL = {
   target_portfolio: "TargetPortfolio",
   risk_projected_portfolio: "RiskProjectedPortfolio",
   order_plan: "OrderPlan",
+  fill: "Fill",
+  position_episode: "PositionEpisode",
+  outcome_card: "OutcomeCard",
+  review_label: "ReviewLabel",
   raw_record: "采集记录",
   unknown: "对象",
 };
@@ -39,13 +49,15 @@ const state = {
   events: [],
   stages: {},
   calls: new Map(),
-  order: [],
   objects: new Map(),
   tab: "stream",
   stageFilter: null,
   search: "",
   expanded: new Set(),
   es: null,
+  digest: new Map(),        // id → 摘要（null 表示已查过但账本里没有，避免重复请求）
+  pendingDigest: new Map(),  // id → kind，本轮渲染新出现的裸 ID，攒起来批量解析
+  digestTimer: null,
 };
 
 /* ---------------- 小工具 ---------------- */
@@ -78,7 +90,7 @@ async function api(path, opts) {
   return body;
 }
 
-const shortId = (id) => (id ? String(id).replace(/^(ev|cl|rp|tb|pi|snap|viz)_/, "").slice(0, 10) : "—");
+const shortId = (id) => (id ? String(id).replace(/^(ev|cl|rp|tb|pi|snap|viz|fill|ep|outcome|review)_/, "").slice(0, 10) : "—");
 const clip = (value, n = 90) => {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   if (!text) return "";
@@ -86,7 +98,10 @@ const clip = (value, n = 90) => {
 };
 const fmtTime = (ts) => (ts ? new Date(ts).toLocaleTimeString("zh-CN", { hour12: false }) : "");
 const num = (value) => (typeof value === "number" ? (Number.isInteger(value) ? value : value.toFixed(3)) : value);
+// 收益/回撤统一按百分比展示：OutcomeCard 的 net_return/active_return/max_drawdown 都是小数
+const pct = (value) => (typeof value === "number" ? (value * 100).toFixed(2) + "%" : "—");
 
+// 所有 JSON 区块一律默认折叠（用户要求）：open 形参保留但不再生效，避免逐处删参
 function jsonBlock(obj, label = "完整 JSON") {
   return h("details", {}, [h("summary", { text: label }),
     h("pre", { cls: "json", text: JSON.stringify(obj, null, 2) })]);
@@ -94,9 +109,51 @@ function jsonBlock(obj, label = "完整 JSON") {
 
 function idChip(kind, id, label) {
   if (!id) return h("span", { cls: "muted", text: "—" });
-  return h("span", {
-    cls: "id-chip", text: label || shortId(id), title: id,
-    on: { click: () => openDrawer(kind, id) },
+  const chip = h("span", { cls: "id-chip", title: id, on: { click: () => openDrawer(kind, id) } });
+  if (label) { chip.append(h("span", { text: label })); return chip; }
+  chip.dataset.id = id;  // 标记裸 ID chip，摘要到达后由 applyDigests 就地补上，不重渲染整页
+  chip.append(h("span", { text: shortId(id) }));
+  if (state.digest.has(id)) {
+    const note = digestLine(state.digest.get(id));
+    if (note) chip.append(h("span", { cls: "id-note", text: ` ${note}` }));
+  } else {
+    queueDigest(kind, id);  // 裸 ID 先占位，摘要到达后就地补上
+  }
+  return chip;
+}
+
+// 摘要行：标的 + 定性文本；意图理由等长文本全量展示不截断，缺内容时返回空串、chip 保持纯短 ID
+function digestLine(d) {
+  if (!d) return "";
+  return `${d.symbol ? d.symbol + " " : ""}${d.label || ""}`.trim();
+}
+
+function queueDigest(kind, id) {
+  if (state.digest.has(id) || state.pendingDigest.has(id)) return;
+  state.pendingDigest.set(id, kind);
+  if (!state.digestTimer) state.digestTimer = setTimeout(flushDigests, 150);
+}
+
+async function flushDigests() {
+  state.digestTimer = null;
+  if (!state.pendingDigest.size) return;
+  const entries = [...state.pendingDigest.entries()].slice(0, 200);
+  entries.forEach(([id]) => state.pendingDigest.delete(id));  // 只删本轮已送的，多余的留给下一拍
+  const refs = entries.map(([id, kind]) => `${kind}:${id}`);
+  try {
+    const { digests } = await api(`/api/digest?ids=${encodeURIComponent(refs.join(","))}`);
+    entries.forEach(([id]) => { if (!(id in (digests || {}))) state.digest.set(id, null); });
+    Object.entries(digests || {}).forEach(([id, d]) => state.digest.set(id, d));
+    applyDigests();  // 摘要到达后只给 chip 就地补一行字，不触发任何 tab 重渲染
+  } catch (e) { /* 解析失败保持裸 ID，不打断观测 */ }
+  if (state.pendingDigest.size && !state.digestTimer) state.digestTimer = setTimeout(flushDigests, 150);
+}
+
+function applyDigests() {
+  document.querySelectorAll(".id-chip[data-id]").forEach((chip) => {
+    if (chip.querySelector(".id-note")) return;
+    const note = digestLine(state.digest.get(chip.dataset.id));
+    if (note) chip.append(h("span", { cls: "id-note", text: ` ${note}` }));
   });
 }
 
@@ -146,11 +203,17 @@ function buildSources() {
   state.meta.run_modes.forEach((mode, index) => {
     box.append(h("label", { cls: "check" }, [
       h("input", { type: "radio", name: "source", value: mode.value, ...(index === 0 ? { checked: "" } : {}),
-        on: { change: () => $("#snapshotPick").classList.toggle("hidden", mode.value !== "snapshot") } }),
+        on: { change: () => syncSourcePanels(mode.value) } }),
       h("span", { text: mode.label }),
     ]));
   });
-  $("#snapshotPick").classList.add("hidden");
+  syncSourcePanels(state.meta.run_modes[0].value);
+}
+
+// snapshot 与 full/review 节奏各有专属参数：选中时才展开对应面板，避免无关输入混进载荷
+function syncSourcePanels(mode) {
+  $("#snapshotPick").classList.toggle("hidden", mode !== "snapshot");
+  $("#replayPick").classList.toggle("hidden", !(mode === "full" || mode === "review"));
 }
 
 function buildProviders() {
@@ -235,6 +298,10 @@ function currentOptions() {
     run_research: $("#runResearch").checked,
     run_committee: $("#runCommittee").checked,
     snapshot_id: mode === "snapshot" ? $("#snapshotSelect").value : null,
+    start: $("#replayStart").value.trim() || null,
+    end: $("#replayEnd").value.trim() || null,
+    force: $("#forceReplay").checked,
+    order_plan_id: $("#orderPlanId").value.trim() || null,
     account_state: account,
   };
 }
@@ -289,10 +356,12 @@ function resetView(keepConfig) {
   state.events = [];
   state.stages = {};
   state.calls.clear();
-  state.order = [];
   state.objects.clear();
   state.expanded.clear();
   state.stageFilter = null;
+  streamView.built = false;  // 视图重建：否则增量分支会对着已清空的列表只追加新事件
+  dirty.pipeline = true;
+  dirty.objects = true;
   state.runId = keepConfig ? state.runId : null;
   state.running = false;
   if (!keepConfig) { setStatus("idle", "待命"); $("#runId").textContent = ""; $("#btnCancel").disabled = true; }
@@ -313,12 +382,15 @@ function scheduleRender() {
   requestAnimationFrame(() => { renderQueued = false; renderAll(); });
 }
 
+// 脏区标记：每条事件只标记受影响区域，避免一条消息就把阶段卡片/对象表全部重建
+const dirty = { pipeline: true, objects: true };
+
 function ingest(event) {
   state.events.push(event);
   switch (event.type) {
-    case "stage_start": state.stages[event.stage] = { status: "running", label: event.label, meta: event, started: event.ts }; break;
-    case "stage_done": state.stages[event.stage] = { status: "done", label: event.label, summary: event.summary, duration_ms: event.duration_ms }; break;
-    case "stage_skip": state.stages[event.stage] = { status: "skipped", label: event.label, reason: event.reason }; break;
+    case "stage_start": state.stages[event.stage] = { status: "running", label: event.label, meta: event, started: event.ts }; dirty.pipeline = true; break;
+    case "stage_done": state.stages[event.stage] = { status: "done", label: event.label, summary: event.summary, duration_ms: event.duration_ms }; dirty.pipeline = true; break;
+    case "stage_skip": state.stages[event.stage] = { status: "skipped", label: event.label, reason: event.reason }; dirty.pipeline = true; break;
     case "run_meta": state.runId = event.run_id; state.options = event.options || null; $("#runId").textContent = event.run_id; break;
     case "run_end":
       state.running = false;
@@ -332,11 +404,13 @@ function ingest(event) {
       const call = touchCall(event);
       call.output = event;
       indexCallObjects(call);
+      dirty.objects = true;
       break;
     }
     case "object":
       if (event.id && event.kind !== "raw_record") state.objects.set(event.id, event);
       else state.objects.set(`${event.kind}:${state.events.length}`, event);
+      dirty.objects = true;
       break;
     default: break;
   }
@@ -347,7 +421,6 @@ function touchCall(event) {
   const key = event.call_id || `${event.node}:${event.symbol}:${state.events.length}`;
   if (!state.calls.has(key)) {
     state.calls.set(key, { key, node: event.node || "unknown", symbol: event.symbol || "", tools: [] });
-    state.order.push(key);
   }
   return state.calls.get(key);
 }
@@ -365,7 +438,14 @@ function indexCallObjects(call) {
 
 /* ---------------- 渲染 ---------------- */
 
-function renderAll() { renderPipeline(); renderCounter(); renderActiveTab(); }
+// 事件驱动的渲染入口：只重建脏区；事件流自身走增量追加（见 renderStream），
+// 所以一条普通消息不会引起整页闪烁或滚动位置丢失
+function renderAll() {
+  if (dirty.pipeline) { renderPipeline(); dirty.pipeline = false; }
+  renderCounter();
+  if (state.tab === "stream") renderStream();
+  else if (state.tab === "objects" && dirty.objects) { renderObjects(); dirty.objects = false; }
+}
 
 function renderCounter() {
   $("#counter").textContent =
@@ -398,6 +478,23 @@ function summarizeStage(info) {
   if (info.status === "skipped") lines.push(h("div", { cls: "muted", text: info.reason || "跳过" }));
   if (info.status === "running") lines.push(h("div", { text: "执行中…" }));
   const s = info.summary;
+  if (s && s.via_replay) {
+    // 闭环回放摘要：与联网节奏的 summary 形状不同，单独渲染计数 + ID chip，避免复用上面的分支出现 undefined
+    if (s.note) lines.push(h("div", { cls: "muted", text: s.note }));
+    const parts = [];
+    const push = (label, v) => { if (v != null && v !== "") parts.push(label + " " + v); };
+    if (s.market_bars) push("行情bar", Object.values(s.market_bars).reduce((a, b) => a + b, 0));
+    push("新闻天", s.news_days); push("卡片", s.cards); push("Packet", s.packets);
+    push("订单", s.orders); push("成交", s.fills); push("持仓集", s.episodes);
+    push("结算", s.outcomes); push("复盘", s.reviews);
+    if (parts.length) lines.push(h("div", { text: parts.join(" · ") }));
+    if (s.snapshot_id) lines.push(h("div", {}, [h("span", { text: "快照 " }), idChip("snapshot", s.snapshot_id)]));
+    if (s.intent_id) lines.push(h("div", {}, [h("span", { text: "意图 " }), idChip("portfolio_intent", s.intent_id)]));
+    if (s.order_plan_id) lines.push(h("div", {}, [h("span", { text: "订单计划 " }), idChip("order_plan", s.order_plan_id)]));
+    if (s.actions && s.actions.length) lines.push(h("div", { cls: "muted tiny", text: clip(s.actions.join(" "), 90) }));
+    if (s.eligibility && s.eligibility.length) lines.push(h("div", { cls: "muted tiny", text: "记忆资格 " + clip(s.eligibility.join(" "), 90) }));
+    return lines;
+  }
   if (s) {
     if (s.records != null) {
       const counts = Object.entries(s.counts || {}).map(([k, v]) => k + ":" + v).join(" ");
@@ -423,24 +520,85 @@ function matchesSearch(text) {
   return !state.search || String(text).toLowerCase().includes(state.search);
 }
 
+// 事件归属的阶段列表：自带 stage（可能是逗号分隔的多阶段）优先，
+// 否则按节点/对象类型映射；未归属事件（通用日志等）在任何过滤下都不显示
+function eventStages(event) {
+  if (event.stage) return String(event.stage).split(",");
+  if (event.type === "node_input" || event.type === "node_output" || event.type === "tool_call") {
+    return NODE_STAGE[event.node] ? [NODE_STAGE[event.node]] : [];
+  }
+  if (event.type === "object") return KIND_STAGE[event.kind] ? [KIND_STAGE[event.kind]] : [];
+  return [];
+}
+
+function stageFilterLabel(value) {
+  const hit = ((state.meta || {}).stages || []).find((s) => s.value === value);
+  return hit ? hit.label : value;
+}
+
 /* ---------- 事件流 ---------- */
+
+// 增量渲染台账：sig 是过滤条件指纹，同一指纹下匹配集只在尾部增长；
+// consumed 记录已渲染的匹配事件数，rows 是 DOM 里现存行数（上限 400）
+const streamView = { sig: null, built: false, consumed: 0, rows: 0 };
+
+const streamNoteText = (total) => `仅渲染最近 400 条（共 ${total} 条），可用过滤框缩小范围`;
 
 function renderStream() {
   const pane = $("#tab-stream");
-  pane.textContent = "";
-  const events = state.events.filter((e) => (!state.stageFilter || e.stage === state.stageFilter || e.type === "stage_start" || e.type === "stage_done") &&
+  const sig = `${state.stageFilter}\u0000${state.search}`;
+  const matched = state.events.filter((e) => (!state.stageFilter || eventStages(e).includes(state.stageFilter)) &&
     matchesSearch(e.text || e.tool || e.kind || ""));
-  if (!events.length) { pane.append(h("div", { cls: "empty", text: "暂无事件：左侧配置后点「运行」" })); return; }
-  const recent = events.slice(-400);
-  if (recent.length < events.length) {
-    pane.append(h("div", { cls: "muted tiny", text: `仅渲染最近 400 条（共 ${events.length} 条），可用过滤框缩小范围` }));
+  if (streamView.built && sig === streamView.sig) {
+    // 增量路径：已有行不动，滚动位置与展开态保留；新事件尾部追加，超上限从头修剪
+    const fresh = matched.slice(streamView.consumed);
+    if (fresh.length) {
+      const empty = pane.querySelector(".empty");
+      if (empty) empty.remove();
+      fresh.forEach((event) => pane.append(streamRow(event)));
+      streamView.consumed = matched.length;
+      streamView.rows += fresh.length;
+      while (streamView.rows > 400) {
+        const first = pane.querySelector(".evt");
+        if (!first) break;
+        first.remove();
+        streamView.rows -= 1;
+      }
+    }
+    let note = pane.querySelector(".stream-note");
+    if (matched.length > 400) {
+      if (!note) { note = h("div", { cls: "muted tiny stream-note" }); pane.prepend(note); }
+      note.textContent = streamNoteText(matched.length);
+    } else if (note) note.remove();
+    return;
+  }
+  // 首次/过滤条件变化/视图重置：全量重建
+  pane.textContent = "";
+  streamView.built = true;
+  streamView.sig = sig;
+  streamView.consumed = matched.length;
+  if (!matched.length) {
+    streamView.rows = 0;
+    const why = state.stageFilter
+      ? `阶段「${stageFilterLabel(state.stageFilter)}」暂无匹配事件（再点该卡片可取消过滤）`
+      : state.search ? "没有匹配的事件" : "暂无事件：左侧配置后点「运行」";
+    pane.append(h("div", { cls: "empty", text: why })); return;
+  }
+  const recent = matched.slice(-400);
+  streamView.rows = recent.length;
+  if (recent.length < matched.length) {
+    pane.append(h("div", { cls: "muted tiny stream-note", text: streamNoteText(matched.length) }));
   }
   recent.forEach((event) => pane.append(streamRow(event)));
 }
 
 function streamRow(event) {
-  const row = h("div", { cls: `event ${event.type}${event.level ? ` ${event.level}` : ""}` });
+  const key = `ev:${event.seq}`;
+  const open = state.expanded.has(key);
+  const expandable = hasDetail(event);
+  const row = h("div", { cls: `evt ${event.type}${event.level ? ` ${event.level}` : ""}${expandable ? " expandable" : ""}${open ? " open" : ""}` });
   const head = h("div", { cls: "event-head" });
+  if (expandable) head.append(h("span", { cls: "caret", text: open ? "▾" : "▸" }));
   head.append(h("span", { cls: "t", text: fmtTime(event.ts) }));
   const label = { stage_start: "阶段开始", stage_done: "阶段完成", stage_skip: "阶段跳过", node_input: "节点输入",
     node_output: "节点输出", tool_call: "工具调用", object: "对象", log: "日志", run_meta: "运行元数据",
@@ -449,16 +607,49 @@ function streamRow(event) {
   if (event.symbol) head.append(h("span", { cls: "mono tiny muted", text: event.symbol }));
   head.append(h("span", { cls: "txt", text: eventText(event) }));
   row.append(head);
-  const body = eventBody(event);
-  if (body) row.append(h("div", { cls: "event-body" }, body));
+  if (!expandable) return row;
+  // 整行任意位置点击展开/收起；详情里的可交互元素（chip/折叠区/JSON 文本）不连带收起
+  row.addEventListener("click", (e) => {
+    if (e.target.closest("summary, .id-chip, a, button, pre")) return;
+    toggleRowDetail(row, event, key);
+  });
+  if (open) row.append(h("div", { cls: "event-body" }, eventBody(event)));
   return row;
+}
+
+// 展开/收起只改被点那一行的 DOM，不重渲染事件流（避免点击后整屏闪）
+function toggleRowDetail(row, event, key) {
+  const open = !state.expanded.has(key);
+  if (open) state.expanded.add(key); else state.expanded.delete(key);
+  row.classList.toggle("open", open);
+  const caret = row.querySelector(".caret");
+  if (caret) caret.textContent = open ? "▾" : "▸";
+  const body = row.querySelector(":scope > .event-body");
+  if (body) body.remove();
+  if (open) row.append(h("div", { cls: "event-body" }, eventBody(event)));
+}
+
+// 条目是否有可展开详情：原「Agent 节点」tab 的卡片展开能力已并入这里
+function hasDetail(event) {
+  if (event.type === "node_input") return !!event.prompt;
+  if (event.type === "node_output") return event.output != null || !!event.error;
+  return ["tool_call", "object", "stage_done", "run_meta"].includes(event.type);
 }
 
 function eventText(event) {
   switch (event.type) {
     case "node_input": {
       const model = event.model ? " · " + event.model : "";
-      return "输入注入：" + (event.evidence_count || 0) + " 条证据" + model;
+      const prompt = event.prompt || {};
+      // risk_critic 注入的是上游论点、committee 注入的是研究包，evidence_count 恒为 0，不补读会误导
+      const claims = prompt.claims || [];
+      const packets = prompt.packets || [];
+      const episodes = Object.values(prompt.historical_episodes_by_symbol || {}).flat();
+      let unit = "条证据", n = event.evidence_count || 0;
+      if (!n && packets.length) { unit = "个研究包"; n = packets.length; }
+      else if (!n && claims.length) { unit = "条论点"; n = claims.length; }
+      const mem = episodes.length ? ` · 记忆注入 ${episodes.length} 笔` : "";
+      return "输入注入：" + (n || 0) + " " + unit + mem + model;
     }
     case "node_output": return event.error ? "失败：" + event.error
       : "输出：" + clip(summarizeOutput(event.output), 120);
@@ -467,7 +658,7 @@ function eventText(event) {
       const extra = event.kind === "evidence_card" ? " · " + event.data.kind + "/" + event.data.symbol : "";
       return (KIND_LABEL[event.kind] || event.kind) + " " + shortId(event.id) + extra;
     }
-    case "stage_done": return event.label + " 完成 · " + clip(event.summary, 110);
+    case "stage_done": return event.label + " 完成 · " + clip(summaryLine(event.summary), 140);
     case "stage_skip": return event.label + " 跳过 · " + event.reason;
     case "run_end": return "运行" + ({ done: "完成", cancelled: "已停止", failed: "失败" }[event.state] || event.state) + " · " + event.duration_s + "s";
     default: return event.text || "";
@@ -490,139 +681,31 @@ function summarizeOutput(output) {
 
 function eventBody(event) {
   const out = [];
-  if (event.type === "node_input" && event.prompt) {
-    out.push(jsonBlock(event.prompt, "注入输入（正文按 320 字截断）"));
-  } else if (event.type === "node_output") {
-    if (event.output != null) out.push(jsonBlock(event.output, "模型输出"));
-    if (event.error) out.push(h("div", { cls: "error", text: event.error }));
-  } else if (event.type === "tool_call") {
-    if (event.evidence_ids && event.evidence_ids.length) {
-      out.push(h("div", { cls: "link-list" }, event.evidence_ids.slice(0, 12).map((id) => idChip("evidence_card", id))));
-    }
-    if (event.note) out.push(h("div", { cls: "muted tiny", text: event.note }));
-    if (event.error) out.push(h("div", { cls: "error tiny", text: JSON.stringify(event.error) }));
-    if (event.result_raw) out.push(h("div", { cls: "muted tiny", text: event.result_raw }));
-    out.push(jsonBlock({ arguments: event.arguments }, "工具参数"));
-  } else if (event.type === "object" || event.type === "stage_done" || event.type === "run_meta") {
-    out.push(jsonBlock(event.data || event.options || event.summary || event, "详情"));
-  }
-  return out.filter(Boolean);
-}
-
-/* ---------- Agent 节点 ---------- */
-
-function renderNodes() {
-  const pane = $("#tab-nodes");
-  pane.textContent = "";
-  const keys = state.order.filter((k) => {
-    const call = state.calls.get(k);
-    return (!state.stageFilter || (state.stageFilter === "committee") === (call.node === "committee")) &&
-      matchesSearch(`${call.node} ${call.symbol} ${clip(call.input && call.input.prompt, 9999)}`);
-  });
-  const bySymbol = groupCalls(keys);
-  if (!bySymbol.size && !state.options) {
-    pane.append(h("div", { cls: "empty", text: "还没有 Agent 调用记录" }));
-    return;
-  }
-  bySymbol.forEach((calls, symbol) => {
-    const block = h("div", { cls: "symbol-block" }, [h("h3", { text: symbol || "（无标的）" })]);
-    nodesForSymbol(symbol, calls).forEach((item) =>
-      block.append(typeof item === "string" ? silentCard(item, symbol) : nodeCard(item)));
-    packetsFor(symbol).forEach((p) => block.append(packetLine(p)));
-    pane.append(block);
-  });
-}
-
-function groupCalls(keys) {
-  const bySymbol = new Map();
-  keys.forEach((k) => {
-    const call = state.calls.get(k);
-    const list = bySymbol.get(call.symbol) || [];
-    list.push(call);
-    bySymbol.set(call.symbol, list);
-  });
-  bySymbol.forEach((calls) => calls.sort((a, b) => NODE_ORDER.indexOf(a.node) - NODE_ORDER.indexOf(b.node)));
-  // 本轮标的池里尚未产生任何调用的标的先占位，让「阶段流转到哪了」一眼可见
-  const pool = state.options && state.options.pool;
-  if (pool && state.stages.research) pool.forEach((s) => { if (!bySymbol.has(s)) bySymbol.set(s, []); });
-  return bySymbol;
-}
-
-// 期望节点与实际调用对齐：缺的节点只有在「流水线已越过它」时才判为静默弃权，否则只是还没轮到
-function nodesForSymbol(symbol, calls) {
-  const present = new Set(calls.map((c) => c.node));
-  const wanted = GRAPH_NODES.filter((n) => !present.has(n));
-  if (!wanted.length) return calls;
-  const past = present.has("risk_critic") ||
-    packetsFor(symbol).length > 0 ||
-    (state.stages.research || {}).status === "done" ||
-    !!((state.stages.committee || {}).status);
-  const silent = past ? wanted : [];
-  const merged = calls.concat(silent);
-  return merged.sort((a, b) => {
-    const an = typeof a === "string" ? a : a.node;
-    const bn = typeof b === "string" ? b : b.node;
-    return NODE_ORDER.indexOf(an) - NODE_ORDER.indexOf(bn);
-  });
-}
-
-function silentCard(node, symbol) {
-  return h("div", { cls: "node-card silent" }, [
-    h("div", { cls: "node-head" }, [
-      badge(node, node),
-      h("span", { cls: "title muted", text: SILENT_HINTS[node] || "无模型调用" }),
-      h("span", { cls: "spacer" }),
-      badge("skipped", "未触发"),
-    ]),
-  ]);
-}
-
-function packetsFor(symbol) {
-  return [...state.objects.values()].filter((o) => o.kind === "research_packet" && (!symbol || o.symbol === symbol));
-}
-
-function packetLine(object) {
-  const p = object.data;
-  return h("div", { cls: "node-card" }, [
-    h("div", { cls: "node-head" }, [
-      badge("packet", "packet"),
-      h("span", { cls: "title", text: "程序收口 ResearchPacket" }),
-      idChip("research_packet", object.id, object.id),
-      h("span", { cls: "spacer" }),
-      h("span", { cls: "muted tiny", text: `引用覆盖 ${(p.citation_coverage * 100).toFixed(0)}%` }),
-      badge(p.critic.verdict === "allow" ? "done" : p.critic.verdict === "abstain" ? "warn" : "failed", `critic=${p.critic.verdict}`),
-    ]),
-  ]);
-}
-
-function nodeCard(call) {
-  const card = h("div", { cls: "node-card" });
-  const head = h("div", {
-    cls: "node-head",
-    on: { click: () => { state.expanded.has(call.key) ? state.expanded.delete(call.key) : state.expanded.add(call.key); renderNodes(); } },
-  }, [
-    badge(call.node, call.node),
-    h("span", { cls: "title", text: call.input ? clip(call.input.model, 40) : "等待输入" }),
-    h("span", { cls: "muted tiny", text: `证据 ${call.input ? call.input.evidence_count || 0 : 0}` }),
-    h("span", { cls: "muted tiny", text: `工具 ${call.tools.length}` }),
-    h("span", { cls: "spacer" }),
-    call.output ? (call.output.error ? badge("failed", "失败") : badge("done", `${(call.output.duration_ms / 1000).toFixed(1)}s`))
-      : badge("running", "进行中"),
-  ]);
-  card.append(head);
-  if (!state.expanded.has(call.key)) return card;
-
-  if (call.input) {
-    const evidence = (call.input.prompt || {}).evidence || [];
-    const section = h("div", { cls: "node-section" }, [h("h4", { text: `注入输入 · ${evidence.length} 条证据` })]);
-    const meta = call.input.prompt || {};
+  if (event.type === "node_input") {
+    const meta = event.prompt || {};
+    const evidence = meta.evidence || [];
+    const claims = meta.claims || [];
+    const packets = meta.packets || [];
+    const episodes = Object.entries(meta.historical_episodes_by_symbol || {}).flatMap(([sym, list]) => list.map((e) => [sym, e]));
+    const counts = [];
+    if (evidence.length || (!claims.length && !packets.length)) counts.push(`${event.evidence_count || evidence.length} 条证据`);
+    if (claims.length) counts.push(`${claims.length} 条上游论点`);
+    if (packets.length) counts.push(`${packets.length} 个研究包`);
+    if (episodes.length) counts.push(`${episodes.length} 笔历史记忆`);
+    const section = h("div", { cls: "node-section" }, [
+      h("h4", { text: `注入输入 · ${counts.join(" · ") || "无证据/论点批次"}（正文按 320 字截断）` })]);
     ["agent", "instruction", "symbol", "as_of", "prompt_version"].forEach((k) => {
       if (meta[k] != null) section.append(h("div", { cls: "claim-line" }, [
         h("span", { cls: "st", text: `${k}: ` }), h("span", { text: clip(meta[k], 160) })]));
     });
-    if (call.input.upstream_claim_ids && call.input.upstream_claim_ids.length) {
+    if ((event.upstream_claim_ids || []).length) {
       section.append(h("div", { cls: "claim-line" }, [h("span", { cls: "st", text: "上游论点: " }),
-        ...call.input.upstream_claim_ids.map((id) => idChip("claim_card", id))]));
+        ...event.upstream_claim_ids.map((id) => idChip("claim_card", id))]));
+    }
+    if (episodes.length) {
+      // 委员会的记忆注入链路可视化：每笔 episode 直接成 chip，可点开看结算/复盘全文
+      section.append(h("div", { cls: "claim-line" }, [h("span", { cls: "st", text: "记忆注入: " }),
+        ...episodes.map(([sym, e]) => idChip("position_episode", String(e.episode_id || e)))]));
     }
     if (evidence.length) {
       section.append(h("details", {}, [h("summary", { text: "证据清单（点开逐张引用）" }),
@@ -630,31 +713,77 @@ function nodeCard(call) {
           idChip("evidence_card", e.evidence_id, shortId(e.evidence_id)),
           h("span", { cls: "muted", text: ` ${e.source || ""} · ${clip(e.title, 70)}` })]))) ]));
     }
-    section.append(jsonBlock(meta, "完整注入 JSON"));
-    card.append(section);
+    section.append(jsonBlock(meta, "完整注入 JSON", true));
+    out.push(section);
+  } else if (event.type === "node_output") {
+    const section = h("div", { cls: "node-section" }, [
+      h("h4", { text: `模型输出${event.output ? " · " + clip(summarizeOutput(event.output), 60) : ""}` })]);
+    if (event.error) section.append(h("div", { cls: "error", text: event.error }));
+    const output = event.output;
+    if (output && typeof output === "object") {
+      section.append(outputView(output));
+      section.append(jsonBlock(output, "原始输出 JSON", true));
+    } else if (output != null) {
+      section.append(h("div", { text: String(output) }));
+    }
+    out.push(section);
+  } else if (event.type === "tool_call") {
+    const section = h("div", { cls: "node-section" }, [h("h4", { text: "工具调用" })]);
+    if (event.evidence_ids && event.evidence_ids.length) {
+      section.append(h("div", { cls: "link-list" }, event.evidence_ids.slice(0, 12).map((id) => idChip("evidence_card", id))));
+    }
+    if (event.note) section.append(h("div", { cls: "muted tiny", text: event.note }));
+    if (event.error) section.append(h("div", { cls: "error tiny", text: JSON.stringify(event.error) }));
+    if (event.result_raw) section.append(h("div", { cls: "muted tiny", text: event.result_raw }));
+    section.append(jsonBlock({ arguments: event.arguments }, "工具参数", true));
+    out.push(section);
+  } else if (event.type === "stage_done") {
+    // 摘要逐字段平铺，ID 字段走 chip 解析出摘要；原始 JSON 只作兜底折叠在下方
+    out.push(h("div", { cls: "node-section" }, [h("h4", { text: "阶段产出" }), summaryView(event.summary)]));
+    out.push(jsonBlock(event.summary, "原始 JSON"));
+  } else if (event.type === "object" || event.type === "run_meta") {
+    out.push(jsonBlock(event.data || event.options || event, "详情", true));
   }
-
-  const toolSection = h("div", { cls: "node-section" }, [h("h4", { text: `工具调用 · ${call.tools.length} 次` })]);
-  if (!call.tools.length) toolSection.append(h("div", { cls: "muted tiny", text: "本节点未发起补查（证据由注入 hook 直接提供）" }));
-  call.tools.forEach((tool) => toolSection.append(h("div", { cls: "tool-line" }, [
-    h("span", { cls: "nm", text: tool.tool }),
-    h("span", { text: clip(tool.arguments, 80) }),
-    h("span", { cls: "muted", text: `→ ${tool.result_count} 条` }),
-    ...(tool.evidence_ids || []).slice(0, 6).map((id) => idChip("evidence_card", id)),
-    tool.note ? h("span", { cls: "muted tiny", text: tool.note }) : null,
-  ])));
-  card.append(toolSection);
-
-  const outSection = h("div", { cls: "node-section" }, [h("h4", { text: `模型输出${call.output && call.output.output ? " · " + clip(summarizeOutput(call.output.output), 60) : ""}` })]);
-  if (call.output && call.output.error) outSection.append(h("div", { cls: "error", text: call.output.error }));
-  const output = call.output && call.output.output;
-  if (output) {
-    outSection.append(outputView(output));
-    outSection.append(jsonBlock(output, "原始输出 JSON"));
-  } else if (!call.output) outSection.append(h("div", { cls: "muted tiny", text: "等待模型返回" }));
-  card.append(outSection);
-  return card;
+  return out.filter(Boolean);
 }
+
+// 行头一行摘要：滤掉 via_replay 等内部键，ID 用 shortId，对象/数组折成计数，不再直出 JSON
+function summaryLine(s) {
+  if (!s || typeof s !== "object") return String(s || "");
+  return Object.entries(s)
+    .filter(([k, v]) => k !== "via_replay" && v != null && v !== "" && v !== false)
+    .map(([k, v]) => {
+      if (ID_FIELD_KIND[k]) return Array.isArray(v) ? `${k.replace(/_id$/, "s")}:${v.map(shortId).join(" ")}` : `${k.replace(/_id$/, "")}:${shortId(String(v))}`;
+      if (typeof v === "object") return `${k}:${Array.isArray(v) ? v.length : "…"}`;
+      return `${k}=${v}`;
+    })
+    .join(" · ");
+}
+
+function summaryView(summary) {
+  const box = h("div");
+  if (!summary || typeof summary !== "object") return box;
+  Object.entries(summary).forEach(([key, value]) => {
+    if (value == null || value === "" || value === false || key === "via_replay") return;
+    const line = h("div", { cls: "claim-line" }, [h("span", { cls: "st", text: `${key}: ` })]);
+    const kind = ID_FIELD_KIND[key];
+    if (kind && Array.isArray(value)) {
+      value.forEach((id) => line.append(idChip(kind, id), document.createTextNode(" ")));
+    } else if (kind) {
+      line.append(idChip(kind, String(value)));
+    } else if (key === "items" && Array.isArray(value)) {
+      line.append(h("span", { text: value.map((i) => `${i.symbol}:${i.action}(强度${i.strength},P${i.priority})`).join(" ") }));
+    } else if (typeof value === "object") {
+      line.append(h("span", { text: JSON.stringify(value) }));
+    } else {
+      line.append(h("span", { text: String(value) }));
+    }
+    box.append(line);
+  });
+  return box;
+}
+
+/* ---------- 模型输出的结构化视图（事件流 node_output 展开详情用） ---------- */
 
 function outputView(output) {
   const box = h("div");
@@ -675,12 +804,22 @@ function outputView(output) {
       h("ul", {}, (output.reasons || []).map((r) => h("li", { text: clip(r, 180) }))),
     ]));
   }
-  (output.items || []).forEach((i) => box.append(h("div", { cls: "claim-line" }, [
-    badge(i.action === "abstain" ? "warn" : "done", `${i.symbol} ${i.action}`),
-    h("span", { cls: "muted tiny", text: `强度 ${i.strength} · 优先级 ${i.priority}` }),
-    h("div", { text: clip(i.rationale, 200) }),
-    ...(i.supporting_card_ids || []).map((id) => idChip("claim_card", id)),
-  ])));
+  // 委员会 intent 的每条决策：结构化平铺全部内部字段，理由全文不截断（用户要求）
+  (output.items || []).forEach((i) => {
+    const line = h("div", { cls: "claim-line" }, [
+      badge(i.action === "abstain" ? "warn" : "done", `${i.symbol} ${i.action}`),
+      h("span", { cls: "muted tiny", text: ` 持有 ${i.horizon_days != null ? i.horizon_days + "d" : "—"} · 强度 ${i.strength} · 优先级 P${i.priority}` }),
+    ]);
+    if (i.rationale) line.append(h("div", { text: i.rationale }));
+    if (i.no_trade_reason) line.append(h("div", { cls: "muted tiny", text: "不交易原因：" + i.no_trade_reason }));
+    if ((i.supporting_card_ids || []).length) line.append(h("div", { cls: "claim-line" }, [
+      h("span", { cls: "st", text: "引用卡: " }), ...i.supporting_card_ids.map((id) => idChip("claim_card", id))]));
+    if ((i.opposing_card_ids || []).length) line.append(h("div", { cls: "claim-line" }, [
+      h("span", { cls: "st", text: "反方卡: " }), ...i.opposing_card_ids.map((id) => idChip("claim_card", id))]));
+    if ((i.calibration_episode_ids || []).length) line.append(h("div", { cls: "claim-line" }, [
+      h("span", { cls: "st", text: "校准记忆: " }), ...i.calibration_episode_ids.map((id) => idChip("position_episode", id))]));
+    box.append(line);
+  });
   return box;
 }
 
@@ -689,15 +828,19 @@ function outputView(output) {
 function renderObjects() {
   const pane = $("#tab-objects");
   pane.textContent = "";
-  const items = [...state.objects.values()];
-  if (!items.length) { pane.append(h("div", { cls: "empty", text: "还没有对象产出" })); return; }
+  const items = [...state.objects.values()].filter((o) => !state.stageFilter || KIND_STAGE[o.kind] === state.stageFilter);
+  if (!items.length) {
+    pane.append(h("div", { cls: "empty", text: state.stageFilter ? `阶段「${stageFilterLabel(state.stageFilter)}」没有产出对象（再点阶段卡片可取消过滤）` : "还没有对象产出" }));
+    return;
+  }
   const groups = new Map();
   items.forEach((o) => {
     const kind = o.kind || "unknown";
     groups.set(kind, [...(groups.get(kind) || []), o]);
   });
   ["snapshot", "evidence_card", "claim_card", "research_packet", "thesis_book", "portfolio_intent",
-    "intent_constraints", "target_portfolio", "risk_projected_portfolio", "order_plan", "raw_record"]
+    "intent_constraints", "target_portfolio", "risk_projected_portfolio", "order_plan",
+    "fill", "position_episode", "outcome_card", "review_label", "raw_record"]
     .filter((kind) => groups.has(kind))
     .forEach((kind) => pane.append(objectGroup(kind, groups.get(kind))));
   [...groups.keys()].filter((kind) => !KIND_LABEL[kind])
@@ -736,6 +879,10 @@ function objectColumns(kind) {
     target_portfolio: ["Target", "暴露", "现金", "weights", "trace"],
     risk_projected_portfolio: ["Projected", "暴露", "现金", "调整", "trace"],
     order_plan: ["OrderPlan", "orders", "延后", "trace"],
+    fill: ["Fill", "标的", "方向", "成交/请求", "成交价", "状态", "trace"],
+    position_episode: ["Episode", "标的", "状态", "锚定→到期", "horizon", "rev", "trace"],
+    outcome_card: ["Outcome", "标的", "净收益", "超额", "最大回撤", "观察", "trace"],
+    review_label: ["Review", "状态", "记忆准入", "理由", "trace"],
     raw_record: ["记录", "kind", "标的", "内容"],
   }[kind] || ["ID", "详情"];
 }
@@ -777,6 +924,21 @@ function objectCells(kind, object) {
       h("span", { cls: "clip", text: (d.orders || []).map((o) =>
         o.side[0].toUpperCase() + " " + o.symbol + " " + (o.target_weight * 100).toFixed(1) + "%" + (o.forced ? "⚡" : "")).join(" ") || "—" }),
       (d.deferred_trades || []).length,
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "fill": return [idChip("fill", object.id, shortId(object.id)), d.symbol, d.side,
+      `${d.filled_shares}/${d.requested_shares}`,
+      d.executed_price != null ? num(d.executed_price) : "—", d.status,
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "position_episode": return [idChip("position_episode", object.id, shortId(object.id)), d.symbol,
+      d.status + (d.is_carry_in ? "·carry-in" : ""),
+      fmtTime(d.anchor_at) + "→" + fmtTime(d.current_due_at),
+      d.original_horizon_days + "d", "r" + (d.revision || 1),
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "outcome_card": return [idChip("outcome_card", object.id, shortId(object.id)), d.symbol,
+      pct(d.net_return), pct(d.active_return), pct(d.max_drawdown), d.observation,
+      [idChip("trace", d.trace_id, shortId(d.trace_id))]];
+    case "review_label": return [idChip("review_label", object.id, shortId(object.id)), d.status,
+      d.memory_eligibility, h("span", { cls: "clip", text: clip(d.rationale, 120) }),
       [idChip("trace", d.trace_id, shortId(d.trace_id))]];
     case "raw_record": return [h("span", { cls: "mono", text: object.id }), d.kind || object.kind || "",
       d.symbol || object.symbol || "",
@@ -864,7 +1026,9 @@ async function replayTrace(traceId) {
 const objectIdKey = (kind) => ({ snapshot: "snapshot_id", evidence_card: "evidence_id", claim_card: "claim_id",
   research_packet: "packet_id", thesis_book: "thesis_book_id", portfolio_intent: "intent_id",
   intent_constraints: "intent_id", target_portfolio: "target_portfolio_id",
-  risk_projected_portfolio: "projected_portfolio_id", order_plan: "order_plan_id" }[kind] || "object_id");
+  risk_projected_portfolio: "projected_portfolio_id", order_plan: "order_plan_id",
+  fill: "fill_id", position_episode: "episode_id", outcome_card: "outcome_card_id",
+  review_label: "review_label_id" }[kind] || "object_id");
 
 /* ---------------- 详情抽屉 ---------------- */
 
@@ -875,6 +1039,12 @@ const LINK_LABEL = {
   claims: "包含 Claim",
   packets: "来源 Packet",
   thesis_book_ids: "所属 ThesisBook",
+  fills: "成交 Fill",
+  outcome_card: "结果卡 OutcomeCard",
+  review_label: "复盘标签 ReviewLabel",
+  episode: "持仓案例 Episode",
+  calibration_episodes: "校准引用案例（记忆→委员会）",
+  intents_citing: "引用该案例的意图",
 };
 
 // 关联列表的对象类型由链接名确定，不再靠字段启发式猜（猜错会点开查不到的 ID）
@@ -885,6 +1055,12 @@ const LINK_KIND = {
   evidence: "evidence_card",
   packets: "research_packet",
   thesis_book_ids: "thesis_book",
+  fills: "fill",
+  outcome_card: "outcome_card",
+  review_label: "review_label",
+  episode: "position_episode",
+  calibration_episodes: "position_episode",
+  intents_citing: "portfolio_intent",
 };
 
 async function openDrawer(kind, id) {
@@ -992,7 +1168,6 @@ function rawView(payload) {
 
 function renderActiveTab() {
   if (state.tab === "stream") renderStream();
-  else if (state.tab === "nodes") renderNodes();
   else if (state.tab === "objects") renderObjects();
 }
 

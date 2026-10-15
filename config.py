@@ -61,9 +61,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 # 日志目录
 LOG_DIR = PROJECT_ROOT / "logs"
 
-# 日志文件大小（MB）和备份数量
-MAX_LOG_SIZE_MB = 20  # 每个日志文件最大 20MB
-LOG_BACKUP_COUNT = 10   # 保留 10 个历史版本
+# 日志级别（应用日志仅输出到控制台，不再落盘为 trader_*.log / errors_*.log）
 DEFAULT_LOG_LEVEL = "DEBUG"  # 默认日志级别 (更详细)
 
 # 确保目录存在

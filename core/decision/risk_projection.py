@@ -1,6 +1,7 @@
 """按 Plan 顺序施加硬约束；所有操作都只缩小目标风险。"""
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
+from datetime import datetime
 from math import sqrt
 
 import numpy as np
@@ -54,6 +55,7 @@ class RiskProjection:
         untradable: Set[str] = frozenset(),
         stop_loss: Set[str] = frozenset(),
         risk_locked: bool = False,
+        created_at: datetime | None = None,
     ) -> RiskProjectedPortfolio:
         # weights：目标权重摊成 dict 就地改；changes：每次收缩记一条审计流水
         weights = {x.symbol: x.weight for x in target.weights}
@@ -135,12 +137,15 @@ class RiskProjection:
             for s, w in sorted(weights.items()) if w > 0
         )
         exposure = sum(x.weight for x in out)
-        return RiskProjectedPortfolio(
-            trace_id=target.trace_id,
-            target_portfolio_id=target.target_portfolio_id,
-            snapshot_id=target.snapshot_id,
-            weights=out,
-            total_exposure=exposure,
-            cash_weight=1 - exposure,
-            adjustments=tuple(changes),
-        )
+        payload = {
+            "trace_id": target.trace_id, 
+            "target_portfolio_id": target.target_portfolio_id,
+            "snapshot_id": target.snapshot_id, 
+            "weights": out, 
+            "total_exposure": exposure,
+            "cash_weight": 1 - exposure, 
+            "adjustments": tuple(changes),
+        }
+        if created_at is not None:
+            payload["created_at"] = created_at
+        return RiskProjectedPortfolio(**payload)

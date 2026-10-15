@@ -206,7 +206,7 @@ def _round(options: FlowOptions, *, model: JsonModel | None, book: ResearchLedge
                                  volatilities=volatilities, covariance=covariance, trading=trading,
                                  drawdown=float(risk_state["drawdown"]),
                                  untradable=set(trading.untradable_symbols), stop_loss=set(risk_state["stop_loss"]),
-                                 risk_locked=bool(risk_state["risk_locked"]))
+                                 risk_locked=bool(risk_state["risk_locked"]), created_at=as_of)
         book.append_constraints(portfolio.constraints)
         book.append_target_portfolio(portfolio.target)
         book.append_risk_projected_portfolio(portfolio.projected)

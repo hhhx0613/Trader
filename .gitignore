@@ -33,6 +33,8 @@ data/account*.json
 data/cache/
 # 研究快照包含原始第三方载荷与本地审计账本，不应提交到版本库。
 data/research/
+# 全流程回测产物（ledger.db / raw 正文库）是本地输出，不属于源码。
+data/backtests/
 # 明确标识内容寻址的第三方原始载荷；父目录规则已覆盖此项。
 data/research/raw/**/payload.json
 # 本地测试运行时目录不属于研究数据，也不应提交。

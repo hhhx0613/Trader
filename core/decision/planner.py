@@ -10,6 +10,7 @@
 """
 from collections.abc import Mapping, Set
 from dataclasses import dataclass
+from datetime import datetime
 from core.database.contracts import (
     IntentConstraints,
     OrderPlan,
@@ -77,10 +78,12 @@ class PortfolioPolicy:
         untradable: Set[str] = frozenset(),
         stop_loss: Set[str] = frozenset(),
         risk_locked: bool = False,
+        created_at: datetime | None = None,
     ) -> PortfolioPolicyResult:
         # Step 1: 将 PortfolioIntent 解析为带方向/上下限/强制退出标记的约束向量
         constraints = self.constraint_builder.build(
             intent, current_weights, trace_id=trace_id,
+            created_at=created_at,
         )
         # Step 2: 在协方差约束下分配相对权重；返回 sum<1 表示无可行完全投资解
         relative = self.allocator.allocate(
@@ -96,6 +99,7 @@ class PortfolioPolicy:
                 intent, relative,
                 trace_id=trace_id,
                 policy_version=self.policy_version,
+                created_at=created_at,
             )
         else:
             # Step 3: 正常路径——按目标波动率缩放，生成最终 TargetPortfolio
@@ -104,6 +108,7 @@ class PortfolioPolicy:
                 current_exposure=sum(current_weights.values()),
                 trace_id=trace_id,
                 policy_version=self.policy_version,
+                created_at=created_at,
             )
         # Step 4: 风控投影——检查目标组合是否违反限额（波动率/回撤/不可交易等），必要时缩减
         projected = self.projection.project(
@@ -115,6 +120,7 @@ class PortfolioPolicy:
             untradable=set(untradable) | set(trading.untradable_symbols),
             stop_loss=stop_loss,
             risk_locked=risk_locked,
+            created_at=created_at,
         )
         # 合并约束层 force_exit 与外部 stop_loss，统一传给 CostGate 标记为必须执行的减仓
         forced = {x.symbol for x in constraints.items if x.force_exit} | set(stop_loss)
@@ -126,5 +132,6 @@ class PortfolioPolicy:
             limits=self.cost_limits,
             model=self.cost_model,
             forced_exits=forced,
+            created_at=created_at,
         )
         return PortfolioPolicyResult(constraints, target, projected, order)
