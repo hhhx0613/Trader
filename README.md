@@ -2,7 +2,7 @@
 
 当前仓库保留 LLM、VADER 和 PPO 的统一回测基线；项目将逐步演进为从 PIT 数据研究到模拟执行的可审计多 Agent 应用。目标不是直接追求收益最大化，而是让每一项决策都能追溯其可得证据、研究论点、风险审查、成本约束和最终结果。
 
-权威开发计划见 [docs/Plan.md](docs/Plan.md)；毕设研究叙事见 [docs/agent_application_proposal.md](docs/agent_application_proposal.md)；历史实验以 [docs/experiment_index.csv](docs/experiment_index.csv) 为唯一结构化登记册。
+权威开发计划见 [docs/Plan.md](docs/Plan.md)；历史实验以 [docs/experiment_index.csv](docs/experiment_index.csv) 为唯一结构化登记册。
 
 ## 当前基线
 
@@ -113,16 +113,37 @@ python scripts/backtest.py                                        # 默认 full�
 
 ## 可视化调试台（`viz/`）
 
-本地单人用的观测页：标准库 HTTP + SSE，只监听 `127.0.0.1`，前端为无构建的原生页面（`viz/server.py` + `viz/readmodel.py` + `viz/static/`）。它**自己不编排、不复制阶段门控**：`collect`/`decide` 调 `run_research_round`，`evidence` 调 flow `daily`，`review` 调 flow `execute` + `OutcomeScheduler.scan`，`full` 复用 `scripts/backtest.py` 抽出的 `run_replay(...)`——终端 print 与这里的 SSE 是同一事件流的两个 sink，与命令行、定时调度器全用同一批函数；只是把模型客户端套一层事件包装，将每阶段流转、逐节点注入输入/工具调用/JSON 输出、后半程 `Fill`/`Episode`/`OutcomeCard`/`ReviewLabel` 实时推到前端。唯一 flow 没有的直接调用是「复用已冻结 Snapshot 只重跑研究图/委员会」，用于不重烧采集配额地反复调试。
+本地单人用的观测页：后端 FastAPI + SSE（`uvicorn` 启动），只监听 `127.0.0.1`；前端在 `viz/web/`（Vite + React + TypeScript），构建产物 `viz/web/dist/` 由 `server.py` 同源托管，Node 只在构建期使用（Python 侧为此只多 `fastapi`/`uvicorn` 两个包）。它**自己不编排、不复制阶段门控**：`collect`/`decide` 调 `run_research_round`，`evidence` 调 flow `daily`，`review` 调 flow `execute` + `OutcomeScheduler.scan`，`full` 复用 `scripts/backtest.py` 抽出的 `run_replay(...)`——终端 print 与这里的 SSE 是同一事件流的两个 sink，与命令行、定时调度器全用同一批函数；只是把模型客户端套一层事件包装，将每阶段流转、逐节点注入输入/工具调用/JSON 输出、后半程 `Fill`/`Episode`/`OutcomeCard`/`ReviewLabel` 实时推到前端。唯一 flow 没有的直接调用是「复用已冻结 Snapshot 只重跑研究图/委员会」，用于不重烧采集配额地反复调试。
+
+两种起法，选一种。
+
+**开发态（推荐，只有一个访问口）**——浏览器只开 http://127.0.0.1:5173，Vite 把 `/api`（含 SSE）代理到 8765；改前端保存即刷新：
+
+```powershell
+# 终端 1：后端 8765 —— /api + SSE + 真正执行 flow，必须常驻
+cd d:\Codes\Trader
+& D:\Miniconda3\envs\trader\python.exe -u viz\server.py
+
+# 终端 2：前端 5173 —— 编译 TSX + 热更新 + 把 /api 代理给 8765
+cd d:\Codes\Trader\viz\web
+npm run dev
+```
+
+首次要先装一次依赖：`cd viz/web && npm install`（依赖有变时再跑）。
+
+**单进程形态**——不热更新，只留 8765，页面由 `server.py` 直接托管 `dist/`：
 
 ```bash
-python viz/server.py                            # 默认 http://127.0.0.1:8765
-python viz/server.py --port 9000                # 换端口
+cd viz/web && npm run build                     # 改过前端才需要：产出 dist/
+python viz/server.py                            # 打开 http://127.0.0.1:8765
+python viz/server.py --port 9000                # 换端口（需同步改 viz/web/vite.config.ts 的 proxy target）
 python viz/server.py --runs-dir tmp/viz_runs    # 换观测产物目录
 python viz/server.py --ledger <某份账本副本>.db --raw <对应正文库目录>  # 只读回放指定账本（缺省指向 config 的研究账本）
 ```
 
-页面选中标的池/账户/阶段开关后点运行即可看逐阶段实时流转（`full`/`review` 会展开回放面板填 start/end/force 与复盘 OrderPlan）；裸 ID 的 chip 会顺 `/api/digest` 批量解析成一行摘要（不再只显短 ID，点开抽屉仍看全文）。历史运行事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略）仅供刷新后回看，权威审计仍是账本与 `logs/llm_calls.jsonl`（每次模型调用带 `trace_id/node/symbol/call_id` 关联键，与事件流的 `node_input/node_output` 同一 `call_id` 对齐，供审计 agent 回溯每个节点当时看到的证据）。
+端口分工：**8765 是后端**（FastAPI：账本查询、SSE 事件流、执行 flow、托管 `dist/`），**5173 是前端**（Vite dev server，只负责编译、热更新与转发 `/api`）。页面与接口同源，因此两侧都不需要 CORS；未构建 `dist/` 时直接访问 8765 会返回 503 并提示先构建。
+
+页面选中标的池/账户/阶段开关后点运行即可看逐阶段实时流转（`full`/`review` 会展开回放面板填 start/end/force 与复盘 OrderPlan）；裸 ID 的 chip 会顺 `/api/digest` 批量解析成一行摘要（不再只显短 ID，点开抽屉仍看全文）。事件流按「决策日分隔条 → 阶段收口 → 模型节点 → 产出对象」组织，只读渲染层会折叠同一事实的重复表达（带 `stage` 的回放日志行、已收口的「阶段开始」、同阶段按日重发的「阶段完成」（折进首次行的「历次收口」）、已有模型节点的阶段（研究图/委员会）的阶段行）；事件本身仍完整进 SSE 与 JSONL，顶部阶段卡的状态与耗时也不受影响（一次 54 事件的两周回放只画 23 行）。历史运行事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略）仅供刷新后回看，权威审计仍是账本与 `logs/llm_calls.jsonl`（每次模型调用带 `trace_id/node/symbol/call_id` 关联键，与事件流的 `node_input/node_output` 同一 `call_id` 对齐，供审计 agent 回溯每个节点当时看到的证据）。
 
 「账本回放」Tab 直接读账本，覆盖阶段 1-6 全部对象：除前半程（Snapshot→证据/论断/研究包→意图→组合政策→OrderPlan）外，还展示后半程 `Fill`/`PositionEpisode`/`OutcomeCard`/`ReviewLabel`——点开 Episode 详情抽屉可顺着「结果卡→复盘标签→成交→引用该案例的意图」逐跳溯源，PortfolioIntent 抽屉则反查它经 `calibration_episode_ids` 引用的已验证案例，即「outcome→review→记忆注入→被 Committee 引用」这条经验闭环在前端可视化。`--ledger/--raw` 为只读覆盖，缺省仍指向 `config` 的研究账本；回测产物账本用该参数即可直接观测，不改默认路径。
 
@@ -177,11 +198,10 @@ scripts/run_backtest.py         统一回测入口
 scripts/train_ppo.py            PPO 训练入口
 models/                         PPO 模型归档
 docs/Plan.md                    唯一权威开发计划
-docs/agent_application_proposal.md  毕设研究提案
 docs/experiment_index.csv       实验结构化登记册
 output/                         单次回测原始证据
 data/cache/                     本地缓存（不提交 Git）
 data/research/                  三类研究数据的原始载荷和审计账本（不提交 Git）
 ```
 
-后续工作顺序以 [docs/development_plan.md](docs/development_plan.md) 的阶段任务为准。
+后续工作顺序以 [docs/Plan.md](docs/Plan.md) 为准。

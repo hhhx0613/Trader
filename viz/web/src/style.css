@@ -1,4 +1,4 @@
-/* 研究链路可视化调试台样式：亮色、紧凑、无构建依赖 */
+/* 研究链路可视化调试台样式：亮色、紧凑；沿用原页面的类名，避免重写视觉。 */
 
 :root {
   --bg: #ffffff;
@@ -32,6 +32,9 @@ body {
   flex-direction: column;
 }
 
+/* 应用根节点接管原来 body 的直接子元素角色（topbar + layout 纵向排布） */
+#root { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
 h1, h2, h3 { margin: 0; font-weight: 600; }
 
 /* ---------- 顶栏 ---------- */
@@ -47,6 +50,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
 .sub { margin: 2px 0 0; color: var(--fg-mute); font-size: 11px; }
 .runbar { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg-mute); display: inline-block; }
+.dot.idle { background: var(--fg-mute); }
 .dot.running { background: var(--accent); animation: pulse 1.1s infinite; }
 .dot.done { background: var(--ok); }
 .dot.failed, .dot.cancelled { background: var(--err); }
@@ -112,7 +116,8 @@ button.tiny { padding: 3px 7px; }
 
 /* ---------- 阶段流水线 ---------- */
 
-.pipeline { display: flex; gap: 8px; padding: 12px; overflow-x: auto; border-bottom: 1px solid var(--line); }
+/* 流水线高度由内容决定，不参与 flex 收缩：窗口矮时先压事件流，不能把卡片压扁 */
+.pipeline { flex: none; display: flex; gap: 8px; padding: 12px; overflow-x: auto; border-bottom: 1px solid var(--line); }
 .stage {
   flex: 1 1 0; min-width: 172px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--bg-card); padding: 9px 10px; cursor: pointer; position: relative;
@@ -120,7 +125,9 @@ button.tiny { padding: 3px 7px; }
 .stage:hover { border-color: var(--accent); }
 .stage.sel { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(74,163,255,.35) inset; }
 .stage .name { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
-.stage .body { font-size: 11px; color: var(--fg-dim); min-height: 34px; }
+.stage .body { font-size: 11px; color: var(--fg-dim); min-height: 34px; overflow: hidden; }
+/* 卡片只有一格宽：chip 的摘要注记（可能上百字）不参与排版，长摘要看抽屉 */
+.stage .id-note { display: none; }
 .stage .foot { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
 .stage.pending { opacity: .7; }
 .stage.running { border-color: var(--accent); }
@@ -156,8 +163,6 @@ button.tiny { padding: 3px 7px; }
 .tab-tools input { width: 200px; }
 
 .tab-body { flex: 1; overflow-y: auto; padding: 10px 12px 24px; min-height: 0; }
-.tab-pane { display: none; }
-.tab-pane.active { display: block; }
 
 /* ---------- 事件流 ---------- */
 
@@ -182,8 +187,19 @@ button.tiny { padding: 3px 7px; }
 .event-head .t { color: var(--fg-mute); font-family: var(--mono); font-size: 10.5px; }
 .event-head .txt { flex: 1; min-width: 200px; }
 .event-body { margin-top: 6px; }
+/* 回放按决策日推进：换日时插一条分隔，长流里能看出走到哪一天 */
+.evt-divider {
+  display: flex; gap: 8px; align-items: center; margin: 11px 0 6px;
+  color: var(--fg-mute); font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+}
+.evt-divider::before, .evt-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line-soft); }
+.refresh-list { margin: 0; padding-left: 16px; font-size: 11px; line-height: 1.5; color: var(--fg-dim); font-family: var(--mono); }
 summary { cursor: pointer; color: var(--fg-dim); font-size: 11px; }
 summary:hover { color: var(--fg); }
+
+/* JSON 区块直接铺开，label 只当分段小标题 */
+.json-block { margin-top: 6px; }
+.json-label { font-size: 10px; letter-spacing: .02em; text-transform: uppercase; color: var(--fg-mute); }
 
 pre.json {
   margin: 4px 0 0; padding: 7px 9px; background: var(--bg-soft); border: 1px solid var(--line-soft);

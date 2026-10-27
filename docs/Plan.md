@@ -1,8 +1,8 @@
 # Plan：可审计量化 Agent 开发计划
 
 > 权威状态：当前唯一架构与开发计划
-> 更新：2026-10-05
-> 研究提案见 [`agent_application_proposal.md`](agent_application_proposal.md)；实验登记册见 [`experiment_index.csv`](experiment_index.csv)。
+> 更新：2026-10-27（新增第 7 节：借鉴 gs_quant 的五个增量方向）
+> 实验登记册见 [`experiment_index.csv`](experiment_index.csv)。
 
 ## 1. 目标、范围与当前基线
 
@@ -443,12 +443,16 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 
 `viz/` 是本地单人使用的观测工具，后端只有 `server.py`（HTTP + SSE + 运行观测）与 `readmodel.py`（账本只读视图）两个文件。它**自己不编排任何阶段**：`collect`/`decide` 两个节奏就是调 `run_research_round`（与命令行同一个函数），`full`/`review` 回放节奏复用 `scripts/backtest.py` 抽出的 `run_replay(...)`——终端 print 与前端 SSE 只是同一事件流的两个 sink，不各写一份日循环。模型客户端套一层事件包装器，把每个节点的注入输入、工具调用与 JSON 输出发到前端，不改变其行为。唯一的例外是 flow 没有的节奏「复用已冻结 Snapshot 只重跑研究图/委员会」——它直接调用生产原语 `PerAssetResearchGraph` 与 `Committee`，用途是不重烧采集配额地反复调试研究节点。从 prompt 结构识别节点的规则与 `scripts/backtest.py` 的终端包装同构，两边各留一份，改动时一起看。
 
-边界四条：
+边界六条：
 
 1. **不复制编排**：采集、建卡、冻结、研究图、委员会的阶段门控与 trace_id 生成一律由 `flow` 持有，`viz/` 里不留第二份。
 2. **只读查询、写经主线**：账本与正文库的查询 API 一律只读；运行/回放节奏通过 `flow` 与 `OutcomeScheduler` 主线接口写生产账本，`viz/` 自身不直接写库、不改契约、不给 Agent 开新的数据入口。
-3. **零新依赖**：HTTP 服务与 SSE 用标准库实现，前端为无构建的原生 HTML/CSS/JS，只监听 `127.0.0.1`。
+3. **传输层用 FastAPI、服务只监听 `127.0.0.1`**：HTTP 与 SSE 由 `server.py` 里的 FastAPI 应用提供——`uvicorn` 启动、`StreamingResponse` 推事件流、`StaticFiles` 托管构建产物；Python 侧为此新增的依赖只有 `fastapi` 与 `uvicorn`（`pydantic` 已在依赖表里）。前端为 `viz/web/`（Vite + React + TypeScript），构建产物 `viz/web/dist/` 由 `server.py` 同源托管，Node 只在构建期使用。开发态 `npm run dev`（5173）由 Vite 把 `/api` 与 SSE 代理到 8765，页面与服务同源，两侧都不需要 CORS。
+
+   这条边界改过两次，理由与代价都要记住。2026-10 先从前端侧改：原方案是单文件 1177 行手写 DOM（含增量渲染、脏区合帧、摘要批量补全），已到维护上限，页面还要继续长出研究图拓扑、Outcome 收益曲线与多周回放时间轴，手写 DOM 的边际成本过高；代价是多一条构建链，改前端后必须 `npm run build` 才能被 `server.py` 托管，`dist/` 不入库。2026-10-27 再把传输层从「标准库零依赖」换成 FastAPI：手写的路由分发、CORS 预检、`Content-Length`/`Connection: close` 与 SSE 分块合计约 300 行，全是框架默认能力；而依赖表已含 torch/SB3/langgraph/cvxpy/pydantic，多两个包不构成负担，同工作区的 AI-Trader 也是 FastAPI + React/Vite 的同构形状。代价是 `viz/server.py` 必须装上 fastapi/uvicorn 才能起，`readmodel.py` 经它间接依赖这两个包。
 4. **观测产物不入权威存储**：每次运行的事件流写 `output/viz_runs/<run_id>.jsonl`（Git 忽略），仅供刷新后回看；权威审计仍是 `ResearchLedger` 与 `logs/llm_calls.jsonl`。
+5. **事件流的去重只发生在渲染层**：一条回放日志会被 `_replay_sink` 同时发成 `log` 与按阶段拆开的 `stage_done`，回放又每个决策日重发一次同阶段收口行，全部画出来就是同一件事说三遍。前端 `EventStream` 按「决策日 → 阶段收口 → 模型节点 → 产出对象」组织，折叠四类重复行：带 `stage` 的回放日志行、已收口的 `stage_start`、同阶段第二条起的 `stage_done`（折进首次行的「历次收口」）、以及有模型节点的阶段（研究图/委员会）的阶段行。事件本身仍完整进 SSE 与 JSONL，顶部阶段卡的状态/耗时/跳过原因仍由这些事件算。
+6. **没走到的阶段要显式标跳过**：回放按周推进，零订单周不进入执行器（`run_replay` 只把有订单的 OrderPlan 入队），窗口内无到期持仓也产不出结算与复盘。这些阶段停在「待命」时，看不出是链路没接上还是本轮本就不会发生。`_replay_sink` 在收到收口日志（`COMPLETE`/`INCOMPLETE`/`NATURAL-END`）时，对仍未 `stage_start` 的 `execute`/`outcome`/`review` 补发 `stage_skip` 并写明原因（零订单 / 无到期持仓 / 无可校准 Episode）。判定只在回放节奏做，`flow` 的 `collect`/`decide` 仍由各阶段自己 `stage_skip`。
 
 它服务的正是 4.3 的目标：给定一次运行或一个 `trace_id`，能在界面上逐阶段看清「数据进来了什么、模型看到了什么、要了什么工具、产出了哪些 Card、被谁引用」。
 
@@ -468,6 +472,9 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 | `Fill` | 实际成交数量、价格、时间、佣金、部分/未成交原因 | 执行事实；|
 | `PositionEpisode` | 同标的实际持仓生命周期，以及 Intent/Plan/Fill/Outcome/Review 的关联 ID | 可检索案例的聚合根与选股结果的最小归因单位；不重复保存事实 |
 | `OutcomeCard` | 到期或终局时的实际/主动结果、成本、回撤、持有期与市场环境 | 每个 episode 只追加一次的客观复盘输入 |
+| `StrategyCard` | 逻辑类型、进入/退出/失效条件、适用 regime 与流动性下限、`horizon_bucket`、风险假设、来源与状态 | 可复用的条件-动作模板（增量，见 7.1） |
+| `ComputedFact` | 指标名、窗口、参数哈希、序列锚点 `snapshot_id`/`symbol`、末值与 `available_at` | Agent 用指标工具现算出的可引用事实（增量，见 7.3） |
+| `ExperienceNote` | 关联 `episode_id`、`pattern`、`worked_when`、`failed_when`、`risk_factors`、`transferable` | 结构化可迁移经验；与原始 episode 摘要一并入 Committee（增量，见 7.5） |
 
 分层职责固定如下：数据层保存事实；研究 Agent 生成论点；Committee 做跨标的意图选择；PortfolioPolicy 做数学分配；RiskProjection 与 CostGate 做确定性拒绝或收缩；Execution Engine 模拟成交；Review Agent 只解释已经发生的结果。任何上游 LLM 均不得绕过下游硬约束。
 
@@ -475,9 +482,54 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 
 实施顺序遵循依赖关系：先让数据与记录可靠，再形成研究结论，再转换为受约束订单，最后建立结果反馈与评测。迁移期间，旧路径与新主线不得共同决定同一笔订单。
 
-详细的任务分解、技术选型、阶段门槛和交接记录见 [development_plan.md](development_plan.md)。该文件只追踪实施，不替代本文件的架构决策。
+任务分解、技术选型、阶段门槛与交接记录都并入本文件，不再另设实施计划。第 7 节的五项增量按 7.4 → 7.3 → 7.1 → 7.2 → 7.5 顺序进入实施；未通过第 8 节门槛的不进入实施。
 
-## 7. 评测与治理
+## 7. 增量改进方向（借鉴 GS Quant）
+
+### 7.1 Strategy Library：基于 Strategy Card 的策略检索
+
+- **策略来源**：研究 GS Quant 中的策略示例、触发条件与执行动作，提取具有复用价值的策略范式，整理为结构化的 `Strategy Card`。
+- **卡片设计**：每张卡片描述策略逻辑、适用市场环境、触发条件、所需指标、历史表现、失效条件及潜在风险，并记录来源与验证状态，区分原始示例、改编策略和实验验证结果。
+- **检索机制**：采用与 Experience Memory 类似的检索方式，根据当前市场环境、研究证据与候选交易逻辑，检索相关策略卡片，并将 Top-K 结果提供给 Committee Agent 作为决策参考。
+- **决策约束**：策略卡片仅用于提供候选思路与历史经验，不直接决定交易。Committee 仍需结合当前研究证据，判断策略的适用性与失效风险。
+
+### 7.2 Risk Projection：借鉴 GS Quant 的风险控制策略
+
+- 研究 GS Quant 中的风险触发器、组合风险约束及触发后的减仓、退出与再平衡机制。
+- 将适用的规则整合至现有 `Risk Projection` 环节，完善组合波动率目标、仓位限制、回撤约束、交易成本门控及风险状态转换等机制。
+- 优先采用确定性规则执行风险校验与组合调整，明确约束的执行顺序、触发条件和对应动作，避免依赖 LLM 判断硬性风险限制是否满足。
+- 复用现有 `PortfolioIntent`、`IntentConstraints`、`TargetPortfolio`、`RiskProjectedPortfolio` 和 `OrderPlan` 等对象，避免重复建设风控模块。
+- 通过历史回测和边界测试验证新增规则的有效性，并分析其对收益、风险和换手率的影响。
+
+### 7.3 Market Agent：赋予 Indicator 计算工具
+
+- 将现有 `compute_indicator` 能力封装为可复用的指标计算工具，供 Market Agent 根据研究需要按需调用。
+- 保留现有预计算流程作为默认路径，在此基础上支持 Agent 请求额外指标或指定计算窗口，兼顾执行效率与研究灵活性。
+- 统一指标定义、参数校验、数据口径和时间边界，确保计算仅使用决策时点可获得的数据，避免未来数据泄漏。
+- 记录工具调用参数及计算结果，保证研究过程可追溯、可回放和可复现。
+- 通过消融实验比较固定预计算与按需调用两种方式对研究质量、工具调用开销及最终投资表现的影响。
+
+### 7.4 统一回测与评估入口
+
+- 在现有研究流程、模拟执行环境及回测基线之上，建立统一的实验运行与评估入口，避免重复实现执行和绩效计算逻辑。
+- 统一实验配置、历史数据区间、股票池、交易成本、执行假设及策略版本管理，使不同实验能够在一致的条件下进行比较。
+- 复用现有 `SimulatedExecution`、`ResearchLedger` 和回放机制，将回测驱动、模拟成交、组合状态更新与绩效评估明确分层。
+- 统一输出收益率、Sharpe Ratio、最大回撤、换手率、交易成本及其他必要指标，并保留净值曲线、成交记录和实验配置。
+- 兼容现有基线策略及新的 Agent 研究链路，明确不同执行路径的差异，确保基线对比和消融实验具有可比性。
+- 基于统一入口开展消融实验，分别评估 Strategy Library、Indicator Tool、风险控制规则及记忆检索等模块的独立贡献与组合效果。
+
+### 7.5 Experience Memory：基于 Review Agent 的经验总结与检索
+
+- **经验提炼**：由 Review Agent 根据历史研究记录、交易结果和 Outcome 信息总结可复用经验，提炼特定市场环境下不同交易逻辑的历史表现、适用条件、失效条件及风险因素。
+- **记忆结构化**：将经验组织为结构化的 Experience Memory，记录市场环境、交易逻辑、支持与反对证据、历史表现、失效原因、风险因素及来源 `episode_id`，区分客观交易事实与 Review Agent 的归因判断。
+- **向量检索**：基于当前研究上下文进行语义检索，召回相关 Experience Memory，并通过相似度、适用条件及时间衰减等机制筛选 Top-K 经验。
+- **原始 Episode 联动**：根据检索结果中的 `episode_id`，从现有 Research Ledger 中获取对应的原始 Episode 数据，将经验摘要与相关原始证据一并提供给 Committee Agent，兼顾检索效率与事实可追溯性。
+- **Committee 决策参考**：Committee 综合当前研究证据、检索到的历史经验及原始 Episode，判断历史经验是否适用于当前市场环境，避免直接将历史结果当作未来收益保证。
+- **记忆更新与验证**：复用现有账本和回放机制，持续积累新的研究结果，并通过后续交易表现验证经验的有效性，更新或淘汰过时、重复及缺乏证据支持的记忆。
+
+以上改进均以复用现有架构为原则，优先补充策略知识、工具能力、风险规则和实验评估机制，再通过消融实验验证各模块的实际价值。
+
+## 8. 评测与治理
 
 每个实验先固定问题、对照、数据截止时间、股票池、调仓日历、成本模型、风险限额和成功/失败标准，再实施代码。不得将单一短窗口的组合收益当作选股 alpha 证据。
 
@@ -485,13 +537,11 @@ Gateway 必须校验 `symbol` 与 `as_of`（必须精确等于冻结 Snapshot �
 
 任何模块若未展示跨窗口、跨条件的稳定增量，应降级为实验结果或删除；不得为了兼容旧路径长期叠加 fallback。
 
-## 8. 文档政策
+## 9. 文档政策
 
 长期维护的 `docs/` 仅包括：
 
 - `Plan.md`：唯一权威架构与开发计划；
-- `agent_application_proposal.md`：答辩/研究提案；
-- `development_plan.md`：分阶段实施任务、验收与交接记录；
 - `experiment_index.csv`：结构化实验登记册。
 
 单次回测原始证据和摘要保存在不可覆盖的 `output/backtest_<run_id>/`；不在 `docs/` 保留重复专项报告、自动生成总报告、平行计划或待办清单。

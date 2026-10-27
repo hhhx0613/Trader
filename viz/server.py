@@ -5,7 +5,8 @@
   1. 运行观测：把 `agents/flow.py` 的一次调用摊成前端事件——阶段产出取自
      `RoundResult`，逐节点的注入输入/工具调用/JSON 输出取自套在 `LLMClient` 外的 TracingModel。
   2. 只读查询：账本与正文库一律走 `viz/readmodel.py`，不写任何生产存储。
-  3. 传输：标准库 HTTP + SSE，只监听 127.0.0.1，前端为无构建的原生页面。
+  3. 传输：FastAPI（uvicorn 启动）+ SSE，只监听 127.0.0.1；前端是 `viz/web/` 的构建产物，
+     由本服务同源托管（改前端后先 `npm run build`）。
 
 这里不实现任何研究逻辑，也不复制阶段门控：`collect`/`decide`/`evidence` 就是调 `run_research_round`，
 与命令行 `scripts/backtest.py`、外部定时调度器用的是同一个函数；`full` 闭环回放复用
@@ -15,9 +16,13 @@
 职责边界见 docs/Plan.md 3.1.1 与 4.4。
 
 用法（conda trader 环境）：
+  cd viz/web && npm install && npm run build          # 首次/改前端后构建
   python viz/server.py                            # 默认 http://127.0.0.1:8765
   python viz/server.py --port 9000                # 换端口
   python viz/server.py --runs-dir tmp/viz_runs    # 换观测产物目录
+
+前端开发（热更新）：另开一个终端 `cd viz/web && npm run dev`，只访问 5173 即可——
+Vite 把 /api 与 SSE 代理到本服务，页面与服务同源，两侧都不需要 CORS。
 """
 
 from __future__ import annotations
@@ -31,14 +36,17 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Iterator
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 import config
 from agents.research.committee import Committee
@@ -55,14 +63,14 @@ from scripts.backtest import AcceptanceHarnessModel, _replay_account, run_replay
 from utils.llm_client import LLMClient
 from viz.readmodel import LedgerReader
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR = Path(__file__).resolve().parent / "web" / "dist"
 DEFAULT_RUNS_DIR = config.PROJECT_ROOT / "output" / "viz_runs"
 
 # 与 flow/命令行同一份默认观察池，保证前端勾选与命令行口径一致
 DEFAULT_POOL = ["AAPL", "AMZN", "GOOGL", "JNJ", "JPM", "MSFT", "NVDA", "UNH", "V", "WMT"]
 
 STAGE_LABELS = {
-    # 编号对齐 docs/development_plan.md：阶段 1 采集/建卡/冻结，2 逐标的研究，3 委员会，4 组合政策，5 成交，6 结算与复盘
+    # 编号对齐 docs/Plan.md 的阶段划分：阶段 1 采集/建卡/冻结，2 逐标的研究，3 委员会，4 组合政策，5 成交，6 结算与复盘
     "collect": "阶段 1 · 采集原始数据",
     "ingest": "阶段 1 · 建卡",
     "freeze": "阶段 1 · 冻结 Snapshot",
@@ -102,12 +110,10 @@ DEFAULT_ACCOUNT: dict[str, Any] = {
 }
 
 _DEFAULTS = {name: LLMClient.PROVIDERS[name] for name in ("deepseek", "glm", "openai")}
-_CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                  ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
-                  ".svg": "image/svg+xml", ".ico": "image/x-icon"}
-
 # 单条事件里正文的截断长度：UI 要看的是「模型收到了什么」，全文另有 evidence 详情接口
 _TEXT_CLIP = 320
+# 只截「原文正文」：理由/论断/摘要是模型自己的结论，截断了读的人就看不到它凭什么这么判
+_BODY_KEYS = {"text", "body"}
 # 一次阶段最多逐张外发的卡片事件数，其余只进批次汇总，避免千张卡把事件流灌满
 _MAX_CARD_EVENTS = 120
 
@@ -123,12 +129,12 @@ def _clip_text(value: str) -> str:
 
 
 def _clip_tree(value: Any, *, key: str | None = None) -> Any:
-    """递归裁剪 prompt 结构里的长正文，保留全部 ID 与字段供溯源。"""
+    """递归裁剪注入 payload 里的证据正文，理由类文本与全部 ID 原样保留供溯源。"""
     if isinstance(value, dict):
         return {k: _clip_tree(v, key=k) for k, v in value.items()}
     if isinstance(value, list):
         return [_clip_tree(v, key=key) for v in value]
-    if isinstance(value, str) and key in {"text", "body", "summary", "rationale", "statement", "detail"}:
+    if isinstance(value, str) and key in _BODY_KEYS:
         return _clip_text(value)
     if isinstance(value, datetime):
         return value.isoformat()
@@ -492,6 +498,9 @@ _REPLAY_STAGE_MAP = {
     "outcome-review": ("outcome", "review"),
 }
 
+# run_replay 的收口日志：走到这里还没开始的阶段，本轮就不会发生了
+_REPLAY_FINISH_STAGES = ("COMPLETE", "INCOMPLETE", "NATURAL-END")
+
 
 def _replay_stage_summary(stage: str, day: Any, fields: dict[str, Any]) -> dict[str, Any]:
     """把 run_replay 某阶段的计数/ID 折进对应流水线卡片的摘要。"""
@@ -534,6 +543,7 @@ class RunObserver:
         self.snapshot = None
         self.packet_ids: list[str] = []
         self._replay_stages_started: set[str] = set()
+        self._replay_orders = 0
 
     def close(self) -> None:
         """账本与只读视图都是按查询开/关连接，只有正文库需要显式收尾。"""
@@ -847,6 +857,8 @@ class RunObserver:
         day = fields.pop("day", None)
         if event_type == "log":
             stage = fields.pop("stage", "")
+            if stage == "weekly-decision":
+                self._replay_orders += int(fields.get("orders") or 0)
             mapped = _REPLAY_STAGE_MAP.get(stage, ())
             self._replay_light_stages(stage, day, fields)
             detail = " ".join(f"{k}={v}" for k, v in fields.items() if v not in (None, "", [], {}))
@@ -854,6 +866,8 @@ class RunObserver:
             # （如 weekly-decision 同属冻结/研究/委员会/组合政策），逗号分隔；映射不到则留空
             run.log(f"[{day}] {stage} {detail}".strip(), day=day, replay_stage=stage,
                     stage=",".join(mapped) if mapped else None)
+            if stage in _REPLAY_FINISH_STAGES:
+                self._close_unreached_replay_stages()
         elif event_type == "object":
             run.object(str(fields.get("kind")), str(fields.get("id")), fields.get("data"), day=day)
 
@@ -865,6 +879,18 @@ class RunObserver:
                 run.stage_start(stage, via_replay=True, day=day)
                 self._replay_stages_started.add(stage)
             run.stage_done(stage, _replay_stage_summary(stage, day, fields), duration_ms=None)
+
+    def _close_unreached_replay_stages(self) -> None:
+        """把本轮确定不会走的阶段标成跳过：一直「待命」看不出是没接上还是本就没发生。"""
+        run = self.run
+        if "execute" not in self._replay_stages_started:
+            reason = ("本轮 OrderPlan 零订单，未进入执行" if self._replay_orders == 0
+                      else "回放窗口内没有可撮合的交易日，订单未执行")
+            run.stage_skip("execute", reason)
+        if "outcome" not in self._replay_stages_started:
+            run.stage_skip("outcome", "回放窗口内无到期持仓，未产生结算")
+        if "review" not in self._replay_stages_started:
+            run.stage_skip("review", "没有可校准的 Episode，未产生复盘标签")
 
 
 # ============================ 进程内状态 ============================
@@ -911,7 +937,7 @@ class _State:
             return self._runs.get(run_id)
 
 
-STATE: _State  # 由 main() 注入，handler 通过模块全局访问
+STATE: _State  # 由 main() 注入，路由函数通过模块全局访问
 
 
 def _meta() -> dict[str, Any]:
@@ -949,178 +975,156 @@ def _run_replay(run_id: str) -> dict[str, Any] | None:
             "created_at": meta.get("created_at"), "events": events}
 
 
-# ============================ HTTP ============================
+# ============================ HTTP（FastAPI） ============================
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "TraderViz/0.1"
-    protocol_version = "HTTP/1.1"
+app = FastAPI(title="Trader Viz", docs_url=None, redoc_url=None, openapi_url=None)
+# 单人本地调试台：不放 /docs 与 /openapi.json，对外接口面就保持下面这十几个路由；
+# 页面与 /api 永远同源（开发态 Vite 代理、生产态本服务托管 dist），因此不配 CORS。
 
-    # ---------- 基础响应 ----------
 
-    def _send(self, status: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for key, value in (extra or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(body)
+def _error(status: int, message: str) -> JSONResponse:
+    """错误体保持 `{"error": ...}`：前端 api() 依赖这个键取文案。"""
+    return JSONResponse({"error": message}, status_code=status)
 
-    def _json(self, payload: Any, status: int = 200) -> None:
-        self._send(status, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
-                   "application/json; charset=utf-8")
 
-    def _error(self, status: int, message: str) -> None:
-        self._json({"error": message}, status)
+# ---------- 只读查询 ----------
 
-    def _body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
-        try:
-            parsed = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ValueError("请求体不是合法 JSON") from None
-        if not isinstance(parsed, dict):
-            raise ValueError("请求体必须是 JSON 对象")
-        return parsed
+@app.get("/api/meta")
+def api_meta() -> dict[str, Any]:
+    return _meta()
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003 — 覆写标准库签名
-        sys.stderr.write("[viz] %s\n" % (format % args))
 
-    # ---------- 路由 ----------
+@app.get("/api/runs")
+def api_runs(limit: int = 50) -> dict[str, Any]:
+    return {"runs": STATE.reader.run_index(STATE.runs_dir, limit)}
 
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler 约定
-        parsed = urlparse(self.path)
-        route = parsed.path
-        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        try:
-            if route in {"/", "/index.html"}:
-                self._static("index.html")
-            elif route.startswith("/static/"):
-                self._static(route[len("/static/"):])
-            elif route == "/api/meta":
-                self._json(_meta())
-            elif route == "/api/runs":
-                self._json({"runs": STATE.reader.run_index(STATE.runs_dir, int(query.get("limit", 50)))})
-            elif route == "/api/run":
-                replay = _run_replay(query.get("run_id", ""))
-                self._json(replay) if replay else self._error(404, "run not found")
-            elif route == "/api/stream":
-                self._stream(query.get("run_id", ""), int(query.get("after", 0)))
-            elif route == "/api/snapshots":
-                self._json({"snapshots": STATE.reader.snapshots(int(query.get("limit", 30)))})
-            elif route == "/api/snapshot":
-                detail = STATE.reader.snapshot_detail(query.get("snapshot_id", ""))
-                self._json(detail) if detail else self._error(404, "snapshot not found")
-            elif route == "/api/traces":
-                self._json({"traces": STATE.reader.traces(int(query.get("limit", 40)))})
-            elif route == "/api/trace":
-                self._json(STATE.reader.trace_detail(query.get("trace_id", "")))
-            elif route == "/api/object":
-                detail = STATE.reader.object_detail(query.get("kind", ""), query.get("id", ""))
-                self._json(detail) if detail else self._error(404, "object not found")
-            elif route == "/api/raw":
-                self._raw(query.get("evidence_id", ""))
-            elif route == "/api/digest":
-                refs = [s for s in str(query.get("ids", "")).split(",") if s.strip()]
-                self._json({"digests": STATE.reader.digests(refs[:400])})
-            else:
-                self._error(404, f"unknown route: {route}")
-        except ValueError as exc:
-            self._error(400, str(exc))
-        except BrokenPipeError:
-            pass  # 浏览器断开 SSE 属于常态，不该污染服务端日志
-        except Exception as exc:  # 观测服务不能因单次查询崩溃
-            self._error(500, f"{type(exc).__name__}: {exc}")
 
-    def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        try:
-            if parsed.path == "/api/run":
-                self._start_run(self._body())
-            elif parsed.path == "/api/run/cancel":
-                body = self._body()
-                run = STATE.get(str(body.get("run_id", "")))
-                if run is None:
-                    self._error(404, "run not found")
-                else:
-                    run.cancel()
-                    self._json({"run_id": run.run_id, "cancelling": True})
-            else:
-                self._error(404, f"unknown route: {parsed.path}")
-        except ValueError as exc:
-            self._error(400, str(exc))
-        except Exception as exc:
-            self._error(500, f"{type(exc).__name__}: {exc}")
+@app.get("/api/run")
+def api_run(run_id: str = "") -> Any:
+    replay = _run_replay(run_id)
+    return replay if replay else _error(404, "run not found")
 
-    # ---------- 处理函数 ----------
 
-    def _static(self, relative: str) -> None:
-        target = (STATIC_DIR / relative).resolve()
-        if STATIC_DIR not in target.parents or not target.is_file():
-            self._error(404, f"static not found: {relative}")
+@app.get("/api/snapshots")
+def api_snapshots(limit: int = 30) -> dict[str, Any]:
+    return {"snapshots": STATE.reader.snapshots(limit)}
+
+
+@app.get("/api/snapshot")
+def api_snapshot(snapshot_id: str = "") -> Any:
+    detail = STATE.reader.snapshot_detail(snapshot_id)
+    return detail if detail else _error(404, "snapshot not found")
+
+
+@app.get("/api/traces")
+def api_traces(limit: int = 40) -> dict[str, Any]:
+    return {"traces": STATE.reader.traces(limit)}
+
+
+@app.get("/api/trace")
+def api_trace(trace_id: str = "") -> Any:
+    return STATE.reader.trace_detail(trace_id)
+
+
+@app.get("/api/object")
+def api_object(kind: str = "", id: str = "") -> Any:  # noqa: A002 — 参数名就是前端契约
+    detail = STATE.reader.object_detail(kind, id)
+    return detail if detail else _error(404, "object not found")
+
+
+@app.get("/api/raw")
+def api_raw(evidence_id: str = "") -> Any:
+    detail = STATE.reader.object_detail("evidence_card", evidence_id)
+    if detail is None:
+        return _error(404, "evidence card not found")
+    return {"evidence_id": evidence_id, "card": detail["data"],
+            "payload": STATE.reader.raw_payload(detail["data"])}
+
+
+@app.get("/api/digest")
+def api_digest(ids: str = "") -> dict[str, Any]:
+    refs = [s for s in ids.split(",") if s.strip()]
+    return {"digests": STATE.reader.digests(refs[:400])}
+
+
+# ---------- 事件流 ----------
+
+@app.get("/api/stream")
+def api_stream(run_id: str = "", after: int = 0) -> Any:
+    run = STATE.get(run_id)
+    if run is None:
+        if (STATE.runs_dir / f"{run_id}.jsonl").exists():
+            return _error(410, "该运行已结束且不在本进程内，请用 /api/run 取完整事件")
+        return _error(404, "run not found")
+    # 同步生成器：Starlette 逐次在独立线程里 next()，run.wait() 的阻塞等待不会卡事件循环
+    return StreamingResponse(_event_stream(run, after), media_type="text/event-stream; charset=utf-8",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+def _event_stream(run: Run, after: int) -> Iterator[str]:
+    """事件流：无事件时挂住连接发心跳，而不是让前端轮询；客户端断开由 uvicorn 取消本生成器。"""
+    cursor = after
+    while True:
+        for event in run.wait(cursor, timeout=15.0):
+            cursor = event["seq"]
+            yield _sse_frame(event)
+        if run.state != "running":
+            for event in run.since(cursor):
+                cursor = event["seq"]
+                yield _sse_frame(event)
+            yield _sse_frame({"type": "stream_end", "seq": cursor, "state": run.state})
             return
-        self._send(200, target.read_bytes(), _CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
+        yield ": keep-alive\n\n"
 
-    def _start_run(self, payload: dict[str, Any]) -> None:
-        active = STATE.active()
-        if active is not None:
-            self._json({"error": "已有运行在进行中", "run_id": active.run_id, "state": active.state}, 409)
-            return
+
+def _sse_frame(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+
+# ---------- 运行 ----------
+
+@app.post("/api/run", status_code=202)
+def api_start_run(payload: dict[str, Any]) -> Any:
+    active = STATE.active()
+    if active is not None:
+        # 用 JSONResponse 而不是 HTTPException：前端靠 body.run_id 跟随既有运行，不能被包进 detail
+        return JSONResponse({"error": "已有运行在进行中", "run_id": active.run_id,
+                             "state": active.state}, status_code=409)
+    try:
         run = STATE.create(payload)
-        start_run_thread(run)
-        self._json({"run_id": run.run_id, "state": run.state}, 202)
+    except ValueError as exc:  # 载荷校验失败是用户输入问题，不是服务端故障
+        return _error(400, str(exc))
+    start_run_thread(run)
+    return {"run_id": run.run_id, "state": run.state}
 
-    def _raw(self, evidence_id: str) -> None:
-        detail = STATE.reader.object_detail("evidence_card", evidence_id)
-        if detail is None:
-            self._error(404, "evidence card not found")
-            return
-        self._json({"evidence_id": evidence_id, "card": detail["data"],
-                    "payload": STATE.reader.raw_payload(detail["data"])})
 
-    def _stream(self, run_id: str, after: int) -> None:
-        """SSE：把事件逐条推给前端；无事件时挂住连接，而不是让前端轮询。
+@app.post("/api/run/cancel")
+def api_cancel_run(payload: dict[str, Any]) -> Any:
+    run = STATE.get(str(payload.get("run_id", "")))
+    if run is None:
+        return _error(404, "run not found")
+    run.cancel()
+    return {"run_id": run.run_id, "cancelling": True}
 
-        响应不设 Content-Length、也不分块，而是声明 `Connection: close` 并在推完
-        后关连接：基类会在下一次循环里重新解析请求，若沿用 keep-alive 就会与
-        浏览器的事件流语义打架。
-        """
-        run = STATE.get(run_id)
-        if run is None:
-            if (STATE.runs_dir / f"{run_id}.jsonl").exists():
-                self._json({"error": "该运行已结束且不在本进程内，请用 /api/run 取完整事件"}, 410)
-            else:
-                self._error(404, "run not found")
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        cursor = after
-        try:
-            while True:
-                for event in run.wait(cursor, timeout=15.0):
-                    self._sse(event)
-                    cursor = event["seq"]
-                if run.state != "running":
-                    for event in run.since(cursor):
-                        self._sse(event)
-                        cursor = event["seq"]
-                    self._sse({"type": "stream_end", "seq": cursor, "state": run.state})
-                    return
-                self.wfile.write(b": keep-alive\n\n")
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            return  # 客户端离开是常态：刷新或关闭页面
 
-    def _sse(self, event: dict[str, Any]) -> None:
-        self.wfile.write(f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n".encode("utf-8"))
-        self.wfile.flush()
+# ---------- 前端构建产物 ----------
+
+class _NoStoreStatic(StaticFiles):
+    """每次 build 都会换 assets 哈希：加 no-store，免得浏览器拿旧 index.html 去引已删除的包。"""
+
+    async def get_response(self, path: str, scope: Any) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+if (STATIC_DIR / "index.html").exists():
+    app.mount("/", _NoStoreStatic(directory=STATIC_DIR, html=True), name="static")
+else:
+    @app.get("/{path:path}")
+    def _frontend_not_built(path: str) -> Response:
+        return PlainTextResponse("前端未构建：在 viz/web 下执行 npm install && npm run build",
+                                 status_code=503)
 
 
 def _enable_utf8_console() -> None:
@@ -1161,19 +1165,13 @@ def main() -> int:
     if args.raw:
         config.RESEARCH_RAW_DIR = Path(args.raw)
     STATE = _State(runs_dir)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
-    print(f"可视化调试台： http://{args.host}:{args.port}")
     print(f"  账本   : {config.RESEARCH_LEDGER_PATH}")
     print(f"  正文库 : {config.RESEARCH_RAW_DIR}")
     print(f"  运行流 : {runs_dir}/<run_id>.jsonl")
-    print("  Ctrl+C 停止")
     try:
-        server.serve_forever()
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     except KeyboardInterrupt:
         print("\n已停止")
-    finally:
-        server.server_close()
     return 0
 
 

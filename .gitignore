@@ -49,6 +49,11 @@ output/*
 output/*/*
 !output/*/manifest.json
 
+# ==================== 前端（viz/web） ====================
+# 构建期依赖与产物都不入库：dist 由 `npm run build` 生成，server.py 同源托管
+node_modules/
+viz/web/dist/
+
 # ==================== Conda ====================
 .conda/
 
@@ -66,3 +71,4 @@ logs/
 .ipynb_checkpoints/
 models/checkpoints/
 models/*.tmp
+docs/FYP Proposal.docx
